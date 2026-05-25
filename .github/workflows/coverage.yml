@@ -1,0 +1,13 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main, dev]
+
+jobs:
+  coverage:
+    uses: brig-id/.github/.github/workflows/coverage.yml@main
+    with:
+      codecov-flags: core
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

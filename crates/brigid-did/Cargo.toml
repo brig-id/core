@@ -1,0 +1,20 @@
+[package]
+name = "brigid-did"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+bs58 = "0.5"
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock = "0.6"
