@@ -10,12 +10,19 @@ allow = [
   "CC0-1.0",
   "Zlib",
   "CDLA-Permissive-2.0",
+  "MPL-2.0",
 ]
 confidence-threshold = 0.8
 
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # rsa Marvin attack: pulled in by sqlx-macros-core (compile-time query
+  # checking imports all DB backends). We do not use RSA or MySQL.
+  # No fix available upstream.
+  { id = "RUSTSEC-2023-0071", reason = "transitive via sqlx-macros-core; project uses SQLite only; no fix available" },
+]
 
 [bans]
 multiple-versions = "warn"
