@@ -1,0 +1,76 @@
+# AGENTS.md — brig·id `core`
+
+This repository contains the **business logic crates** for brig·id,
+organized as a Cargo workspace under `crates/`.
+
+## Language
+
+**All content must be in English** — code, comments, doc-comments, commit messages,
+issues, pull requests. No exceptions.
+
+## Scope
+
+| Crate | Phase | Purpose |
+|---|---|---|
+| `brigid-store` | 2 | Zero-trust SQLite storage (all data encrypted before INSERT) |
+| `brigid-did` | 2 | DID:web and DID:peer resolution + `.well-known/did.json` handler |
+| `brigid-identity` | 3 | `RootId`, `PrivateAlias`, `IdentifierKind`, VSID computation |
+| `brigid-webauthn` | 4 | Passkey registration and authentication flows |
+| `brigid-oidc` | 5 | ID Token issuance, JWKS, `.well-known/openid-configuration` |
+| `brigid-api` | 6 | Axum HTTP server — all routes |
+| `brigid-ui` | 6 | Leptos SSR frontend (login page, passkey management) |
+
+## Current phases
+
+**Phases 2–6** — see `/workspaces/.dev/phases/` for checklists.
+
+## Hard security constraints
+
+- **Zero-trust storage** — every sensitive field must be encrypted via `brigid-crypto`
+  before being written to SQLite. A raw SQL dump must never expose readable secrets.
+- **VSID invariants** (enforced in `brigid-identity`):
+  - `sub` in OIDC tokens = VSID, never username, alias, or raw DID.
+  - VSID must never be derived from an alias.
+  - VSID must never be derived from a virtual identity.
+  - Same `(did_root, client_id, salt)` → same VSID; different `client_id` → different VSID.
+- **No OpenSSL** — use `rustls` everywhere; TLS 1.3 minimum.
+- **No secrets in logs** — `tracing` spans must never capture key material, credentials, or tokens.
+- **No `unwrap()` on error paths** — typed errors via `thiserror`.
+- **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
+- **OIDC** — `jti` store must have TTL = token `exp`; never grow unbounded.
+- **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
+  (`default-src 'self'`, no `unsafe-inline`, nonce-based for Leptos hydration scripts).
+- **Rate limiting** — all `/auth/*` routes: 20 req/min per IP via `tower-governor`.
+
+## Architecture quick-reference
+
+```
+POST /auth/register/begin  → WebAuthn CreationChallenge
+POST /auth/register/finish → store encrypted credential
+POST /auth/login/begin     → WebAuthn RequestChallenge
+POST /auth/login/finish    → ID Token (sub = VSID)
+
+GET /.well-known/openid-configuration
+GET /.well-known/jwks.json
+GET /.well-known/did.json
+```
+
+## Key crates
+
+- `sqlx` (sqlite, runtime-tokio-rustls) — `brigid-store`
+- `webauthn-rs` — `brigid-webauthn`
+- `jsonwebtoken` (EdDSA, v9+) — `brigid-oidc`
+- `axum` + `tower-http` + `tower-governor` — `brigid-api`
+- `leptos` + `leptos_axum` — `brigid-ui`
+- `brigid-crypto` (git dep from `brig-id/crypto`)
+
+## Commands
+
+```bash
+cargo test --workspace
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+cargo audit
+cargo deny check
+cargo llvm-cov --workspace --summary-only
+```

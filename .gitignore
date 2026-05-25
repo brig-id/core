@@ -1,0 +1,9 @@
+# Build artifacts (CARGO_TARGET_DIR redirects to /cargo-target volume)
+/target
+# VS Code local history (not for version control)
+.history
+# macOS
+.DS_Store
+# Editor
+*.orig
+*.swp
