@@ -1,0 +1,36 @@
+[package]
+name = "brigid-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+brigid-store.workspace = true
+brigid-webauthn.workspace = true
+brigid-oidc.workspace = true
+brigid-identity.workspace = true
+brigid-did.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+url.workspace = true
+time.workspace = true
+
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "set-header", "trace"] }
+tower_governor = "0.8"
+tracing = "0.1"
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+
+[dev-dependencies]
+brigid-crypto.workspace = true
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
