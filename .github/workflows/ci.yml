@@ -1,0 +1,11 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: brig-id/.github/.github/workflows/ci-rust.yml@main
