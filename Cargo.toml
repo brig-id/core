@@ -4,6 +4,7 @@ members = [
     "crates/brigid-did",
     "crates/brigid-identity",
     "crates/brigid-webauthn",
+    "crates/brigid-oidc",
 ]
 resolver = "2"
 
