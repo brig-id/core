@@ -162,6 +162,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "brigid-identity"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "brigid-crypto",
+ "serde",
+ "sha3 0.10.9",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "brigid-store"
 version = "0.1.0"
 dependencies = [
