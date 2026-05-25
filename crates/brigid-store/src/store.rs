@@ -27,6 +27,21 @@ fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
         .map_err(crate::Error::from)
 }
 
+/// Compute a stable, deterministic lookup index for `username@server`.
+///
+/// Because `username` and `server` are stored encrypted, we cannot do a SQL
+/// `WHERE` on those columns. Instead we store an HKDF-derived index that is
+/// consistent across calls for the same master key and `username@server` pair,
+/// enabling an indexed lookup without leaking the plaintext values.
+///
+/// Index = hex(HKDF-SHA3-256(master, b"username@server", b"username-lookup"))
+fn username_index(master: &MasterKey, username: &str, server: &str) -> Result<String> {
+    let info = format!("{username}@{server}");
+    let key = brigid_crypto::hkdf::derive_user_key(master, info.as_bytes(), b"username-lookup")
+        .map_err(crate::Error::from)?;
+    Ok(hex::encode(*key))
+}
+
 /// Encrypt `plaintext` with `key`; returns the serialised nonce+ciphertext blob.
 ///
 /// AES-256-GCM encryption with a valid 32-byte key is unconditionally
@@ -53,7 +68,8 @@ fn dec(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
 /// Encrypt and INSERT a [`User`] into the database.
 ///
 /// `username`, `server`, and `did_web` are encrypted with a per-user
-/// HKDF-derived key before storage.
+/// HKDF-derived key before storage. A deterministic `username_index` is
+/// computed and stored to enable lookups without exposing plaintext.
 pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> Result<()> {
     let key = user_key(master, &user.id)?;
     let username_enc = enc(&key, user.username.as_bytes())?;
@@ -63,20 +79,67 @@ pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> R
         .created_at
         .format(&Rfc3339)
         .map_err(|e| Error::Time(e.to_string()))?;
+    let idx = username_index(master, &user.username, &user.server)?;
 
     sqlx::query(
-        "INSERT INTO users (id, username, server, did_web, created_at) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(user.id.to_string())
     .bind(username_enc)
     .bind(server_enc)
     .bind(did_web_enc)
     .bind(created_at)
+    .bind(idx)
     .execute(pool)
     .await?;
 
     Ok(())
+}
+
+/// Look up a [`User`] by `username` and `server`, using the deterministic
+/// `username_index` for the WHERE clause.
+///
+/// Returns `None` if no matching user exists.
+pub async fn fetch_user_by_username(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    username: &str,
+    server: &str,
+) -> Result<Option<User>> {
+    let idx = username_index(master, username, server)?;
+
+    let row = sqlx::query(
+        "SELECT id, username, server, did_web, created_at FROM users WHERE username_index = ?",
+    )
+    .bind(&idx)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else { return Ok(None) };
+
+    let id_str: String = row.try_get("id")?;
+    let id: Uuid = id_str.parse()?;
+    let key = user_key(master, &id)?;
+
+    let username_raw: Vec<u8> = row.try_get("username")?;
+    let server_raw: Vec<u8> = row.try_get("server")?;
+    let did_web_raw: Vec<u8> = row.try_get("did_web")?;
+    let created_at_str: String = row.try_get("created_at")?;
+
+    let username = String::from_utf8(dec(&key, &username_raw)?)?;
+    let server = String::from_utf8(dec(&key, &server_raw)?)?;
+    let did_web = String::from_utf8(dec(&key, &did_web_raw)?)?;
+    let created_at =
+        OffsetDateTime::parse(&created_at_str, &Rfc3339).map_err(|e| Error::Time(e.to_string()))?;
+
+    Ok(Some(User {
+        id,
+        username,
+        server,
+        did_web,
+        created_at,
+    }))
 }
 
 /// Fetch a [`User`] by ID, decrypting sensitive fields on read.
@@ -195,6 +258,14 @@ impl EncryptedStore {
 
     pub async fn fetch_credentials(&self, user_id: Uuid) -> Result<Vec<Credential>> {
         fetch_credentials(&self.pool, &self.master, user_id).await
+    }
+
+    pub async fn fetch_user_by_username(
+        &self,
+        username: &str,
+        server: &str,
+    ) -> Result<Option<User>> {
+        fetch_user_by_username(&self.pool, &self.master, username, server).await
     }
 }
 
@@ -325,15 +396,18 @@ mod tests {
 
         // 3 bytes is far too short for a valid AES-GCM blob (nonce alone is 12 bytes).
         let garbage: Vec<u8> = vec![0xde, 0xad, 0xbe];
+        // A dummy index value (64 zeros) satisfies the NOT NULL constraint.
+        let dummy_index = "0".repeat(64);
         sqlx::query(
-            "INSERT INTO users (id, username, server, did_web, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(&garbage)
         .bind(&garbage)
         .bind(&garbage)
         .bind(created_at)
+        .bind(dummy_index)
         .execute(&pool)
         .await?;
 
@@ -385,6 +459,21 @@ mod tests {
         let creds = store.fetch_credentials(user_id).await.unwrap();
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0].data, b"passkey-data");
+
+        // fetch_user_by_username via the wrapper
+        let found = store
+            .fetch_user_by_username("alice", "example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, user_id);
+        assert_eq!(found.username, "alice");
+
+        let missing = store
+            .fetch_user_by_username("bob", "example.com")
+            .await
+            .unwrap();
+        assert!(missing.is_none());
     }
 
     /// `OffsetDateTime::format(&Rfc3339)` returns `Err` for years outside
@@ -437,6 +526,51 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Time(_))),
             "expected Time error for malformed date, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn fetch_user_by_username_found(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user(); // username="alice", server="example.com"
+        let id = user.id;
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let found = fetch_user_by_username(&pool, &master, "alice", "example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.username, "alice");
+        assert_eq!(found.server, "example.com");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn fetch_user_by_username_not_found(pool: SqlitePool) -> sqlx::Result<()> {
+        let result = fetch_user_by_username(&pool, &master(), "nobody", "example.com")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        Ok(())
+    }
+
+    /// Verify that different master keys produce different username indexes,
+    /// so a lookup with the wrong key returns None instead of the wrong user.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn wrong_master_returns_none_for_username_lookup(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let wrong_master = MasterKey::from_hex(&"ff".repeat(32)).unwrap();
+        let result = fetch_user_by_username(&pool, &wrong_master, "alice", "example.com")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "wrong master key should not find the user"
         );
         Ok(())
     }

@@ -1,0 +1,449 @@
+//! Integration tests for brigid-api.
+
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use brigid_crypto::MasterKey;
+use brigid_identity::derive_vsid_salt;
+use brigid_oidc::OidcSigningKey;
+use brigid_store::EncryptedStore;
+use brigid_webauthn::WebauthnService;
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+use url::Url;
+use uuid::Uuid;
+
+use brigid_api::{AppState, build_router};
+
+fn master() -> MasterKey {
+    MasterKey::from_hex(&"ab".repeat(32)).unwrap()
+}
+
+async fn make_state() -> Arc<AppState> {
+    let master = master();
+    let vsid_salt = derive_vsid_salt(&master);
+    let store = EncryptedStore::new("sqlite::memory:", master)
+        .await
+        .unwrap();
+    let rp_origin = Url::parse("http://localhost:8080").unwrap();
+    let webauthn = WebauthnService::new("localhost", &rp_origin).unwrap();
+    let oidc_key = OidcSigningKey::generate();
+    let base_url = Url::parse("http://localhost:8080").unwrap();
+
+    Arc::new(AppState::new(
+        store, webauthn, oidc_key, base_url, vsid_salt,
+    ))
+}
+
+async fn response_body_json(body: Body) -> serde_json::Value {
+    let bytes = body.collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_returns_200() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_body_json(resp.into_body()).await;
+    assert_eq!(json["status"], "ok");
+}
+
+#[tokio::test]
+async fn ready_returns_200_when_db_accessible() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn openid_configuration_returns_valid_json() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_body_json(resp.into_body()).await;
+    assert!(json["issuer"].is_string(), "missing issuer");
+    assert!(json["authorization_endpoint"].is_string());
+    assert!(json["jwks_uri"].is_string());
+}
+
+#[tokio::test]
+async fn jwks_returns_valid_json() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_body_json(resp.into_body()).await;
+    assert!(json["keys"].is_array(), "missing keys array");
+    assert!(!json["keys"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn did_document_returns_valid_json() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/did.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_body_json(resp.into_body()).await;
+    assert!(json["id"].as_str().unwrap().starts_with("did:web:"));
+}
+
+// ---------------------------------------------------------------------------
+// Security headers
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn security_headers_present() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let headers = resp.headers();
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert!(headers.contains_key("strict-transport-security"));
+    assert!(headers.contains_key("content-security-policy"));
+}
+
+// ---------------------------------------------------------------------------
+// Auth: error paths (no WebAuthn hardware required)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn register_begin_rejects_invalid_username() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let body = serde_json::json!({ "username": "not-an-email" });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn register_finish_rejects_unknown_session() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let body = serde_json::json!({
+        "session_id": Uuid::new_v4(),
+        "credential": {}
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn login_finish_rejects_unknown_session() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let body = serde_json::json!({
+        "session_id": Uuid::new_v4(),
+        "credential": {}
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn login_begin_returns_404_for_unknown_user() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let body = serde_json::json!({ "username": "nobody@example.com" });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Auth: full register roundtrip using SoftPasskey
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn register_and_login_roundtrip() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // -- Register begin --
+    let body = serde_json::json!({ "username": "alice@localhost" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "register/begin failed");
+    let begin_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+
+    // -- Perform registration with soft passkey --
+    let reg_credential = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+
+    // -- Register finish --
+    let finish_body = serde_json::json!({
+        "session_id": session_id,
+        "credential": reg_credential,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&finish_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "register/finish failed");
+
+    // -- Login begin --
+    let body = serde_json::json!({ "username": "alice@localhost" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login/begin failed");
+    let begin_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let login_session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
+    let rcr: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+
+    // -- Perform authentication with soft passkey --
+    let auth_credential = auth_client.do_authentication(rp_origin, rcr).unwrap();
+
+    // -- Login finish --
+    let finish_body = serde_json::json!({
+        "session_id": login_session_id,
+        "credential": auth_credential,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&finish_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login/finish failed");
+    let login_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        login_json["id_token"].is_string(),
+        "expected id_token in response"
+    );
+}
+
+#[tokio::test]
+async fn register_begin_conflict_for_duplicate_user() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    let body = serde_json::json!({ "username": "bob@localhost" });
+
+    // First registration.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let begin_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+    let reg_credential = auth_client.do_registration(rp_origin, ccr).unwrap();
+
+    let finish_body = serde_json::json!({
+        "session_id": session_id,
+        "credential": reg_credential,
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&finish_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second registration attempt — must return 409 Conflict.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
