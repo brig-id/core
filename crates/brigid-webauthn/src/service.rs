@@ -133,14 +133,14 @@ pub async fn update_passkey(
     passkey: &Passkey,
 ) -> Result<()> {
     let creds = store.fetch_credentials(user_id).await?;
-    let target_id = serde_json::to_string(passkey.cred_id())
-        .expect("CredentialID always serializes");
+    let target_id =
+        serde_json::to_string(passkey.cred_id()).expect("CredentialID always serializes");
     let target_id = target_id.trim_matches('"');
 
     for cred in creds {
         let existing: Passkey = serde_json::from_slice(&cred.data)?;
-        let existing_id = serde_json::to_string(existing.cred_id())
-            .expect("CredentialID always serializes");
+        let existing_id =
+            serde_json::to_string(existing.cred_id()).expect("CredentialID always serializes");
         let existing_id_str = existing_id.trim_matches('"');
         if existing_id_str == target_id {
             let updated_cred = Credential {

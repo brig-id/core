@@ -1,9 +1,6 @@
 //! WebAuthn authentication and registration routes.
 
-use std::{
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use brigid_did::build_did_web;

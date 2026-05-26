@@ -73,7 +73,8 @@ pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> Vsid {
     // additional salt (HKDF without a salt uses a zero-filled hash-length pad).
     let hk = Hkdf::<Sha3_256>::new(None, salt);
     let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm).expect("32 bytes always fits within HKDF output limit");
+    hk.expand(&info, &mut okm)
+        .expect("32 bytes always fits within HKDF output limit");
     Vsid(Base64UrlUnpadded::encode_string(&okm))
 }
 
