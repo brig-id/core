@@ -17,7 +17,7 @@ publish = false
 rust-version = "1.85"
 
 [workspace.dependencies]
-brigid-crypto = { git = "https://github.com/brig-id/crypto", rev = "e6f92d72cd9264ef80d47c01524888c5bfa4be66" }
+brigid-crypto = { git = "https://github.com/brig-id/crypto", rev = "65cb9a3982d901db9ebb2c234ff230ee1bb621f9" }
 brigid-store = { path = "crates/brigid-store" }
 brigid-did = { path = "crates/brigid-did" }
 brigid-identity = { path = "crates/brigid-identity" }
