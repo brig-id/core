@@ -23,6 +23,9 @@ ignore = [
   # checking imports all DB backends). We do not use RSA or MySQL.
   # No fix available upstream.
   { id = "RUSTSEC-2023-0071", reason = "transitive via sqlx-macros-core; project uses SQLite only; no fix available" },
+  # paste crate marked unmaintained; pulled in transitively by webauthn-rs-proto.
+  # No security impact — paste is a proc-macro helper only.
+  { id = "RUSTSEC-2024-0436", reason = "transitive via webauthn-rs-proto; paste is a proc-macro with no runtime security impact; no fix available" },
 ]
 
 [bans]

@@ -16,9 +16,16 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 url.workspace = true
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.5", features = [
+  "danger-allow-state-serialisation",
+] }
 
 [dev-dependencies]
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate", "macros"] }
+sqlx = { version = "0.8", features = [
+  "sqlite",
+  "runtime-tokio-rustls",
+  "migrate",
+  "macros",
+] }
 time.workspace = true
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
