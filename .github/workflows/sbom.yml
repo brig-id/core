@@ -1,0 +1,11 @@
+name: SBOM
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  sbom:
+    uses: brig-id/.github/.github/workflows/sbom.yml@main
