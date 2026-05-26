@@ -45,7 +45,8 @@ pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
 ///
 /// Extracted so that tests can inject an HTTP mock URL without requiring HTTPS.
 pub(crate) async fn fetch_document(url: &str) -> Result<DIDDocument> {
-    let doc: DIDDocument = reqwest::get(url).await?.json().await?;
+    let resp = reqwest::get(url).await?.error_for_status()?;
+    let doc: DIDDocument = resp.json().await?;
     Ok(doc)
 }
 

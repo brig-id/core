@@ -4,7 +4,8 @@
 //! before writing to SQLite. A raw DB dump must never expose readable secrets.
 
 use brigid_crypto::{EncryptedBlob, MasterKey};
-use sqlx::{Row as _, SqlitePool};
+use sqlx::{Row as _, SqlitePool, sqlite::SqliteConnectOptions};
+use std::str::FromStr;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -239,7 +240,10 @@ impl EncryptedStore {
     /// Open (or create) the SQLite database at `database_url`, run migrations,
     /// and return an `EncryptedStore`.
     pub async fn new(database_url: &str, master: MasterKey) -> Result<Self> {
-        let pool = SqlitePool::connect(database_url).await?;
+        let opts = SqliteConnectOptions::from_str(database_url)?
+            .foreign_keys(true)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(opts).await?;
         crate::MIGRATOR.run(&pool).await?;
         Ok(Self { pool, master })
     }

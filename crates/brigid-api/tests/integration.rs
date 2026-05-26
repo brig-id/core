@@ -491,6 +491,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.1.10")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -511,6 +512,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.1.10")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "session_id": session_id,
@@ -532,6 +534,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.1.10")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -552,6 +555,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/login/finish")
                 .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.1.10")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "session_id": auth_session_id,
@@ -576,6 +580,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/logout")
                 .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.0.1.11")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -590,6 +595,7 @@ async fn logout_blacklists_token() {
                 .method("POST")
                 .uri("/auth/logout")
                 .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.0.1.11")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -612,8 +618,8 @@ async fn rate_limit_triggers_after_burst() {
     let app = build_router(state, &[]);
     let body = serde_json::to_vec(&serde_json::json!({ "username": "test@localhost" })).unwrap();
 
-    // 20 requests within the burst quota — none should be rate-limited.
-    for _ in 0..20 {
+    // 5 requests within the burst quota — none should be rate-limited.
+    for _ in 0..5 {
         let resp = app
             .clone()
             .oneshot(
@@ -630,7 +636,7 @@ async fn rate_limit_triggers_after_burst() {
         assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // 21st request — burst exhausted, must be throttled.
+    // 6th request — burst exhausted, must be throttled.
     let resp = app
         .oneshot(
             Request::builder()
