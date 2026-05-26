@@ -37,7 +37,10 @@ pub fn did_document_handler(
     let public_key_multibase = format!("z{}", bs58::encode(&payload).into_string());
 
     Ok(DIDDocument {
-        context: vec!["https://www.w3.org/ns/did/v1".to_string()],
+        context: vec![
+            "https://www.w3.org/ns/did/v1".to_string(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_string(),
+        ],
         id: did.to_string(),
         verification_method: vec![VerificationMethod {
             id: method_id.clone(),
@@ -65,7 +68,13 @@ mod tests {
     fn handler_returns_valid_document() {
         let doc = did_document_handler("alice", "example.com", &sample_key()).unwrap();
         assert_eq!(doc.id, "did:web:example.com:u:alice");
-        assert_eq!(doc.context, ["https://www.w3.org/ns/did/v1"]);
+        assert_eq!(
+            doc.context,
+            [
+                "https://www.w3.org/ns/did/v1",
+                "https://w3id.org/security/suites/ed25519-2020/v1"
+            ]
+        );
         assert_eq!(doc.verification_method.len(), 1);
         assert_eq!(doc.authentication.len(), 1);
         assert_eq!(

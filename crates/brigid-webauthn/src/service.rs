@@ -121,6 +121,42 @@ pub async fn load_passkeys(store: &EncryptedStore, user_id: Uuid) -> Result<Vec<
         .collect()
 }
 
+/// UPDATE an existing `Passkey` row for `user_id` in the encrypted store.
+///
+/// Finds the raw credential whose deserialised passkey has the same `cred_id`
+/// as `passkey`, then overwrites the encrypted data blob in-place. This
+/// prevents duplicate rows accumulating on each successful authentication
+/// when the signature counter advances.
+pub async fn update_passkey(
+    store: &EncryptedStore,
+    user_id: Uuid,
+    passkey: &Passkey,
+) -> Result<()> {
+    let creds = store.fetch_credentials(user_id).await?;
+    let target_id = serde_json::to_string(passkey.cred_id())
+        .expect("CredentialID always serializes");
+    let target_id = target_id.trim_matches('"');
+
+    for cred in creds {
+        let existing: Passkey = serde_json::from_slice(&cred.data)?;
+        let existing_id = serde_json::to_string(existing.cred_id())
+            .expect("CredentialID always serializes");
+        let existing_id_str = existing_id.trim_matches('"');
+        if existing_id_str == target_id {
+            let updated_cred = Credential {
+                id: cred.id,
+                user_id,
+                data: serde_json::to_vec(passkey)?,
+            };
+            store.update_credential(&updated_cred).await?;
+            return Ok(());
+        }
+    }
+    // No matching credential found — the auth was valid but counter state
+    // could not be persisted. This should not happen in practice.
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 use std::fmt;
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use sha3::{Digest, Sha3_256};
+use hkdf::Hkdf;
+use sha3::Sha3_256;
 
 use brigid_crypto::MasterKey;
 
@@ -42,11 +43,13 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
 ///
 /// Formula:
 /// ```text
-/// SHA3-256(
-///   u32_be(len(did_root)) || did_root ||
-///   u32_be(len(client_id)) || client_id ||
-///   salt
-/// )
+/// HKDF-SHA3-256(
+///   IKM  = salt,
+///   salt = b"" (none, already a derived key),
+///   info = "brigid-vsid-v1" ||
+///          u32_be(len(did_root)) || did_root ||
+///          u32_be(len(client_id)) || client_id
+/// )[..32]
 /// ```
 /// Length-prefixed fields prevent collisions (`:` appears in DIDs).
 /// Result is base64url-encoded without padding.
@@ -56,14 +59,22 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
 /// `did_root` MUST be a root DID (`did:web:…`). Passing an alias or a virtual
 /// identity DID here violates the VSID security model.
 pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> Vsid {
-    let mut hasher = Sha3_256::new();
-    hasher.update((did_root.len() as u32).to_be_bytes());
-    hasher.update(did_root.as_bytes());
-    hasher.update((client_id.len() as u32).to_be_bytes());
-    hasher.update(client_id.as_bytes());
-    hasher.update(salt);
-    let digest = hasher.finalize();
-    Vsid(Base64UrlUnpadded::encode_string(&digest))
+    let dr_len = (did_root.len() as u32).to_be_bytes();
+    let ci_len = (client_id.len() as u32).to_be_bytes();
+
+    let mut info = Vec::with_capacity(14 + 4 + did_root.len() + 4 + client_id.len());
+    info.extend_from_slice(b"brigid-vsid-v1");
+    info.extend_from_slice(&dr_len);
+    info.extend_from_slice(did_root.as_bytes());
+    info.extend_from_slice(&ci_len);
+    info.extend_from_slice(client_id.as_bytes());
+
+    // `salt` is already a 32-byte HKDF-derived value — use it as IKM with no
+    // additional salt (HKDF without a salt uses a zero-filled hash-length pad).
+    let hk = Hkdf::<Sha3_256>::new(None, salt);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes always fits within HKDF output limit");
+    Vsid(Base64UrlUnpadded::encode_string(&okm))
 }
 
 #[cfg(test)]
