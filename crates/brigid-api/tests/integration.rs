@@ -447,3 +447,258 @@ async fn register_begin_conflict_for_duplicate_user() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+// ---------------------------------------------------------------------------
+// Auth: logout
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn logout_requires_bearer_token() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_blacklists_token() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // -- Register --
+    let body = serde_json::json!({ "username": "charlie@localhost" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let begin_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+    let reg_credential = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": session_id,
+                        "credential": reg_credential,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // -- Login --
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let login_begin: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let auth_session_id: Uuid = serde_json::from_value(login_begin["session_id"].clone()).unwrap();
+    let rcr: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(login_begin["challenge"].clone()).unwrap();
+    let auth_credential = auth_client.do_authentication(rp_origin, rcr).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/finish")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": auth_session_id,
+                        "credential": auth_credential,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login/finish failed");
+    let login_json: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id_token = login_json["id_token"].as_str().unwrap().to_owned();
+
+    // -- Logout #1 — must succeed (200 OK) --
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header("authorization", format!("Bearer {id_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "first logout must succeed");
+
+    // -- Logout #2 — token is now blacklisted, must return 401 --
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header("authorization", format!("Bearer {id_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "second logout must fail (token blacklisted)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rate_limit_triggers_after_burst() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+    let body = serde_json::to_vec(&serde_json::json!({ "username": "test@localhost" })).unwrap();
+
+    // 20 requests within the burst quota — none should be rate-limited.
+    for _ in 0..20 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login/begin")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "10.0.0.1")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // 21st request — burst exhausted, must be throttled.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/begin")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.1")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cors_rejects_unauthorized_origin() {
+    let allowed = Url::parse("https://allowed.example.com").unwrap();
+    let state = make_state().await;
+    let app = build_router(state, &[allowed]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "https://evil.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "evil origin must not be reflected"
+    );
+}
+
+#[tokio::test]
+async fn cors_allows_configured_origin() {
+    let allowed = Url::parse("https://allowed.example.com").unwrap();
+    let state = make_state().await;
+    let app = build_router(state, &[allowed]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "https://allowed.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("https://allowed.example.com"),
+        "configured origin must be reflected"
+    );
+}

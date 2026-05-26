@@ -3,7 +3,7 @@ use jsonwebtoken::{Algorithm, Header, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::jti::JtiStore;
 use crate::key::OidcSigningKey;
 
@@ -87,6 +87,30 @@ pub fn validate_token(
     let token_data = jsonwebtoken::decode::<Claims>(jwt, &key.decoding_key(), &validation)?;
     let claims = token_data.claims;
     jti_store.check_and_insert(&claims.jti, claims.exp)?;
+    Ok(claims)
+}
+
+/// Decode and validate an OIDC token for repeated bearer auth use.
+///
+/// Checks signature, expiry, issuer, audience, and JTI blacklist.
+/// Does **not** insert the JTI — allows the same token to be used multiple times
+/// within its lifetime. Use this for bearer auth middleware.
+/// Use [`validate_token`] when you want to consume the token (one-time use).
+pub fn decode_token(
+    jwt: &str,
+    expected_issuer: &str,
+    expected_aud: &str,
+    key: &OidcSigningKey,
+    jti_store: &JtiStore,
+) -> Result<Claims> {
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[expected_aud]);
+    validation.set_issuer(&[expected_issuer]);
+    let token_data = jsonwebtoken::decode::<Claims>(jwt, &key.decoding_key(), &validation)?;
+    let claims = token_data.claims;
+    if jti_store.is_blacklisted(&claims.jti) {
+        return Err(Error::JtiReplay);
+    }
     Ok(claims)
 }
 

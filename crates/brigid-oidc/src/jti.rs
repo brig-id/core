@@ -31,6 +31,22 @@ impl JtiStore {
         }
     }
 
+    /// Explicitly blacklists `jti` without a replay check.
+    ///
+    /// Use this for logout: the token is invalidated and subsequent calls to
+    /// [`is_blacklisted`](Self::is_blacklisted) will return `true` until it expires.
+    pub fn blacklist(&mut self, jti: &str, exp: i64) {
+        self.entries.insert(jti.to_string(), exp);
+    }
+
+    /// Returns `true` if `jti` is currently blacklisted and not yet expired.
+    pub fn is_blacklisted(&self, jti: &str) -> bool {
+        match self.entries.get(jti) {
+            Some(&exp) => exp > now_unix(),
+            None => false,
+        }
+    }
+
     /// Checks that `jti` has not been used since `exp`.
     ///
     /// Evicts all expired entries first (keeps the store bounded).

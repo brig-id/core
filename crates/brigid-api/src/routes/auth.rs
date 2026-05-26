@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
+    middleware::AuthenticatedClaims,
     state::{AppState, PendingAuthentication, PendingRegistration},
 };
 
@@ -242,4 +243,20 @@ pub async fn login_finish(
     let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
 
     Ok((StatusCode::OK, Json(LoginResponse { id_token })))
+}
+
+/// `POST /auth/logout`
+///
+/// Blacklists the presented Bearer token's JTI, preventing further use
+/// before it expires naturally.
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .jti_store
+        .lock()
+        .unwrap()
+        .blacklist(&claims.jti, claims.exp);
+    Ok(StatusCode::OK)
 }
