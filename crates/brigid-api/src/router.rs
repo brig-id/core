@@ -87,7 +87,12 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
     } else {
         let origins: Vec<_> = cors_origins
             .iter()
-            .filter_map(|u| u.as_str().trim_end_matches('/').parse().ok())
+            .map(|u| {
+                u.as_str()
+                    .trim_end_matches('/')
+                    .parse::<HeaderValue>()
+                    .expect("CORS origin is not a valid header value — check configuration")
+            })
             .collect();
         CorsLayer::new()
             .allow_origin(origins)
@@ -99,10 +104,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             .allow_headers(Any)
     };
 
-    // Rate limiter for /auth/* routes: 20-request burst, then 1 req/3 s per IP.
+    // Rate limiter for /auth/* routes: 1 token per 3 s per IP, burst of 5 ≈ 20 req/min.
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(3)
-        .burst_size(20)
+        .burst_size(5)
         .key_extractor(ForwardedForExtractor)
         .finish()
         .unwrap();

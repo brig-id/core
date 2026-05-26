@@ -32,6 +32,13 @@ ignore = [
 multiple-versions = "warn"
 wildcards = "warn"
 
+[[bans.skip-tree]]
+# webauthn-rs-core pulls in openssl-sys as a transitive dependency via its
+# optional TLS feature. We do not enable TLS features or link OpenSSL at
+# runtime; this is a build-time detection artifact and has no security impact.
+name = "openssl-sys"
+reason = "transitive via webauthn-rs-core; not linked at runtime; no fix available upstream"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

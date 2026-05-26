@@ -14,6 +14,14 @@ fn now_unix() -> i64 {
 ///
 /// Evicts expired entries before each check to keep the store bounded.
 /// The store must persist for at least the maximum token lifetime.
+///
+/// # Limitation
+///
+/// This store is process-local. Blacklisted JTIs are lost on service restart,
+/// so tokens revoked before `exp` may be accepted again after a restart.
+/// A future phase should persist the JTI blacklist in the SQLite `jti_blacklist`
+/// table with TTL = token `exp` to survive restarts.
+// TODO(phase-5): migrate JTI blacklist to SQLite for persistence across restarts.
 pub struct JtiStore {
     entries: HashMap<String, i64>, // jti → exp (unix secs)
 }
