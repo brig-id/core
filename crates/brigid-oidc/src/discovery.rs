@@ -24,11 +24,19 @@ pub struct JwkSet {
 }
 
 /// OpenID Connect Discovery 1.0 metadata.
+///
+/// brig·id issues OIDC ID tokens but uses WebAuthn/passkeys instead of the
+/// standard OAuth 2.0 Authorization Code flow. As a result,
+/// `authorization_endpoint` and `token_endpoint` are omitted from the
+/// discovery document. Relying parties should use the brig·id WebAuthn API
+/// (`/auth/login/begin`, `/auth/login/finish`) to obtain tokens.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenIDConfiguration {
     pub issuer: String,
-    pub authorization_endpoint: String,
-    pub token_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
     pub jwks_uri: String,
     pub response_types_supported: Vec<String>,
     pub subject_types_supported: Vec<String>,
@@ -59,8 +67,8 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
     let base = base_url.as_str().trim_end_matches('/');
     OpenIDConfiguration {
         issuer: base.to_string(),
-        authorization_endpoint: format!("{base}/auth/authorize"),
-        token_endpoint: format!("{base}/auth/token"),
+        authorization_endpoint: None,
+        token_endpoint: None,
         jwks_uri: format!("{base}/.well-known/jwks.json"),
         response_types_supported: vec!["code".to_string()],
         subject_types_supported: vec!["public".to_string()],

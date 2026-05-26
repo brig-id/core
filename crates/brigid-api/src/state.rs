@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use brigid_oidc::{JtiStore, OidcSigningKey};
@@ -13,16 +14,24 @@ use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
 
 /// In-flight registration session keyed by a temporary session UUID.
 pub struct PendingRegistration {
+    pub user_id: Uuid,
     pub username: String,
     pub server: String,
     pub state: PasskeyRegistration,
+    /// Timestamp when this session was created; used for TTL eviction.
+    pub created_at: Instant,
 }
 
 /// In-flight authentication session keyed by a temporary session UUID.
 pub struct PendingAuthentication {
     pub user_id: Uuid,
     pub state: PasskeyAuthentication,
+    /// Timestamp when this session was created; used for TTL eviction.
+    pub created_at: Instant,
 }
+
+/// Challenge sessions expire after 5 minutes of inactivity.
+const PENDING_SESSION_TTL: Duration = Duration::from_secs(300);
 
 /// Central application state shared (via `Arc`) across all request handlers.
 pub struct AppState {
@@ -55,5 +64,20 @@ impl AppState {
             pending_registrations: Arc::new(Mutex::new(HashMap::new())),
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Evict pending sessions older than [`PENDING_SESSION_TTL`].
+    ///
+    /// Call this before inserting a new pending session to bound memory growth.
+    pub fn evict_expired_pending(&self) {
+        let cutoff = Instant::now() - PENDING_SESSION_TTL;
+        self.pending_registrations
+            .lock()
+            .unwrap()
+            .retain(|_, v| v.created_at > cutoff);
+        self.pending_authentications
+            .lock()
+            .unwrap()
+            .retain(|_, v| v.created_at > cutoff);
     }
 }

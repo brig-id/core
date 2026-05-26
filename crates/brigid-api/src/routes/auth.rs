@@ -1,13 +1,16 @@
 //! WebAuthn authentication and registration routes.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Instant,
+};
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use brigid_did::build_did_web;
 use brigid_identity::{RootId, compute_vsid};
 use brigid_oidc::{IssuanceParams, issue_token};
 use brigid_store::User;
-use brigid_webauthn::{load_passkeys, store_passkey};
+use brigid_webauthn::{load_passkeys, store_passkey, update_passkey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -84,12 +87,15 @@ pub async fn register_begin(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
+    state.evict_expired_pending();
     state.pending_registrations.lock().unwrap().insert(
         session_id,
         PendingRegistration {
+            user_id,
             username: root_id.username.clone(),
             server: root_id.server.clone(),
             state: reg_state,
+            created_at: Instant::now(),
         },
     );
 
@@ -119,7 +125,9 @@ pub async fn register_finish(
         .finish_registration(&pending.state, &body.credential)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let user_id = Uuid::new_v4();
+    // Use the same user_id that was bound into the WebAuthn challenge —
+    // the passkey's stored user handle must match the one in the authenticator.
+    let user_id = pending.user_id;
     let did_web = build_did_web(&pending.username, &pending.server).to_string();
 
     let user = User {
@@ -171,6 +179,7 @@ pub async fn login_begin(
         PendingAuthentication {
             user_id: user.id,
             state: auth_state,
+            created_at: Instant::now(),
         },
     );
 
@@ -210,7 +219,7 @@ pub async fn login_finish(
                 serde_json::to_string(passkey.cred_id()).expect("CredentialID always serializes");
             let cred_id = cred_id_json.trim_matches('"').to_string();
             if cred_id == auth_result.credential_id {
-                store_passkey(&state.store, pending.user_id, passkey)
+                update_passkey(&state.store, pending.user_id, passkey)
                     .await
                     .map_err(|e| internal!(e))?;
                 break;

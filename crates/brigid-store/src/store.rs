@@ -35,10 +35,20 @@ fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
 /// consistent across calls for the same master key and `username@server` pair,
 /// enabling an indexed lookup without leaking the plaintext values.
 ///
-/// Index = hex(HKDF-SHA3-256(master, b"username@server", b"username-lookup"))
+/// Both fields are length-prefixed (u32 BE) before being fed into HKDF to
+/// prevent ambiguous collisions between inputs such as
+/// `(username="a@b", server="c")` and `(username="a", server="b@c")`.
+///
+/// Index = hex(HKDF-SHA3-256(master, len||username||len||server, b"username-lookup"))
 fn username_index(master: &MasterKey, username: &str, server: &str) -> Result<String> {
-    let info = format!("{username}@{server}");
-    let key = brigid_crypto::hkdf::derive_user_key(master, info.as_bytes(), b"username-lookup")
+    let ulen = (username.len() as u32).to_be_bytes();
+    let slen = (server.len() as u32).to_be_bytes();
+    let mut input = Vec::with_capacity(8 + username.len() + server.len());
+    input.extend_from_slice(&ulen);
+    input.extend_from_slice(username.as_bytes());
+    input.extend_from_slice(&slen);
+    input.extend_from_slice(server.as_bytes());
+    let key = brigid_crypto::hkdf::derive_user_key(master, &input, b"username-lookup")
         .map_err(crate::Error::from)?;
     Ok(hex::encode(*key))
 }
@@ -200,6 +210,28 @@ pub async fn store_credential(
     Ok(())
 }
 
+/// UPDATE the encrypted `data` blob for an existing [`Credential`] row.
+///
+/// Used when WebAuthn advances the signature counter after a successful
+/// authentication — the credential's serialised `Passkey` state is updated
+/// in-place rather than inserting a duplicate row.
+pub async fn update_credential(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    cred: &Credential,
+) -> Result<()> {
+    let key = user_key(master, &cred.user_id)?;
+    let data_enc = enc(&key, &cred.data)?;
+
+    sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
+        .bind(data_enc)
+        .bind(cred.id.to_string())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 /// Fetch all [`Credential`]s for a user, decrypting `data` on read.
 pub async fn fetch_credentials(
     pool: &SqlitePool,
@@ -258,6 +290,10 @@ impl EncryptedStore {
 
     pub async fn store_credential(&self, cred: &Credential) -> Result<()> {
         store_credential(&self.pool, &self.master, cred).await
+    }
+
+    pub async fn update_credential(&self, cred: &Credential) -> Result<()> {
+        update_credential(&self.pool, &self.master, cred).await
     }
 
     pub async fn fetch_credentials(&self, user_id: Uuid) -> Result<Vec<Credential>> {

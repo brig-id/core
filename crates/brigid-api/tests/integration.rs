@@ -107,7 +107,8 @@ async fn openid_configuration_returns_valid_json() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = response_body_json(resp.into_body()).await;
     assert!(json["issuer"].is_string(), "missing issuer");
-    assert!(json["authorization_endpoint"].is_string());
+    // authorization_endpoint and token_endpoint are intentionally omitted —
+    // brig·id uses WebAuthn passkeys instead of the standard OAuth 2.0 code flow.
     assert!(json["jwks_uri"].is_string());
 }
 

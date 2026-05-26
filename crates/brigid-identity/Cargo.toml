@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 brigid-crypto.workspace = true
+hkdf = { workspace = true }
 sha3 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

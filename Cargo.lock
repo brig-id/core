@@ -418,6 +418,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "brigid-crypto",
+ "hkdf",
  "serde",
  "sha3 0.10.9",
  "thiserror 2.0.18",
@@ -460,7 +461,6 @@ dependencies = [
 name = "brigid-ui"
 version = "0.1.0"
 dependencies = [
- "brigid-api",
  "leptos",
  "reactive_graph",
  "serde",

@@ -21,7 +21,10 @@ pub fn build_did_web(username: &str, server: &str) -> Did {
 /// Map a `did:web` DID to its `.well-known/did.json` (or equivalent) URL.
 ///
 /// Colon-separated path components after the host are converted to URL path
-/// segments per the DID:web specification.
+/// segments per the DID:web specification. The host segment is percent-decoded
+/// before use so that port separators encoded as `%3A` become literal `:`,
+/// enabling correct HTTPS URL construction (e.g. `did:web:example.com%3A8443`
+/// maps to `https://example.com:8443/.well-known/did.json`).
 pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
     let s = did.as_str();
     let method_specific = s
@@ -29,13 +32,15 @@ pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
         .ok_or_else(|| Error::InvalidDid(format!("not a did:web DID: {s}")))?;
 
     let parts: Vec<&str> = method_specific.split(':').collect();
-    let host = parts[0];
+    // Percent-decode the host component so that `%3A` (colon) becomes `:` for
+    // port numbers, and `%2F` (slash) becomes `/` for sub-path hosts.
+    let host_decoded = parts[0].replace("%3A", ":").replace("%2F", "/");
 
     let raw = if parts.len() == 1 {
-        format!("https://{host}/.well-known/did.json")
+        format!("https://{host_decoded}/.well-known/did.json")
     } else {
         let path = parts[1..].join("/");
-        format!("https://{host}/{path}/did.json")
+        format!("https://{host_decoded}/{path}/did.json")
     };
 
     Ok(raw.parse()?)
