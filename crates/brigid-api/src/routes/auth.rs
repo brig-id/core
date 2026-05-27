@@ -135,11 +135,15 @@ pub async fn register_finish(
         created_at: OffsetDateTime::now_utc(),
     };
 
-    state
-        .store
-        .store_user(&user)
-        .await
-        .map_err(|e| internal!(e))?;
+    state.store.store_user(&user).await.map_err(|e| match e {
+        // The pre-check in `register_begin` is advisory; the authoritative
+        // duplicate signal is the UNIQUE constraint on `username_index`.
+        // Concurrent registrations of the same username collapse here.
+        brigid_store::Error::Duplicate => {
+            ApiError::Conflict(format!("user {} already exists", user.username))
+        }
+        other => internal!(other),
+    })?;
     store_passkey(&state.store, user_id, &passkey)
         .await
         .map_err(|e| internal!(e))?;

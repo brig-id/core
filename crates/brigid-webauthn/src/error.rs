@@ -9,6 +9,12 @@ pub enum Error {
     Store(#[from] brigid_store::Error),
     #[error("no credentials registered for this user")]
     NoCredentials,
+    /// `update_passkey` was called for a credential ID that does not exist in
+    /// the store. This indicates a desynchronisation between the authenticated
+    /// passkey and the persisted state — the signature counter cannot be
+    /// advanced safely, so we refuse rather than silently dropping the update.
+    #[error("authenticated credential not found in store; counter not updated")]
+    CredentialNotMatched,
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }

@@ -29,12 +29,17 @@ pub async fn jwks(State(state): State<Arc<AppState>>) -> Result<impl IntoRespons
 pub async fn did_document(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Extract the server's hostname from the base URL.
-    let server = state
+    // Extract the server's hostname (including any non-default port) from the
+    // base URL — the DID:web identifier must match the URL clients use to
+    // resolve `.well-known/did.json`, which includes the port when present.
+    let host = state
         .base_url
         .host_str()
-        .ok_or_else(|| ApiError::BadRequest("invalid base URL: no host".into()))?
-        .to_string();
+        .ok_or_else(|| ApiError::BadRequest("invalid base URL: no host".into()))?;
+    let server = match state.base_url.port() {
+        Some(port) => format!("{host}%3A{port}"),
+        None => host.to_string(),
+    };
 
     // Use the OIDC Ed25519 key bytes as the server's public key.
     let public_key_bytes = state.oidc_key.verifying_key().to_bytes();

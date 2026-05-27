@@ -44,6 +44,13 @@ pub struct AppState {
     pub vsid_salt: [u8; 32],
     pub pending_registrations: Arc<Mutex<HashMap<Uuid, PendingRegistration>>>,
     pub pending_authentications: Arc<Mutex<HashMap<Uuid, PendingAuthentication>>>,
+    /// Whether to trust `x-forwarded-for` for rate-limit key extraction.
+    ///
+    /// MUST be `true` only when the API is reachable exclusively through a
+    /// trusted reverse proxy (e.g. Caddy in the reference deployment) that
+    /// overwrites the header. If the API is reachable directly, an attacker
+    /// can forge the header to bypass rate limits — keep this `false`.
+    pub trust_forwarded_for: bool,
 }
 
 impl AppState {
@@ -63,6 +70,10 @@ impl AppState {
             vsid_salt,
             pending_registrations: Arc::new(Mutex::new(HashMap::new())),
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
+            // Default to false — safe for direct exposure and tests. The
+            // production deployment binary (`server-leaf`) must opt-in when
+            // Caddy (or another trusted proxy) terminates the public TLS edge.
+            trust_forwarded_for: false,
         }
     }
 

@@ -418,6 +418,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "brigid-crypto",
+ "bs58",
  "hkdf",
  "serde",
  "sha3 0.10.9",

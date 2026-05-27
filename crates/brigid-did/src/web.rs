@@ -34,7 +34,13 @@ pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
     let parts: Vec<&str> = method_specific.split(':').collect();
     // Percent-decode the host component so that `%3A` (colon) becomes `:` for
     // port numbers, and `%2F` (slash) becomes `/` for sub-path hosts.
-    let host_decoded = parts[0].replace("%3A", ":").replace("%2F", "/");
+    // The DID-Web specification mandates ASCII percent-encoded triplets but
+    // does not constrain the hex case — accept both `%3A` and `%3a`.
+    let host_decoded = parts[0]
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%2F", "/")
+        .replace("%2f", "/");
 
     let raw = if parts.len() == 1 {
         format!("https://{host_decoded}/.well-known/did.json")
