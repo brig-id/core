@@ -25,6 +25,12 @@ pub struct PendingRegistration {
 /// In-flight authentication session keyed by a temporary session UUID.
 pub struct PendingAuthentication {
     pub user_id: Uuid,
+    /// Relying-party identifier sent at `/auth/login/begin`. Bound into the
+    /// pending session so the `aud` claim and VSID derived at
+    /// `/auth/login/finish` cannot be changed between the two halves of the
+    /// flow (an attacker controlling the second request must otherwise be
+    /// able to swap the audience for a token they did not initiate).
+    pub client_id: String,
     pub state: PasskeyAuthentication,
     /// Timestamp when this session was created; used for TTL eviction.
     pub created_at: Instant,

@@ -343,6 +343,61 @@ impl EncryptedStore {
         fetch_user_by_username(&self.pool, &self.master, username, server).await
     }
 
+    /// Atomically INSERT a user **and** their first credential in a single
+    /// transaction.
+    ///
+    /// This is the only correct entry point for the WebAuthn registration
+    /// finish flow: if the credential write fails after the user write
+    /// succeeds, the account would otherwise remain registered with no
+    /// credentials — locking the user out (every login then fails with no
+    /// credentials, every re-registration attempt collides on the unique
+    /// username index). The transaction guarantees the two rows either both
+    /// commit or both roll back.
+    pub async fn register_user_with_credential(
+        &self,
+        user: &User,
+        cred: &Credential,
+    ) -> Result<()> {
+        let u_key = user_key(&self.master, &user.id)?;
+        let username_enc = enc(&u_key, user.username.as_bytes())?;
+        let server_enc = enc(&u_key, user.server.as_bytes())?;
+        let did_web_enc = enc(&u_key, user.did_web.as_bytes())?;
+        let created_at = user
+            .created_at
+            .format(&Rfc3339)
+            .map_err(|e| Error::Time(e.to_string()))?;
+        let idx = username_index(&self.master, &user.username, &user.server)?;
+
+        let cred_key = user_key(&self.master, &cred.user_id)?;
+        let cred_data_enc = enc(&cred_key, &cred.data)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user.id.to_string())
+        .bind(username_enc)
+        .bind(server_enc)
+        .bind(did_web_enc)
+        .bind(created_at)
+        .bind(idx)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_unique)?;
+
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+            .bind(cred.id.to_string())
+            .bind(cred.user_id.to_string())
+            .bind(cred_data_enc)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Persist a revoked JTI in the database so it remains blacklisted across
     /// server restarts for the duration of its token lifetime.
     ///

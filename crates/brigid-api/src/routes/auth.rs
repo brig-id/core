@@ -7,7 +7,7 @@ use brigid_did::build_did_web;
 use brigid_identity::{RootId, compute_vsid};
 use brigid_oidc::{IssuanceParams, issue_token};
 use brigid_store::User;
-use brigid_webauthn::{load_passkeys, store_passkey, update_passkey};
+use brigid_webauthn::{load_passkeys, passkey_to_credential, update_passkey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -38,6 +38,12 @@ pub struct FinishRegisterRequest {
 #[derive(Deserialize)]
 pub struct BeginLoginRequest {
     pub username: String,
+    /// Relying-party identifier (the OIDC `client_id`) that will receive the
+    /// resulting ID Token. Required: the `aud` claim and the VSID embedded
+    /// in the token are derived from this value, so the same physical user
+    /// presents a different opaque `sub` to each RP (AGENTS.md per-RP
+    /// correlation invariant).
+    pub client_id: String,
 }
 
 #[derive(Serialize)]
@@ -146,18 +152,24 @@ pub async fn register_finish(
         created_at: OffsetDateTime::now_utc(),
     };
 
-    state.store.store_user(&user).await.map_err(|e| match e {
-        // The pre-check in `register_begin` is advisory; the authoritative
-        // duplicate signal is the UNIQUE constraint on `username_index`.
-        // Concurrent registrations of the same username collapse here.
-        brigid_store::Error::Duplicate => {
-            ApiError::Conflict(format!("user {} already exists", user.username))
-        }
-        other => internal!(other),
-    })?;
-    store_passkey(&state.store, user_id, &passkey)
+    // Atomic registration: writing the user and their first credential in
+    // separate operations leaves a window where a transient failure on the
+    // credential write would orphan the user row (UNIQUE on `username_index`
+    // then blocks every re-registration attempt while every login fails
+    // with "no credentials"). The store-level transaction commits both or
+    // neither.
+    let cred =
+        passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
+    state
+        .store
+        .register_user_with_credential(&user, &cred)
         .await
-        .map_err(|e| internal!(e))?;
+        .map_err(|e| match e {
+            brigid_store::Error::Duplicate => {
+                ApiError::Conflict(format!("user {} already exists", user.username))
+            }
+            other => internal!(other),
+        })?;
 
     Ok(StatusCode::OK)
 }
@@ -168,6 +180,9 @@ pub async fn login_begin(
     Json(body): Json<BeginLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let root_id = RootId::parse(&body.username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if body.client_id.is_empty() {
+        return Err(ApiError::BadRequest("client_id is required".into()));
+    }
 
     let user = state
         .store
@@ -195,6 +210,7 @@ pub async fn login_begin(
             session_id,
             PendingAuthentication {
                 user_id: user.id,
+                client_id: body.client_id,
                 state: auth_state,
                 created_at: Instant::now(),
             },
@@ -258,7 +274,13 @@ pub async fn login_finish(
 
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/').to_string();
-    let client_id = state.base_url.host_str().unwrap_or("unknown").to_string();
+    // Use the relying-party `client_id` captured at `/auth/login/begin` (and
+    // bound into the pending session so it cannot be swapped between the
+    // begin and finish requests). The `aud` claim and the VSID embedded in
+    // the token are both derived from this value so the same physical user
+    // presents a different opaque `sub` to each RP (AGENTS.md per-RP
+    // correlation invariant).
+    let client_id = pending.client_id.clone();
     let vsid =
         compute_vsid(&user.did_web, &client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
 

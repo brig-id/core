@@ -265,7 +265,7 @@ async fn login_begin_returns_404_for_unknown_user() {
     let state = make_state().await;
     let app = build_router(state, &[]);
 
-    let body = serde_json::json!({ "username": "nobody@example.com" });
+    let body = serde_json::json!({ "username": "nobody@example.com", "client_id": "test-client" });
     let resp = app
         .oneshot(
             Request::builder()
@@ -340,7 +340,7 @@ async fn register_and_login_roundtrip() {
     assert_eq!(resp.status(), StatusCode::OK, "register/finish failed");
 
     // -- Login begin --
-    let body = serde_json::json!({ "username": "alice@localhost" });
+    let body = serde_json::json!({ "username": "alice@localhost", "client_id": "test-client" });
     let resp = app
         .clone()
         .oneshot(
@@ -492,7 +492,7 @@ async fn logout_blacklists_token() {
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
     // -- Register --
-    let body = serde_json::json!({ "username": "charlie@localhost" });
+    let body = serde_json::json!({ "username": "charlie@localhost", "client_id": "test-client" });
     let resp = app
         .clone()
         .oneshot(
@@ -625,7 +625,7 @@ async fn logout_blacklists_token() {
 async fn rate_limit_triggers_after_burst() {
     let state = make_state().await;
     let app = build_router(state, &[]);
-    let body = serde_json::to_vec(&serde_json::json!({ "username": "test@localhost" })).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({ "username": "test@localhost", "client_id": "test-client" })).unwrap();
 
     // 5 requests within the burst quota — none should be rate-limited.
     for _ in 0..5 {
