@@ -32,9 +32,24 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedClaims {
         let issuer = issuer.trim_end_matches('/').to_string();
         let client_id = state.base_url.host_str().unwrap_or("unknown").to_string();
 
-        let jti_store = state.jti_store.lock().unwrap();
-        let claims = decode_token(&token, &issuer, &client_id, &state.oidc_key, &jti_store)
+        // Decode and validate the token against the in-memory JTI blacklist.
+        // The guard is scoped so it is *definitely* dropped before the async
+        // DB check below — MutexGuard is !Send and cannot cross an await point.
+        let claims = {
+            let jti_store = state.jti_store.lock().unwrap_or_else(|e| e.into_inner());
+            decode_token(&token, &issuer, &client_id, &state.oidc_key, &jti_store)
+                .map_err(|_| ApiError::Unauthorized)?
+        }; // MutexGuard dropped here, before any .await
+
+        // Also check the persistent DB blacklist so revocations survive restarts.
+        let db_blacklisted = state
+            .store
+            .is_jti_blacklisted(&claims.jti)
+            .await
             .map_err(|_| ApiError::Unauthorized)?;
+        if db_blacklisted {
+            return Err(ApiError::Unauthorized);
+        }
 
         Ok(AuthenticatedClaims(claims))
     }

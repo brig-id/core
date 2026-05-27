@@ -8,7 +8,10 @@ use sqlx::{
     Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -319,6 +322,45 @@ impl EncryptedStore {
         server: &str,
     ) -> Result<Option<User>> {
         fetch_user_by_username(&self.pool, &self.master, username, server).await
+    }
+
+    /// Persist a revoked JTI in the database so it remains blacklisted across
+    /// server restarts for the duration of its token lifetime.
+    ///
+    /// Expired entries (exp < now) are pruned on each insert to keep the table
+    /// bounded.
+    pub async fn blacklist_jti(&self, jti: &str, exp: i64) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Prune expired entries to keep the table bounded.
+        sqlx::query("DELETE FROM jti_blacklist WHERE exp <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("INSERT OR REPLACE INTO jti_blacklist (jti, exp) VALUES (?, ?)")
+            .bind(jti)
+            .bind(exp)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Returns `true` if the JTI is in the persistent blacklist and has not
+    /// yet expired.
+    pub async fn is_jti_blacklisted(&self, jti: &str) -> Result<bool> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT jti FROM jti_blacklist WHERE jti = ? AND exp > ?")
+                .bind(jti)
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
     }
 }
 

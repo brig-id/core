@@ -33,13 +33,13 @@ multiple-versions = "warn"
 wildcards = "warn"
 
 [[bans.skip-tree]]
-# webauthn-rs-core (a runtime dependency of webauthn-rs) transitively depends on
-# openssl-sys via its optional TLS detection feature. openssl-sys can link to the
-# system OpenSSL library when the feature is enabled; however, brigid does not
-# enable any webauthn-rs TLS feature flags, so OpenSSL is not linked in brigid
-# builds. No upstream alternative exists.
+# webauthn-rs-core unconditionally depends on openssl via webauthn-attestation-ca
+# (used for X.509 attestation certificate chain verification — not for TLS).
+# All network connections in brigid use rustls; OpenSSL is never used for TLS.
+# This dependency cannot be removed without replacing the webauthn-rs library.
+# Tracked upstream: https://github.com/kanidm/webauthn-rs/issues
 name = "openssl-sys"
-reason = "transitive runtime dep of webauthn-rs-core (optional TLS feature not enabled); OpenSSL is not linked in brigid builds; no upstream fix available"
+reason = "transitive dep of webauthn-rs-core via webauthn-attestation-ca for X.509 attestation cert parsing; not used for TLS connections (rustls handles all TLS); no upstream alternative available"
 
 [sources]
 unknown-registry = "deny"
