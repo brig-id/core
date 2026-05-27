@@ -31,7 +31,7 @@ pub struct PendingAuthentication {
 }
 
 /// Challenge sessions expire after 5 minutes of inactivity.
-const PENDING_SESSION_TTL: Duration = Duration::from_secs(300);
+pub(crate) const PENDING_SESSION_TTL: Duration = Duration::from_secs(300);
 
 /// Central application state shared (via `Arc`) across all request handlers.
 pub struct AppState {

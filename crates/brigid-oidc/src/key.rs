@@ -19,7 +19,12 @@ impl OidcSigningKey {
         }
     }
 
-    /// Reconstruct a key from raw 32-byte seed bytes (e.g. after decrypted storage).
+    /// Reconstruct a key from raw 32-byte seed bytes.
+    ///
+    /// The signing seed is treated as opaque caller-supplied material: this
+    /// method performs **no** KDF, HKDF, or master-key derivation. Callers are
+    /// responsible for decrypting the seed (typically stored encrypted under
+    /// `MASTER_KEY` via `brigid-store`) before invoking this constructor.
     pub fn from_raw_bytes(kid: String, bytes: &[u8; 32]) -> Self {
         Self {
             kid,

@@ -8,4 +8,4 @@ on:
 
 jobs:
   ci:
-    uses: brig-id/.github/.github/workflows/ci-rust.yml@main
+    uses: brig-id/.github/.github/workflows/ci-rust.yml@26e9a0393cb98cdb4f25e4d10f155230fb4db6f5

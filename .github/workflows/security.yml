@@ -8,4 +8,4 @@ on:
 
 jobs:
   security:
-    uses: brig-id/.github/.github/workflows/security-audit.yml@main
+    uses: brig-id/.github/.github/workflows/security-audit.yml@26e9a0393cb98cdb4f25e4d10f155230fb4db6f5

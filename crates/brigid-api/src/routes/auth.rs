@@ -117,6 +117,13 @@ pub async fn register_finish(
         .remove(&body.session_id)
         .ok_or(ApiError::BadRequest("unknown session".into()))?;
 
+    // Authoritative TTL check at finish time. `evict_expired_pending()` only
+    // runs opportunistically when a new challenge is created; in the absence
+    // of new traffic an expired pending session would otherwise remain valid.
+    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
+        return Err(ApiError::BadRequest("session expired".into()));
+    }
+
     let passkey = state
         .webauthn
         .finish_registration(&pending.state, &body.credential)
@@ -205,6 +212,11 @@ pub async fn login_finish(
         .unwrap()
         .remove(&body.session_id)
         .ok_or(ApiError::BadRequest("unknown session".into()))?;
+
+    // Authoritative TTL check at finish time — see `register_finish`.
+    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
+        return Err(ApiError::BadRequest("session expired".into()));
+    }
 
     let mut passkeys = load_passkeys(&state.store, pending.user_id)
         .await

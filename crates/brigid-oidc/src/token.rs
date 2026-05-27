@@ -84,6 +84,11 @@ pub fn validate_token(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_audience(&[expected_aud]);
     validation.set_issuer(&[expected_issuer]);
+    // Disable jsonwebtoken's default 60s clock leeway: it would otherwise let
+    // a token validate cryptographically after its `exp`, while `JtiStore`
+    // evicts the replay-protection entry at exactly `exp`. The two semantics
+    // must agree to prevent a replay window after expiry.
+    validation.leeway = 0;
     let token_data = jsonwebtoken::decode::<Claims>(jwt, &key.decoding_key(), &validation)?;
     let claims = token_data.claims;
     jti_store.check_and_insert(&claims.jti, claims.exp)?;
@@ -106,6 +111,8 @@ pub fn decode_token(
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_audience(&[expected_aud]);
     validation.set_issuer(&[expected_issuer]);
+    // Disable jsonwebtoken's default 60s clock leeway — see `validate_token`.
+    validation.leeway = 0;
     let token_data = jsonwebtoken::decode::<Claims>(jwt, &key.decoding_key(), &validation)?;
     let claims = token_data.claims;
     if jti_store.is_blacklisted(&claims.jti) {

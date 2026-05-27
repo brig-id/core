@@ -242,11 +242,17 @@ pub async fn update_credential(
     let key = user_key(master, &cred.user_id)?;
     let data_enc = enc(&key, &cred.data)?;
 
-    sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
+    let result = sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
         .bind(data_enc)
         .bind(cred.id.to_string())
         .execute(pool)
         .await?;
+
+    // Guard against silent counter desync: a concurrent credential deletion
+    // would otherwise make a no-op UPDATE look successful.
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
 
     Ok(())
 }
