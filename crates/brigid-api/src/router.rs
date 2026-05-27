@@ -45,23 +45,38 @@ impl KeyExtractor for ForwardedForExtractor {
         // Only consult x-forwarded-for when a trusted reverse proxy is known to
         // set it (see `AppState::trust_forwarded_for`). Otherwise an attacker
         // could forge the header to evade rate limits.
-        if self.trust_header
-            && let Some(ip) = req
+        if self.trust_header {
+            if let Some(ip) = req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-        {
-            return Ok(ip);
+            {
+                return Ok(ip);
+            }
         }
         // Real TCP peer address injected by
         // `into_make_service_with_connect_info::<SocketAddr>()`.
         if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
             return Ok(addr.0.ip().to_string());
         }
-        // Last resort for environments where connect_info is not wired up.
+        // No identifying information for this request. In production the
+        // server wires `ConnectInfo<SocketAddr>` via
+        // `into_make_service_with_connect_info::<SocketAddr>()` so this
+        // branch is unreachable; if it ever fires it means the server is
+        // misconfigured and every anonymous request would share one global
+        // rate-limit bucket (one client can then throttle every other
+        // client). Emit a loud warning so operators surface and fix it.
+        // Tests (oneshot, no `ConnectInfo`) and dev environments still get
+        // a key so the request can be served.
+        tracing::warn!(
+            "ForwardedForExtractor: neither a trusted x-forwarded-for header \
+             nor ConnectInfo<SocketAddr> is available; falling back to a \
+             shared rate-limit bucket. Wire `into_make_service_with_connect_info` \
+             in the server to restore per-IP rate limiting."
+        );
         Ok("0.0.0.0".to_string())
     }
 }
