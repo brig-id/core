@@ -25,20 +25,30 @@ impl PrivateAlias {
         &self.0
     }
 
-    /// Converts the alias to a `did:peer:2.z<base58btc>` identifier.
+    /// Converts the alias to a `did:peer:2.z<base58btc(0xed01 || 32B)>`
+    /// identifier compatible with [`brigid_did::resolve_did_peer`].
     ///
-    /// The alias is stripped of underscores before hashing (SHA3-256), then
-    /// encoded with multibase prefix `z` (base58btc), as required by the
-    /// `did:peer:2` numeric algorithm. This is a placeholder until the full
-    /// `did:peer:2` representation with Ed25519 verification keys is wired
-    /// in phase 4.
+    /// The alias is stripped of underscores then hashed with SHA3-256; the
+    /// resulting 32 bytes occupy the position normally reserved for an
+    /// Ed25519 public key in a `did:peer:2` numalgo-2 identifier, so the
+    /// multicodec prefix (`0xed 0x01`) and base58btc encoding match the
+    /// spec syntactically. The 32 bytes carry **no** asymmetric semantics:
+    /// resolving the DID recovers the SHA3-256 commitment to the alias,
+    /// not a signing key. Phase 4 will replace this placeholder with a
+    /// proper Ed25519 verification-key binding.
     ///
     /// INVARIANT: VSID computation MUST NOT use this method — the result
     /// is NOT a root DID and MUST NOT be passed to `compute_vsid`.
     pub fn to_did_peer(&self) -> String {
         let stripped: String = self.0.chars().filter(|c| *c != '_').collect();
         let hash = Sha3_256::digest(stripped.as_bytes());
-        let encoded = bs58::encode(hash.as_slice()).into_string();
+        // Multicodec prefix for `ed25519-pub` (varint 0xed 0x01), per the
+        // `did:peer:2.z` format. Kept in sync with
+        // `brigid_did::peer::MULTICODEC_ED25519`.
+        let mut payload = Vec::with_capacity(2 + 32);
+        payload.extend_from_slice(&[0xed, 0x01]);
+        payload.extend_from_slice(hash.as_slice());
+        let encoded = bs58::encode(&payload).into_string();
         format!("did:peer:2.z{encoded}")
     }
 }

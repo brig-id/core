@@ -119,10 +119,10 @@ pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> R
 /// reports a UNIQUE constraint violation (e.g. concurrent registration of the
 /// same username). Other errors are propagated as `Error::Database`.
 fn map_sqlx_unique(e: sqlx::Error) -> Error {
-    if let sqlx::Error::Database(ref db_err) = e
-        && db_err.is_unique_violation()
-    {
-        return Error::Duplicate;
+    if let sqlx::Error::Database(ref db_err) = e {
+        if db_err.is_unique_violation() {
+            return Error::Duplicate;
+        }
     }
     Error::Database(e)
 }

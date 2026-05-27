@@ -85,16 +85,20 @@ pub async fn register_begin(
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
-    state.pending_registrations.lock().unwrap().insert(
-        session_id,
-        PendingRegistration {
-            user_id,
-            username: root_id.username.clone(),
-            server: root_id.server.clone(),
-            state: reg_state,
-            created_at: Instant::now(),
-        },
-    );
+    state
+        .pending_registrations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            session_id,
+            PendingRegistration {
+                user_id,
+                username: root_id.username.clone(),
+                server: root_id.server.clone(),
+                state: reg_state,
+                created_at: Instant::now(),
+            },
+        );
 
     Ok((
         StatusCode::OK,
@@ -113,7 +117,7 @@ pub async fn register_finish(
     let pending = state
         .pending_registrations
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&body.session_id)
         .ok_or(ApiError::BadRequest("unknown session".into()))?;
 
@@ -183,14 +187,18 @@ pub async fn login_begin(
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
-    state.pending_authentications.lock().unwrap().insert(
-        session_id,
-        PendingAuthentication {
-            user_id: user.id,
-            state: auth_state,
-            created_at: Instant::now(),
-        },
-    );
+    state
+        .pending_authentications
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            session_id,
+            PendingAuthentication {
+                user_id: user.id,
+                state: auth_state,
+                created_at: Instant::now(),
+            },
+        );
 
     Ok((
         StatusCode::OK,
@@ -209,7 +217,7 @@ pub async fn login_finish(
     let pending = state
         .pending_authentications
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .remove(&body.session_id)
         .ok_or(ApiError::BadRequest("unknown session".into()))?;
 
