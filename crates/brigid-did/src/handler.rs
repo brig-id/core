@@ -56,6 +56,42 @@ pub fn did_document_handler(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Build a DID Core document for the server root (`did:web:<server>`).
+///
+/// This document is served at `/.well-known/did.json` and represents the server's
+/// own root DID — no user path component (e.g. `did:web:example.com`).
+pub fn did_root_document_handler(server: &str, public_key_bytes: &[u8]) -> Result<DIDDocument> {
+    if public_key_bytes.len() != 32 {
+        return Err(Error::InvalidKey(format!(
+            "expected 32 bytes, got {}",
+            public_key_bytes.len()
+        )));
+    }
+
+    let did = format!("did:web:{server}");
+    let method_id = format!("{did}#key-1");
+
+    let mut payload = Vec::with_capacity(2 + 32);
+    payload.extend_from_slice(&MULTICODEC_ED25519);
+    payload.extend_from_slice(public_key_bytes);
+    let public_key_multibase = format!("z{}", bs58::encode(&payload).into_string());
+
+    Ok(DIDDocument {
+        context: vec![
+            "https://www.w3.org/ns/did/v1".to_string(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_string(),
+        ],
+        id: did.to_string(),
+        verification_method: vec![VerificationMethod {
+            id: method_id.clone(),
+            key_type: "Ed25519VerificationKey2020".to_string(),
+            controller: did.to_string(),
+            public_key_multibase,
+        }],
+        authentication: vec![method_id],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

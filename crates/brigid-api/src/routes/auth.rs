@@ -171,6 +171,7 @@ pub async fn login_begin(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
+    state.evict_expired_pending();
     state.pending_authentications.lock().unwrap().insert(
         session_id,
         PendingAuthentication {
@@ -234,7 +235,8 @@ pub async fn login_finish(
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/').to_string();
     let client_id = state.base_url.host_str().unwrap_or("unknown").to_string();
-    let vsid = compute_vsid(&user.did_web, &client_id, &state.vsid_salt);
+    let vsid =
+        compute_vsid(&user.did_web, &client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let params = IssuanceParams {

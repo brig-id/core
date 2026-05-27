@@ -11,7 +11,7 @@ pub mod peer;
 pub mod web;
 
 pub use error::{Error, Result};
-pub use handler::did_document_handler;
+pub use handler::{did_document_handler, did_root_document_handler};
 pub use model::{DIDDocument, Did, VerificationMethod};
 pub use peer::{generate_did_peer, resolve_did_peer};
 pub use web::{build_did_web, did_web_to_url, resolve_did_web};
