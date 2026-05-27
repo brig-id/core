@@ -33,9 +33,11 @@ async fn make_state() -> Arc<AppState> {
     let oidc_key = OidcSigningKey::generate();
     let base_url = Url::parse("http://localhost:8080").unwrap();
 
-    Arc::new(AppState::new(
-        store, webauthn, oidc_key, base_url, vsid_salt,
-    ))
+    let mut state = AppState::new(store, webauthn, oidc_key, base_url, vsid_salt);
+    // Integration tests use `x-forwarded-for` to give each test its own
+    // rate-limit bucket (oneshot requests carry no real peer address).
+    state.trust_forwarded_for = true;
+    Arc::new(state)
 }
 
 async fn response_body_json(body: Body) -> serde_json::Value {
@@ -205,7 +207,11 @@ async fn register_begin_rejects_invalid_username() {
 }
 
 #[tokio::test]
-async fn register_finish_rejects_unknown_session() {
+async fn register_finish_rejects_malformed_credential() {
+    // Sending a malformed credential (`{}`) trips Axum's JSON extractor before
+    // the handler runs, yielding 422. The unknown-session branch (400) requires
+    // a well-formed `PublicKeyCredential` payload and is covered by the full
+    // end-to-end flow exercised in `brigid-webauthn` integration tests.
     let state = make_state().await;
     let app = build_router(state, &[]);
 
@@ -229,7 +235,9 @@ async fn register_finish_rejects_unknown_session() {
 }
 
 #[tokio::test]
-async fn login_finish_rejects_unknown_session() {
+async fn login_finish_rejects_malformed_credential() {
+    // See `register_finish_rejects_malformed_credential` — 422 here also
+    // reflects JSON extraction failure, not the unknown-session branch.
     let state = make_state().await;
     let app = build_router(state, &[]);
 

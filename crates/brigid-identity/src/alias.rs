@@ -1,7 +1,5 @@
 use sha3::{Digest, Sha3_256};
 
-use base64ct::{Base64UrlUnpadded, Encoding};
-
 /// A private alias: an opaque handle that contains at least one `_` and no `@`.
 ///
 /// This type is defined in phase 3 but not yet surfaced in the public API (v0.0.1).
@@ -27,18 +25,20 @@ impl PrivateAlias {
         &self.0
     }
 
-    /// Converts the alias to a `did:peer:2.z<base64url>` identifier.
+    /// Converts the alias to a `did:peer:2.z<base58btc>` identifier.
     ///
-    /// The alias is stripped of underscores before hashing (SHA3-256),
-    /// then base64url-encoded (no padding). This is a placeholder until
-    /// full DID:peer:2 with Ed25519 keys is wired in phase 4.
+    /// The alias is stripped of underscores before hashing (SHA3-256), then
+    /// encoded with multibase prefix `z` (base58btc), as required by the
+    /// `did:peer:2` numeric algorithm. This is a placeholder until the full
+    /// `did:peer:2` representation with Ed25519 verification keys is wired
+    /// in phase 4.
     ///
     /// INVARIANT: VSID computation MUST NOT use this method — the result
     /// is NOT a root DID and MUST NOT be passed to `compute_vsid`.
     pub fn to_did_peer(&self) -> String {
         let stripped: String = self.0.chars().filter(|c| *c != '_').collect();
         let hash = Sha3_256::digest(stripped.as_bytes());
-        let encoded = Base64UrlUnpadded::encode_string(&hash);
+        let encoded = bs58::encode(hash.as_slice()).into_string();
         format!("did:peer:2.z{encoded}")
     }
 }

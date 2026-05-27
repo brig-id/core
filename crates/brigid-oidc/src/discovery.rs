@@ -71,7 +71,9 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
         token_endpoint: None,
         jwks_uri: format!("{base}/.well-known/jwks.json"),
         response_types_supported: vec!["id_token".to_string()],
-        subject_types_supported: vec!["public".to_string()],
+        // brigid uses VSID = HKDF(did_root, client_id, salt) as `sub`, which is
+        // per-client (pairwise) by construction — never a stable public identifier.
+        subject_types_supported: vec!["pairwise".to_string()],
         id_token_signing_alg_values_supported: vec!["EdDSA".to_string()],
     }
 }

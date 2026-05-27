@@ -22,6 +22,11 @@ pub enum Error {
 
     #[error("timestamp error: {0}")]
     Time(String),
+
+    /// A row with a unique key (e.g. `username_index`) already exists.
+    /// This is the authoritative duplicate signal — pre-checks are advisory only.
+    #[error("duplicate row (unique constraint violated)")]
+    Duplicate,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

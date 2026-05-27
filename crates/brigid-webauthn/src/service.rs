@@ -152,9 +152,12 @@ pub async fn update_passkey(
             return Ok(());
         }
     }
-    // No matching credential found — the auth was valid but counter state
-    // could not be persisted. This should not happen in practice.
-    Ok(())
+    // No matching credential found — the authentication validated against
+    // some passkey, but the persisted row vanished between login_begin and
+    // login_finish (manual DB tamper, race with credential revocation, ...).
+    // Returning Ok would silently drop the signature-counter advance, which
+    // weakens replay protection — surface it as an error instead.
+    Err(crate::Error::CredentialNotMatched)
 }
 
 // ---------------------------------------------------------------------------

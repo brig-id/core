@@ -109,9 +109,22 @@ pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> R
     .bind(created_at)
     .bind(idx)
     .execute(pool)
-    .await?;
+    .await
+    .map_err(map_sqlx_unique)?;
 
     Ok(())
+}
+
+/// Map a `sqlx::Error` to [`Error::Duplicate`] when the underlying database
+/// reports a UNIQUE constraint violation (e.g. concurrent registration of the
+/// same username). Other errors are propagated as `Error::Database`.
+fn map_sqlx_unique(e: sqlx::Error) -> Error {
+    if let sqlx::Error::Database(ref db_err) = e
+        && db_err.is_unique_violation()
+    {
+        return Error::Duplicate;
+    }
+    Error::Database(e)
 }
 
 /// Look up a [`User`] by `username` and `server`, using the deterministic

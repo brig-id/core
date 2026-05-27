@@ -25,30 +25,38 @@ use crate::{
     state::AppState,
 };
 
-/// Key extractor that reads the first IP from `x-forwarded-for`.
+/// Key extractor that reads the first IP from `x-forwarded-for` when the
+/// deployment topology trusts a reverse proxy to set that header. Otherwise
+/// it ignores client-supplied headers and keys solely on the TCP peer address.
 ///
-/// Falls back to the real TCP peer address (via [`ConnectInfo`]) when the header
-/// is absent (e.g. direct connections, tests). This ensures each distinct client
-/// gets its own rate-limit bucket even without a proxy.
+/// Falls back to the real TCP peer address (via [`ConnectInfo`]) when the
+/// header is absent or untrusted (e.g. direct connections, tests). This
+/// ensures each distinct client gets its own rate-limit bucket and prevents
+/// header-forgery rate-limit bypass.
 #[derive(Clone)]
-struct ForwardedForExtractor;
+struct ForwardedForExtractor {
+    trust_header: bool,
+}
 
 impl KeyExtractor for ForwardedForExtractor {
     type Key = String;
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
-        // Prefer x-forwarded-for (set by the Caddy reverse proxy in production).
-        if let Some(ip) = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        // Only consult x-forwarded-for when a trusted reverse proxy is known to
+        // set it (see `AppState::trust_forwarded_for`). Otherwise an attacker
+        // could forge the header to evade rate limits.
+        if self.trust_header
+            && let Some(ip) = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         {
             return Ok(ip);
         }
-        // Fall back to the real TCP peer address injected by
+        // Real TCP peer address injected by
         // `into_make_service_with_connect_info::<SocketAddr>()`.
         if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
             return Ok(addr.0.ip().to_string());
@@ -119,7 +127,9 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
     let governor_conf = GovernorConfigBuilder::default()
         .per_second(3)
         .burst_size(5)
-        .key_extractor(ForwardedForExtractor)
+        .key_extractor(ForwardedForExtractor {
+            trust_header: state.trust_forwarded_for,
+        })
         .finish()
         .unwrap();
 
