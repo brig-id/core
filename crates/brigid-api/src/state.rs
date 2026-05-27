@@ -73,11 +73,11 @@ impl AppState {
         let cutoff = Instant::now() - PENDING_SESSION_TTL;
         self.pending_registrations
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|_, v| v.created_at > cutoff);
         self.pending_authentications
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|_, v| v.created_at > cutoff);
     }
 }

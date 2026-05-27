@@ -3,10 +3,11 @@
 //! Assembles all routes, middleware, and security headers into a single
 //! [`axum::Router`].
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
+    extract::ConnectInfo,
     http::{
         HeaderName, HeaderValue, Request,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -26,8 +27,9 @@ use crate::{
 
 /// Key extractor that reads the first IP from `x-forwarded-for`.
 ///
-/// Falls back to `"0.0.0.0"` when the header is absent (e.g. in tests).
-/// This makes the rate limiter testable without a real TCP peer address.
+/// Falls back to the real TCP peer address (via [`ConnectInfo`]) when the header
+/// is absent (e.g. direct connections, tests). This ensures each distinct client
+/// gets its own rate-limit bucket even without a proxy.
 #[derive(Clone)]
 struct ForwardedForExtractor;
 
@@ -35,14 +37,24 @@ impl KeyExtractor for ForwardedForExtractor {
     type Key = String;
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
-        Ok(req
+        // Prefer x-forwarded-for (set by the Caddy reverse proxy in production).
+        if let Some(ip) = req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "0.0.0.0".to_string()))
+        {
+            return Ok(ip);
+        }
+        // Fall back to the real TCP peer address injected by
+        // `into_make_service_with_connect_info::<SocketAddr>()`.
+        if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+            return Ok(addr.0.ip().to_string());
+        }
+        // Last resort for environments where connect_info is not wired up.
+        Ok("0.0.0.0".to_string())
     }
 }
 

@@ -256,15 +256,23 @@ pub async fn login_finish(
 /// `POST /auth/logout`
 ///
 /// Blacklists the presented Bearer token's JTI, preventing further use
-/// before it expires naturally.
+/// before it expires naturally. The JTI is persisted in the database so
+/// it remains blacklisted across server restarts.
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     AuthenticatedClaims(claims): AuthenticatedClaims,
 ) -> Result<impl IntoResponse, ApiError> {
+    // In-memory blacklist (fast path for the current process session).
     state
         .jti_store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .blacklist(&claims.jti, claims.exp);
+    // Persistent blacklist — survives server restarts.
+    state
+        .store
+        .blacklist_jti(&claims.jti, claims.exp)
+        .await
+        .map_err(|e| internal!(e))?;
     Ok(StatusCode::OK)
 }
