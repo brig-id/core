@@ -70,7 +70,7 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
         authorization_endpoint: None,
         token_endpoint: None,
         jwks_uri: format!("{base}/.well-known/jwks.json"),
-        response_types_supported: vec!["code".to_string()],
+        response_types_supported: vec!["id_token".to_string()],
         subject_types_supported: vec!["public".to_string()],
         id_token_signing_alg_values_supported: vec!["EdDSA".to_string()],
     }

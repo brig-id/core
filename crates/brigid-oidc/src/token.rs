@@ -127,7 +127,7 @@ mod tests {
 
     fn test_vsid() -> Vsid {
         let salt = derive_vsid_salt(&master());
-        compute_vsid("did:web:example.com", "test-client", &salt)
+        compute_vsid("did:web:example.com", "test-client", &salt).unwrap()
     }
 
     fn test_key() -> OidcSigningKey {

@@ -3,7 +3,7 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use std::sync::Arc;
 
-use brigid_did::did_document_handler;
+use brigid_did::did_root_document_handler;
 use brigid_oidc::{build_jwks, build_openid_configuration};
 
 use crate::{error::ApiError, state::AppState};
@@ -39,7 +39,7 @@ pub async fn did_document(
     // Use the OIDC Ed25519 key bytes as the server's public key.
     let public_key_bytes = state.oidc_key.verifying_key().to_bytes();
 
-    let doc = did_document_handler("server", &server, &public_key_bytes)
+    let doc = did_root_document_handler(&server, &public_key_bytes)
         .map_err(|e| ApiError::Internal(Box::new(e)))?;
 
     Ok((StatusCode::OK, Json(doc)))

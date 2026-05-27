@@ -7,17 +7,16 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    http::{HeaderName, HeaderValue, Request},
+    http::{
+        HeaderName, HeaderValue, Request,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     routing::{get, post},
 };
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
 };
-use tower_http::{
-    cors::{Any, CorsLayer},
-    set_header::SetResponseHeaderLayer,
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use url::Url;
 
 use crate::{
@@ -101,7 +100,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
                 axum::http::Method::POST,
                 axum::http::Method::OPTIONS,
             ])
-            .allow_headers(Any)
+            .allow_headers([CONTENT_TYPE, AUTHORIZATION])
     };
 
     // Rate limiter for /auth/* routes: 1 token per 3 s per IP, burst of 5 ≈ 20 req/min.

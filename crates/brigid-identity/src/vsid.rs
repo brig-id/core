@@ -58,7 +58,12 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
 ///
 /// `did_root` MUST be a root DID (`did:web:…`). Passing an alias or a virtual
 /// identity DID here violates the VSID security model.
-pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> Vsid {
+pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> crate::Result<Vsid> {
+    if !did_root.starts_with("did:web:") {
+        return Err(crate::Error::InvalidIdentifier(
+            "did_root must be a root did:web: DID".to_string(),
+        ));
+    }
     let dr_len = (did_root.len() as u32).to_be_bytes();
     let ci_len = (client_id.len() as u32).to_be_bytes();
 
@@ -75,7 +80,7 @@ pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> Vsid {
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm)
         .expect("32 bytes always fits within HKDF output limit");
-    Vsid(Base64UrlUnpadded::encode_string(&okm))
+    Ok(Vsid(Base64UrlUnpadded::encode_string(&okm)))
 }
 
 #[cfg(test)]
@@ -92,8 +97,8 @@ mod tests {
     fn vsid_is_stable() {
         let master = test_master();
         let salt = derive_vsid_salt(&master);
-        let v1 = compute_vsid(DID_ROOT, "app1", &salt);
-        let v2 = compute_vsid(DID_ROOT, "app1", &salt);
+        let v1 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
+        let v2 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
         assert_eq!(v1, v2, "same inputs must produce the same VSID");
     }
 
@@ -101,8 +106,8 @@ mod tests {
     fn vsid_non_correlable_across_clients() {
         let master = test_master();
         let salt = derive_vsid_salt(&master);
-        let v1 = compute_vsid(DID_ROOT, "app1", &salt);
-        let v2 = compute_vsid(DID_ROOT, "app2", &salt);
+        let v1 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
+        let v2 = compute_vsid(DID_ROOT, "app2", &salt).unwrap();
         assert_ne!(v1, v2, "different client_id must yield different VSID");
     }
 
@@ -110,29 +115,30 @@ mod tests {
     fn vsid_differs_across_salts() {
         let s1 = [0u8; 32];
         let s2 = [1u8; 32];
-        let v1 = compute_vsid(DID_ROOT, "app1", &s1);
-        let v2 = compute_vsid(DID_ROOT, "app1", &s2);
+        let v1 = compute_vsid(DID_ROOT, "app1", &s1).unwrap();
+        let v2 = compute_vsid(DID_ROOT, "app1", &s2).unwrap();
         assert_ne!(v1, v2, "different salt must yield different VSID");
     }
 
     #[test]
     fn vsid_never_derived_from_alias() {
-        // Demonstrates the invariant: computing VSID from an alias-like string
-        // is a programming error. The VSID from a root DID must differ from
-        // what you would get if you mistakenly passed an alias.
+        // Invariant: compute_vsid rejects non-root-DID inputs at the call site,
+        // preventing alias or virtual identity DIDs from leaking into VSIDs.
         let master = test_master();
         let salt = derive_vsid_salt(&master);
-        let vsid_from_root = compute_vsid("did:web:brig.id:u:berenger", "app1", &salt);
-        let vsid_from_alias = compute_vsid("_berenger_alias", "app1", &salt);
-        assert_ne!(
-            vsid_from_root, vsid_from_alias,
-            "VSID from alias must differ from VSID from root DID"
+        assert!(
+            compute_vsid("did:web:brig.id:u:berenger", "app1", &salt).is_ok(),
+            "root did:web: DID must be accepted"
+        );
+        assert!(
+            compute_vsid("_berenger_alias", "app1", &salt).is_err(),
+            "non-DID alias must be rejected"
         );
     }
 
     #[test]
     fn vsid_display_and_as_str() {
-        let v = compute_vsid(DID_ROOT, "app1", &[0u8; 32]);
+        let v = compute_vsid(DID_ROOT, "app1", &[0u8; 32]).unwrap();
         assert_eq!(v.as_str(), v.to_string());
         assert!(!v.as_str().is_empty());
     }

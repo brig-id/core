@@ -44,6 +44,9 @@ impl JtiStore {
     /// Use this for logout: the token is invalidated and subsequent calls to
     /// [`is_blacklisted`](Self::is_blacklisted) will return `true` until it expires.
     pub fn blacklist(&mut self, jti: &str, exp: i64) {
+        // Evict expired entries to keep the store bounded even under sustained logout load.
+        let now = now_unix();
+        self.entries.retain(|_, exp_ts| *exp_ts > now);
         self.entries.insert(jti.to_string(), exp);
     }
 
