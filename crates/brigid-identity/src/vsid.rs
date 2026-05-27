@@ -67,11 +67,9 @@ pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> crate::Resu
     // Note: brig\u00b7id uses multi-component did:web identifiers of the form
     // `did:web:<host>:u:<username>` for root public identities, so embedded
     // `:` characters are permitted. Leading/trailing `:` and `/` are not.
-    let body = did_root
-        .strip_prefix("did:web:")
-        .ok_or_else(|| crate::Error::InvalidIdentifier(
-            "did_root must be a did:web: DID".to_string(),
-        ))?;
+    let body = did_root.strip_prefix("did:web:").ok_or_else(|| {
+        crate::Error::InvalidIdentifier("did_root must be a did:web: DID".to_string())
+    })?;
     if body.is_empty()
         || body.contains('/')
         || body.starts_with(':')
