@@ -102,14 +102,22 @@ pub async fn store_passkey(
     user_id: Uuid,
     passkey: &Passkey,
 ) -> Result<Credential> {
+    let cred = passkey_to_credential(user_id, passkey)?;
+    store.store_credential(&cred).await?;
+    Ok(cred)
+}
+
+/// Build the encrypted-store [`Credential`] row for `passkey` **without**
+/// persisting it. Used by callers that need to batch the credential write
+/// into a transaction with another write (e.g. atomic registration of a
+/// user + their first credential).
+pub fn passkey_to_credential(user_id: Uuid, passkey: &Passkey) -> Result<Credential> {
     let data = serde_json::to_vec(passkey)?;
-    let cred = Credential {
+    Ok(Credential {
         id: Uuid::new_v4(),
         user_id,
         data,
-    };
-    store.store_credential(&cred).await?;
-    Ok(cred)
+    })
 }
 
 /// Load and deserialise all `Passkey`s for `user_id` from the encrypted store.

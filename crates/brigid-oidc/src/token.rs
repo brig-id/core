@@ -101,15 +101,25 @@ pub fn validate_token(
 /// Does **not** insert the JTI — allows the same token to be used multiple times
 /// within its lifetime. Use this for bearer auth middleware.
 /// Use [`validate_token`] when you want to consume the token (one-time use).
+///
+/// `expected_aud` is `Option<&str>`: pass `Some(aud)` when the consumer knows
+/// which RP the token must target; pass `None` when the issuer itself accepts
+/// any audience it has signed (e.g. an issuer-hosted `/auth/logout` that
+/// revokes a token regardless of the original RP). Skipping the audience
+/// check is safe in that single-issuer case because the signature already
+/// proves the issuer minted the token.
 pub fn decode_token(
     jwt: &str,
     expected_issuer: &str,
-    expected_aud: &str,
+    expected_aud: Option<&str>,
     key: &OidcSigningKey,
     jti_store: &JtiStore,
 ) -> Result<Claims> {
     let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_audience(&[expected_aud]);
+    match expected_aud {
+        Some(aud) => validation.set_audience(&[aud]),
+        None => validation.validate_aud = false,
+    }
     validation.set_issuer(&[expected_issuer]);
     // Disable jsonwebtoken's default 60s clock leeway — see `validate_token`.
     validation.leeway = 0;

@@ -30,14 +30,19 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedClaims {
 
         let issuer = state.base_url.to_string();
         let issuer = issuer.trim_end_matches('/').to_string();
-        let client_id = state.base_url.host_str().unwrap_or("unknown").to_string();
 
         // Decode and validate the token against the in-memory JTI blacklist.
         // The guard is scoped so it is *definitely* dropped before the async
         // DB check below — MutexGuard is !Send and cannot cross an await point.
+        //
+        // The audience check is intentionally skipped (`None`): a token's
+        // `aud` is the RP that requested it, but issuer-hosted endpoints
+        // such as `/auth/logout` need to revoke tokens regardless of the
+        // original RP. Signature + issuer + JTI checks remain in force and
+        // already prove the issuer minted the token.
         let claims = {
             let jti_store = state.jti_store.lock().unwrap_or_else(|e| e.into_inner());
-            decode_token(&token, &issuer, &client_id, &state.oidc_key, &jti_store)
+            decode_token(&token, &issuer, None, &state.oidc_key, &jti_store)
                 .map_err(|_| ApiError::Unauthorized)?
         }; // MutexGuard dropped here, before any .await
 
