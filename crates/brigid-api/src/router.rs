@@ -87,6 +87,11 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
+            // Static CSP suitable for the JSON API endpoints currently exposed
+            // (no inline scripts, no hydration). When the Leptos SSR UI
+            // (`brigid-ui`, Phase 6) is mounted on this router it must replace
+            // `script-src 'self'` with a per-response `nonce-<base64>` policy
+            // — see AGENTS.md "CSP header" invariant. Tracked in phase-6.md.
             HeaderValue::from_static(
                 "default-src 'self'; \
                  script-src 'self'; \

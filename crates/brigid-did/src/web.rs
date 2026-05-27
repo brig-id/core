@@ -55,8 +55,15 @@ pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
 /// Fetch a DID document from an arbitrary URL string.
 ///
 /// Extracted so that tests can inject an HTTP mock URL without requiring HTTPS.
+///
+/// The client enforces TLS 1.3 as the minimum negotiated version, per the
+/// `brigid` security model (AGENTS.md). rustls would otherwise default to
+/// `TLS 1.2` as the floor.
 pub(crate) async fn fetch_document(url: &str) -> Result<DIDDocument> {
-    let resp = reqwest::get(url).await?.error_for_status()?;
+    let client = reqwest::Client::builder()
+        .min_tls_version(reqwest::tls::Version::TLS_1_3)
+        .build()?;
+    let resp = client.get(url).send().await?.error_for_status()?;
     let doc: DIDDocument = resp.json().await?;
     Ok(doc)
 }

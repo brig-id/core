@@ -27,6 +27,13 @@ pub enum Error {
     /// This is the authoritative duplicate signal — pre-checks are advisory only.
     #[error("duplicate row (unique constraint violated)")]
     Duplicate,
+
+    /// An update or fetch targeted a row that does not exist (any more).
+    /// Surfaced by [`update_credential`](crate::update_credential) when
+    /// `UPDATE` matches zero rows — e.g. the credential was concurrently
+    /// deleted while a counter persistence was in flight.
+    #[error("row not found")]
+    NotFound,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

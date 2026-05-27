@@ -6,7 +6,7 @@ on:
 
 jobs:
   coverage:
-    uses: brig-id/.github/.github/workflows/coverage.yml@main
+    uses: brig-id/.github/.github/workflows/coverage.yml@26e9a0393cb98cdb4f25e4d10f155230fb4db6f5
     with:
       codecov-flags: core
     secrets:

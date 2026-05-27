@@ -59,9 +59,27 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
 /// `did_root` MUST be a root DID (`did:web:…`). Passing an alias or a virtual
 /// identity DID here violates the VSID security model.
 pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> crate::Result<Vsid> {
-    if !did_root.starts_with("did:web:") {
+    // The prefix check alone would accept malformed values like `did:web:`
+    // (empty body) or values containing path separators (`/`) that are not
+    // valid did:web syntax. Validate the body strictly so we never derive a
+    // VSID from clearly malformed input.
+    //
+    // Note: brig\u00b7id uses multi-component did:web identifiers of the form
+    // `did:web:<host>:u:<username>` for root public identities, so embedded
+    // `:` characters are permitted. Leading/trailing `:` and `/` are not.
+    let body = did_root
+        .strip_prefix("did:web:")
+        .ok_or_else(|| crate::Error::InvalidIdentifier(
+            "did_root must be a did:web: DID".to_string(),
+        ))?;
+    if body.is_empty()
+        || body.contains('/')
+        || body.starts_with(':')
+        || body.ends_with(':')
+        || body.contains("::")
+    {
         return Err(crate::Error::InvalidIdentifier(
-            "did_root must be a root did:web: DID".to_string(),
+            "did_root has malformed did:web syntax".to_string(),
         ));
     }
     let dr_len = (did_root.len() as u32).to_be_bytes();
