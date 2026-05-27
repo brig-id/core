@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "brigid-crypto"
 version = "0.0.1"
-source = "git+https://github.com/brig-id/crypto?rev=65cb9a3982d901db9ebb2c234ff230ee1bb621f9#65cb9a3982d901db9ebb2c234ff230ee1bb621f9"
+source = "git+https://github.com/brig-id/crypto?rev=52d0983b557b6f294b9f40a9896d95d03e2e4681#52d0983b557b6f294b9f40a9896d95d03e2e4681"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
