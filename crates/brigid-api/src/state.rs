@@ -39,6 +39,19 @@ pub struct PendingAuthentication {
 /// Challenge sessions expire after 5 minutes of inactivity.
 pub(crate) const PENDING_SESSION_TTL: Duration = Duration::from_secs(300);
 
+/// Hard upper bound on the number of in-flight WebAuthn challenges held in
+/// memory for each of the registration and authentication maps.
+///
+/// `evict_expired_pending()` provides a soft bound (TTL only), but a sustained
+/// burst of `begin_*` requests faster than the TTL can still grow the maps
+/// without limit. This cap turns that growth into a backpressure signal
+/// (HTTP 429) instead of letting attackers exhaust process memory.
+///
+/// Sized to keep total worst-case memory for both maps below ~10 MB on a
+/// 64-bit target, comfortably above the per-IP rate limit (20 req/min) for
+/// a small operator deployment but small enough to detect floods.
+pub(crate) const PENDING_SESSION_MAX_CAPACITY: usize = 10_000;
+
 /// Central application state shared (via `Arc`) across all request handlers.
 pub struct AppState {
     pub store: Arc<EncryptedStore>,

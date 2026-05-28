@@ -19,9 +19,15 @@ impl RootId {
         let server = &input[at + 1..];
         validate_username(username)?;
         validate_server(server)?;
+        // DNS hostnames are case-insensitive (RFC 4343). Canonicalise the
+        // server component to lowercase before storing so that
+        // `alice@Example.com` and `alice@example.com` produce the same
+        // `username_index`, DID:web URL, and persisted `RootId`. Without
+        // this, two clients addressing the same host could mint distinct
+        // root identities for what is, by DNS, the same authority.
         Ok(Self {
             username: username.to_string(),
-            server: server.to_string(),
+            server: server.to_ascii_lowercase(),
         })
     }
 
@@ -154,5 +160,15 @@ mod tests {
     #[test]
     fn server_label_ends_with_hyphen() {
         assert!(RootId::parse("alice@brig-.id").is_err());
+    }
+
+    #[test]
+    fn server_is_lowercased() {
+        let id = RootId::parse("alice@Example.COM").unwrap();
+        assert_eq!(id.server, "example.com");
+        assert_eq!(id.to_did_web(), "did:web:example.com:u:alice");
+        // Case variants must map to the same canonical RootId.
+        let other = RootId::parse("alice@EXAMPLE.com").unwrap();
+        assert_eq!(id, other);
     }
 }

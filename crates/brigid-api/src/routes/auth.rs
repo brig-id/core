@@ -91,11 +91,18 @@ pub async fn register_begin(
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
-    state
-        .pending_registrations
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
+    {
+        let mut map = state
+            .pending_registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
+            // Hard cap reached even after TTL eviction — reject with 429 so
+            // callers see backpressure instead of the server exhausting
+            // memory under a sustained `begin` flood.
+            return Err(ApiError::TooManyRequests);
+        }
+        map.insert(
             session_id,
             PendingRegistration {
                 user_id,
@@ -105,6 +112,7 @@ pub async fn register_begin(
                 created_at: Instant::now(),
             },
         );
+    }
 
     Ok((
         StatusCode::OK,
@@ -201,11 +209,15 @@ pub async fn login_begin(
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
-    state
-        .pending_authentications
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
+    {
+        let mut map = state
+            .pending_authentications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
+            return Err(ApiError::TooManyRequests);
+        }
+        map.insert(
             session_id,
             PendingAuthentication {
                 user_id: user.id,
@@ -214,6 +226,7 @@ pub async fn login_begin(
                 created_at: Instant::now(),
             },
         );
+    }
 
     Ok((
         StatusCode::OK,
@@ -288,7 +301,6 @@ pub async fn login_finish(
         vsid: &vsid,
         issuer: &issuer,
         client_id: &client_id,
-        user_did: &user.did_web,
         server: &user.server,
         ttl_secs: 3600,
     };
