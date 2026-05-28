@@ -34,6 +34,15 @@ pub enum Error {
     /// deleted while a counter persistence was in flight.
     #[error("row not found")]
     NotFound,
+
+    /// A `Credential` was handed to an atomic-registration entry point with
+    /// a `user_id` that does not match the `User` being created. Returned
+    /// by [`EncryptedStore::register_user_with_credential`](crate::EncryptedStore::register_user_with_credential)
+    /// before any database write to prevent attaching a wrongly-encrypted
+    /// credential to the new user (or attaching the new user's credential to
+    /// another existing user).
+    #[error("credential user_id does not match the user being registered")]
+    CredentialUserMismatch,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

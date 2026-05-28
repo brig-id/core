@@ -307,17 +307,22 @@ pub async fn logout(
     State(state): State<Arc<AppState>>,
     AuthenticatedClaims(claims): AuthenticatedClaims,
 ) -> Result<impl IntoResponse, ApiError> {
-    // In-memory blacklist (fast path for the current process session).
-    state
-        .jti_store
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .blacklist(&claims.jti, claims.exp);
-    // Persistent blacklist — survives server restarts.
+    // Persist FIRST. The in-memory blacklist is only the fast-path cache;
+    // writing to it before the durable store would make a transient DB error
+    // unrecoverable for this token: the response would be 500 but the JTI
+    // would already be in the in-memory blacklist, so a retried logout would
+    // be rejected by `AuthenticatedClaims` before it could persist the
+    // revocation. Persisting first means a 500 still leaves the operator
+    // free to retry, and the in-memory cache is only updated on success.
     state
         .store
         .blacklist_jti(&claims.jti, claims.exp)
         .await
         .map_err(|e| internal!(e))?;
+    state
+        .jti_store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .blacklist(&claims.jti, claims.exp);
     Ok(StatusCode::OK)
 }

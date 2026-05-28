@@ -615,6 +615,38 @@ async fn logout_blacklists_token() {
         StatusCode::UNAUTHORIZED,
         "second logout must fail (token blacklisted)"
     );
+
+    // -- Simulate a service restart --
+    //
+    // The previous assertion is satisfied by the in-process `JtiStore` alone,
+    // so it does not exercise the persistent SQLite blacklist consulted by
+    // `AuthenticatedClaims` after the in-memory check. Wipe the in-memory
+    // store (equivalent to relaunching the binary with the same SQLite file)
+    // and replay the logout: only the DB-backed blacklist can produce 401
+    // now, proving revocations survive across restarts.
+    {
+        use brigid_oidc::JtiStore;
+        *state.jti_store.lock().unwrap_or_else(|e| e.into_inner()) = JtiStore::new();
+    }
+    let app = build_router(Arc::clone(&state), &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.0.1.12")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "logout after simulated restart must still fail (persistent JTI blacklist)"
+    );
 }
 
 // ---------------------------------------------------------------------------

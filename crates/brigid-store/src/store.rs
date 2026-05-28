@@ -242,14 +242,23 @@ pub async fn update_credential(
     let key = user_key(master, &cred.user_id)?;
     let data_enc = enc(&key, &cred.data)?;
 
-    let result = sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
-        .bind(data_enc)
-        .bind(cred.id.to_string())
-        .execute(pool)
-        .await?;
+    // Match on (id, user_id) — not id alone. The encrypted `data` blob is
+    // wrapped under the caller-supplied `cred.user_id`'s per-user key, so an
+    // UPDATE that matched only on `id` and was called with a mismatched
+    // `user_id` would overwrite an existing row with ciphertext readable only
+    // under a different user's key, corrupting that credential beyond
+    // recovery. The extra predicate makes the mismatch a clean `NotFound`.
+    let result =
+        sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ? AND user_id = ?")
+            .bind(data_enc)
+            .bind(cred.id.to_string())
+            .bind(cred.user_id.to_string())
+            .execute(pool)
+            .await?;
 
     // Guard against silent counter desync: a concurrent credential deletion
-    // would otherwise make a no-op UPDATE look successful.
+    // (or a (id, user_id) mismatch — see WHERE clause above) would otherwise
+    // make a no-op UPDATE look successful.
     if result.rows_affected() == 0 {
         return Err(Error::NotFound);
     }
@@ -358,6 +367,18 @@ impl EncryptedStore {
         user: &User,
         cred: &Credential,
     ) -> Result<()> {
+        // Defend against a mismatched credential reaching the transaction:
+        // the credential's `data` is encrypted under `cred.user_id`'s per-user
+        // key, so committing a `Credential` whose `user_id` differs from the
+        // user being created would either (a) attach a credential decryptable
+        // only under a third party's key to the new user, or (b) cause the
+        // newly created user to have no credential at all while a different
+        // existing user silently receives one — either outcome defeats the
+        // atomicity this method exists to provide.
+        if cred.user_id != user.id {
+            return Err(Error::CredentialUserMismatch);
+        }
+
         let u_key = user_key(&self.master, &user.id)?;
         let username_enc = enc(&u_key, user.username.as_bytes())?;
         let server_enc = enc(&u_key, user.server.as_bytes())?;
