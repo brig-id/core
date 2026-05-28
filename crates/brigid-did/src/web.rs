@@ -60,8 +60,15 @@ pub fn did_web_to_url(did: &Did) -> Result<url::Url> {
 /// `brigid` security model (AGENTS.md). rustls would otherwise default to
 /// `TLS 1.2` as the floor.
 pub(crate) async fn fetch_document(url: &str) -> Result<DIDDocument> {
+    // Bound the whole operation so a slow or stalled remote DID host cannot
+    // tie up the caller's Axum task indefinitely. `reqwest::Client` has no
+    // default request or connect timeout, which makes DID resolution a
+    // DoS-amplification vector if any peer publishes a hostile or simply
+    // unresponsive `.well-known/did.json` endpoint.
     let client = reqwest::Client::builder()
         .min_tls_version(reqwest::tls::Version::TLS_1_3)
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let doc: DIDDocument = resp.json().await?;
