@@ -158,8 +158,7 @@ pub async fn register_finish(
     // then blocks every re-registration attempt while every login fails
     // with "no credentials"). The store-level transaction commits both or
     // neither.
-    let cred =
-        passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
+    let cred = passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
     state
         .store
         .register_user_with_credential(&user, &cred)

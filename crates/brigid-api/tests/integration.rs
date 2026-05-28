@@ -625,7 +625,10 @@ async fn logout_blacklists_token() {
 async fn rate_limit_triggers_after_burst() {
     let state = make_state().await;
     let app = build_router(state, &[]);
-    let body = serde_json::to_vec(&serde_json::json!({ "username": "test@localhost", "client_id": "test-client" })).unwrap();
+    let body = serde_json::to_vec(
+        &serde_json::json!({ "username": "test@localhost", "client_id": "test-client" }),
+    )
+    .unwrap();
 
     // 5 requests within the burst quota — none should be rate-limited.
     for _ in 0..5 {
