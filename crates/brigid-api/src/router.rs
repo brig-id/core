@@ -3,7 +3,7 @@
 //! Assembles all routes, middleware, and security headers into a single
 //! [`axum::Router`].
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -143,9 +143,15 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             .allow_headers([CONTENT_TYPE, AUTHORIZATION])
     };
 
-    // Rate limiter for /auth/* routes: 1 token per 3 s per IP, burst of 5 ≈ 20 req/min.
+    // Rate limiter for /auth/* routes: 1 token every 3 s per IP, burst of 5.
+    // Sustained rate = 60s / 3s = 20 req/min per IP, matching the security
+    // requirement in AGENTS.md §"Hard security constraints". The previous
+    // `.per_second(3)` configured a sustained 3 req/s = 180 req/min, which
+    // violated that requirement. `tower_governor::GovernorConfigBuilder` does
+    // not expose a sub-per-second helper, so the replenishment cadence is set
+    // via `period(Duration)` directly.
     let governor_conf = GovernorConfigBuilder::default()
-        .per_second(3)
+        .period(Duration::from_secs(3))
         .burst_size(5)
         .key_extractor(ForwardedForExtractor {
             trust_header: state.trust_forwarded_for,

@@ -6,7 +6,10 @@
 # No upstream fix is available.
 #
 # RUSTSEC-2024-0436: paste crate marked unmaintained.
-# Transitive dependency via webauthn-rs-proto. `paste` is a proc-macro helper
-# with no runtime security impact. No fix is available upstream.
+# Transitive dependency via the Leptos / Tachys reactive stack (see
+# `cargo tree -i paste` — the path is `paste → tachys → leptos`, not via
+# `webauthn-rs-proto` which the previous comment incorrectly named). `paste`
+# is a proc-macro helper with no runtime security impact. No fix is available
+# upstream.
 [advisories]
 ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2024-0436"]
