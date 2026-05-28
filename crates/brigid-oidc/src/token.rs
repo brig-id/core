@@ -15,8 +15,6 @@ pub struct IssuanceParams<'a> {
     pub issuer: &'a str,
     /// Client identifier — used as the `aud` claim.
     pub client_id: &'a str,
-    /// Root DID of the authenticated user.
-    pub user_did: &'a str,
     /// Brig·id server domain (e.g. `"example.com"`).
     pub server: &'a str,
     /// Token lifetime in seconds (added to `now_unix`).
@@ -24,6 +22,13 @@ pub struct IssuanceParams<'a> {
 }
 
 /// OIDC ID Token claims.
+//
+// NOTE on omitted claims: the token deliberately does NOT include the user's
+// root DID (or any other stable, cross-RP user identifier). The `sub` claim
+// is a VSID derived from `(did_root, client_id, salt)`, which makes it
+// pairwise per relying party. Adding a stable DID claim to RP-facing tokens
+// would let two colluding RPs correlate the same user across `aud` values
+// and undermine that pairwise-subject privacy property.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// Subject — always the VSID (stable per `(did_root, client_id, salt)`).
@@ -38,9 +43,9 @@ pub struct Claims {
     pub iat: i64,
     /// JWT ID — uuid v4 used for replay prevention.
     pub jti: String,
-    /// Root DID of the authenticated user.
-    pub did: String,
-    /// Brig·id server domain.
+    /// Brig·id server domain. Identifies the issuing server, not the user;
+    /// kept distinct from `iss` (which carries the scheme + host) so RPs can
+    /// match the bare hostname without re-parsing the URL.
     pub server: String,
     /// Alias type (Phase 0.0.1 — always `"public"`).
     pub alias_type: String,
@@ -61,7 +66,6 @@ pub fn issue_token(
         exp: now_unix + params.ttl_secs as i64,
         iat: now_unix,
         jti: Uuid::new_v4().to_string(),
-        did: params.user_did.to_string(),
         server: params.server.to_string(),
         alias_type: "public".to_string(),
     };
@@ -163,7 +167,6 @@ mod tests {
             vsid,
             issuer: "https://example.com",
             client_id,
-            user_did: "did:web:example.com",
             server: "example.com",
             ttl_secs: 3600,
         }
@@ -183,7 +186,6 @@ mod tests {
         assert_eq!(claims.sub, vsid.to_string());
         assert_eq!(claims.aud, "my-client");
         assert_eq!(claims.iss, "https://example.com");
-        assert_eq!(claims.did, "did:web:example.com");
         assert_eq!(claims.alias_type, "public");
     }
 
@@ -216,7 +218,6 @@ mod tests {
             vsid: &vsid,
             issuer: "https://example.com",
             client_id: "my-client",
-            user_did: "did:web:example.com",
             server: "example.com",
             ttl_secs: 1,
         };

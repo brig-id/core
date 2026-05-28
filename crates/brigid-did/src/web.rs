@@ -69,6 +69,15 @@ pub(crate) async fn fetch_document(url: &str) -> Result<DIDDocument> {
         .min_tls_version(reqwest::tls::Version::TLS_1_3)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
+        // Disable HTTP redirects entirely. `reqwest::Client` follows up to
+        // 10 redirects by default, which would let a hostile (or merely
+        // misconfigured) DID host bounce resolution to a plaintext `http://`
+        // URL or to a different origin — turning DID:web resolution into
+        // both a TLS-downgrade and a server-side-request-forgery vector.
+        // DID:web has no legitimate reason to redirect: the URL is
+        // deterministically derived from the DID, and any deviation MUST be
+        // treated as a resolution failure.
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let doc: DIDDocument = resp.json().await?;
