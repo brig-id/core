@@ -10,6 +10,8 @@ pub enum Error {
     InvalidAudience,
     #[error("JTI replay detected")]
     JtiReplay,
+    #[error("invalid token TTL (overflow or out of i64 range)")]
+    InvalidTtl,
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }

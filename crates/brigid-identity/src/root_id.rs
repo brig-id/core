@@ -73,10 +73,26 @@ fn validate_server(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::InvalidIdentifier("server is empty".into()));
     }
+    // RFC 1035 §2.3.4 / RFC 1123: the total length of a hostname (excluding a
+    // single optional trailing dot used as a fully-qualified marker) must not
+    // exceed 253 octets. A longer string cannot represent a resolvable host
+    // and could let an attacker probe length-sensitive code paths downstream.
+    let canonical = s.strip_suffix('.').unwrap_or(s);
+    if canonical.len() > 253 {
+        return Err(Error::InvalidIdentifier(format!(
+            "server hostname exceeds 253 octets in '{s}'"
+        )));
+    }
     for label in s.split('.') {
         if label.is_empty() {
             return Err(Error::InvalidIdentifier(format!(
                 "empty label in server '{s}'"
+            )));
+        }
+        // RFC 1035 §2.3.4: each DNS label is limited to 63 octets.
+        if label.len() > 63 {
+            return Err(Error::InvalidIdentifier(format!(
+                "label exceeds 63 octets in server '{s}'"
             )));
         }
         if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -170,5 +186,31 @@ mod tests {
         // Case variants must map to the same canonical RootId.
         let other = RootId::parse("alice@EXAMPLE.com").unwrap();
         assert_eq!(id, other);
+    }
+
+    #[test]
+    fn server_label_too_long() {
+        // Single label of 64 octets — exceeds the RFC 1035 §2.3.4 limit of 63.
+        let label = "a".repeat(64);
+        assert!(RootId::parse(&format!("alice@{label}.id")).is_err());
+    }
+
+    #[test]
+    fn server_label_at_max_length_ok() {
+        // Boundary: a 63-octet label must be accepted.
+        let label = "a".repeat(63);
+        assert!(RootId::parse(&format!("alice@{label}.id")).is_ok());
+    }
+
+    #[test]
+    fn server_hostname_too_long() {
+        // Build a hostname whose total length exceeds 253 octets while keeping
+        // each label under 63. 5 labels of 60 chars + 4 dots = 304 octets.
+        let label = "a".repeat(60);
+        let host = std::iter::repeat_n(label.as_str(), 5)
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(host.len() > 253);
+        assert!(RootId::parse(&format!("alice@{host}")).is_err());
     }
 }

@@ -184,8 +184,15 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .merge(auth_routes)
         .merge(discovery_routes)
         .merge(health_routes)
-        .layer(security_headers)
+        // `cors` is added before `security_headers` so that `security_headers`
+        // becomes the outermost layer. `CorsLayer` short-circuits preflight
+        // OPTIONS requests with its own response *inside* the layer it wraps;
+        // if `security_headers` were inside `cors`, those preflight responses
+        // would bypass the security headers entirely. Wrapping the other way
+        // round guarantees every response — including CORS preflights and
+        // CORS-rejected requests — carries the full security header set.
         .layer(cors)
+        .layer(security_headers)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

@@ -59,11 +59,19 @@ pub fn issue_token(
     key: &OidcSigningKey,
     now_unix: i64,
 ) -> Result<String> {
+    // Compute `exp = now_unix + ttl_secs` with explicit overflow handling.
+    // A direct `as i64` cast of a large `u64` ttl would silently wrap to a
+    // negative value and produce an already-expired token; a naive `+` could
+    // also overflow at the i64 boundary. Both failure modes are surfaced as
+    // `Error::InvalidTtl` so the caller can reject the request instead of
+    // minting a bogus token.
+    let ttl_i64 = i64::try_from(params.ttl_secs).map_err(|_| Error::InvalidTtl)?;
+    let exp = now_unix.checked_add(ttl_i64).ok_or(Error::InvalidTtl)?;
     let claims = Claims {
         sub: params.vsid.to_string(),
         iss: params.issuer.to_string(),
         aud: params.client_id.to_string(),
-        exp: now_unix + params.ttl_secs as i64,
+        exp,
         iat: now_unix,
         jti: Uuid::new_v4().to_string(),
         server: params.server.to_string(),
