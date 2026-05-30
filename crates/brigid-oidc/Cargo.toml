@@ -17,7 +17,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 jsonwebtoken = "9"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64ct = { version = "1", features = ["alloc"] }
-pkcs8 = { version = "0.10", features = ["alloc"] }
+pkcs8 = { version = "0.11", features = ["alloc"] }
 
 [dev-dependencies]
 brigid-crypto.workspace = true
