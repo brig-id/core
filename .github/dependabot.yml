@@ -8,6 +8,37 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    groups:
+      rustcrypto-traits:
+        # All RustCrypto crates that share digest/crypto-common/signature traits
+        # must move together — bumping one alone breaks the trait bounds of others.
+        patterns:
+          - "aes-gcm"
+          - "aes"
+          - "cipher"
+          - "crypto-common"
+          - "der"
+          - "digest"
+          - "ed25519"
+          - "ed25519-dalek"
+          - "hkdf"
+          - "hmac"
+          - "ml-dsa"
+          - "ml-kem"
+          - "module-lattice"
+          - "pkcs8"
+          - "secrecy"
+          - "sha3"
+          - "shake"
+          - "signature"
+          - "spki"
+          - "x25519-dalek"
+          - "zeroize"
+      jsonwebtoken-major:
+        # jsonwebtoken 9→10 is a major API rewrite (Validation, key types, errors)
+        # that requires coordinated changes in brigid-oidc.
+        patterns:
+          - "jsonwebtoken"
 
   - package-ecosystem: github-actions
     directory: /
@@ -17,3 +48,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    groups:
+      github-actions:
+        patterns:
+          - "*"
