@@ -33,7 +33,12 @@ issues, pull requests. No exceptions.
   - VSID must never be derived from an alias.
   - VSID must never be derived from a virtual identity.
   - Same `(did_root, client_id, salt)` → same VSID; different `client_id` → different VSID.
-- **No OpenSSL** — use `rustls` everywhere; TLS 1.3 minimum.
+- **No OpenSSL** — use `rustls` everywhere; TLS 1.3 minimum. **Single
+  documented exception:** `webauthn-rs`'s attestation CA chain validator
+  (`webauthn-attestation-ca`) pulls in `openssl-sys` transitively. The
+  exception is scoped strictly to attestation chain verification — TLS,
+  KEM, DSA, KDF and signature flows must stay on rustls / RustCrypto.
+  `server-leaf/Dockerfile` documents the link-time consequences.
 - **No secrets in logs** — `tracing` spans must never capture key material, credentials, or tokens.
 - **No `unwrap()` on error paths** — typed errors via `thiserror`.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
