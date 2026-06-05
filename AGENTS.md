@@ -69,6 +69,42 @@ GET /.well-known/did.json
 - `leptos` + `leptos_axum` — `brigid-ui`
 - `brigid-crypto` (git dep from `brig-id/crypto`)
 
+## Commit conventions
+
+Follow the org-wide convention defined in `brig-id/.github/AGENTS.md` —
+**Conventional Commits + gitmoji**, format `type(scope): <emoji> description`.
+
+### Allowed scopes for this repo
+
+| Scope | Maps to |
+| --- | --- |
+| `store` | `crates/brigid-store` |
+| `did` | `crates/brigid-did` |
+| `identity` | `crates/brigid-identity` |
+| `webauthn` | `crates/brigid-webauthn` |
+| `oidc` | `crates/brigid-oidc` |
+| `api` | `crates/brigid-api` |
+| `ui` | `crates/brigid-ui` |
+| `workspace` | Root `Cargo.toml`, workspace-level changes |
+| `ci` | `.github/workflows/` |
+| `deps` | Dependency bumps (`Cargo.lock`, `Cargo.toml` version pins) |
+
+**Do not use a scope outside this list.** If a new crate is added, update:
+
+1. This table
+2. `.vscode/settings.json` → `conventionalCommits.scopes`
+3. `.github/workflows/conventional-commits.yml` → `scopes` input
+
+### Examples
+
+```text
+feat(api): ✨ add delete passkey endpoint
+fix(store): 🐛 prevent cross-user credential deletion
+test(webauthn): ✅ add softpasskey registration roundtrip
+chore(deps): 📦 bump uuid from 1.23.1 to 1.23.2
+ci(ci): 👷 add conventional commit PR check
+```
+
 ## Commands
 
 ```bash
