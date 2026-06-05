@@ -1,0 +1,25 @@
+name: Conventional Commits
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  check:
+    uses: brig-id/.github/.github/workflows/conventional-commits.yml@main
+    with:
+      # Scopes allowed in this repo — must match .vscode/settings.json
+      # and the scope table in AGENTS.md.
+      # Add a new scope here only when a new crate or top-level concern is introduced.
+      scopes: |
+        store
+        did
+        identity
+        webauthn
+        oidc
+        api
+        ui
+        workspace
+        ci
+        deps
