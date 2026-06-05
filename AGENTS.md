@@ -10,19 +10,26 @@ issues, pull requests. No exceptions.
 
 ## Scope
 
-| Crate | Phase | Purpose |
-|---|---|---|
-| `brigid-store` | 2 | Zero-trust SQLite storage (all data encrypted before INSERT) |
-| `brigid-did` | 2 | DID:web and DID:peer resolution + `.well-known/did.json` handler |
-| `brigid-identity` | 3 | `RootId`, `PrivateAlias`, `IdentifierKind`, VSID computation |
-| `brigid-webauthn` | 4 | Passkey registration and authentication flows |
-| `brigid-oidc` | 5 | ID Token issuance, JWKS, `.well-known/openid-configuration` |
-| `brigid-api` | 6 | Axum HTTP server — all routes |
-| `brigid-ui` | 6 | Leptos SSR frontend (login page, passkey management) |
+| Crate | Purpose |
+| --- | --- |
+| `brigid-store` | Zero-trust SQLite storage (all data encrypted before INSERT) |
+| `brigid-did` | DID:web and DID:peer resolution + `.well-known/did.json` handler |
+| `brigid-identity` | `RootId`, `PrivateAlias`, `IdentifierKind`, VSID computation |
+| `brigid-webauthn` | Passkey registration and authentication flows |
+| `brigid-oidc` | ID Token issuance, JWKS, `.well-known/openid-configuration` |
+| `brigid-api` | Axum HTTP server — all routes |
+| `brigid-ui` | Leptos SSR skeleton (login page — UI replaced by Qwik in `brig-id/web`) |
 
 ## Current phases
 
-**Phases 2–6** — see `/workspaces/.dev/phases/` for checklists.
+See `/workspaces/.dev/phases/` for the v2 plan:
+
+| File | Phase | Status |
+| --- | --- | --- |
+| `phase-1.md` | API finalization (`DELETE /auth/passkeys`, `user_id` in `LoginResponse`) | ⬜ |
+| `phase-2.md` | Qwik UI (`brig-id/web`) | ⬜ |
+| `phase-3.md` | Integration & E2E (`server-leaf`) | ⬜ |
+| `phase-4.md` | Release v0.1.0 | ⬜ |
 
 ## Hard security constraints
 
@@ -44,12 +51,12 @@ issues, pull requests. No exceptions.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
 - **OIDC** — `jti` store must have TTL = token `exp`; never grow unbounded.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
-  (`default-src 'self'`, no `unsafe-inline`, nonce-based for Leptos hydration scripts).
+  (`default-src 'self'`, no `unsafe-inline`).
 - **Rate limiting** — all `/auth/*` routes: 20 req/min per IP via `tower-governor`.
 
 ## Architecture quick-reference
 
-```
+```text
 POST /auth/register/begin  → WebAuthn CreationChallenge
 POST /auth/register/finish → store encrypted credential
 POST /auth/login/begin     → WebAuthn RequestChallenge
@@ -66,15 +73,28 @@ GET /.well-known/did.json
 - `webauthn-rs` — `brigid-webauthn`
 - `jsonwebtoken` (EdDSA, v9+) — `brigid-oidc`
 - `axum` + `tower-http` + `tower-governor` — `brigid-api`
-- `leptos` + `leptos_axum` — `brigid-ui`
 - `brigid-crypto` (git dep from `brig-id/crypto`)
 
 ## Commit conventions
 
-Follow the org-wide convention defined in `brig-id/.github/AGENTS.md` —
-**Conventional Commits + gitmoji**, format `type(scope): <emoji> description`.
+Format: `type(scope): <emoji> description`
 
-### Allowed scopes for this repo
+| Type | Emoji | When |
+| --- | --- | --- |
+| `feat` | ✨ | New feature |
+| `fix` | 🐛 | Bug fix |
+| `docs` | 📝 | Documentation only |
+| `chore` | 🔧 | Maintenance, config |
+| `test` | ✅ | Tests |
+| `refactor` | ♻️ | Restructuring, no behaviour change |
+| `perf` | ⚡️ | Performance |
+| `style` | 🎨 | Formatting only |
+| `ci` | 👷 | CI/CD |
+| `security` | 🔒 | Security fix or hardening |
+| `build` | 📦 | Build system, dependencies |
+| `revert` | ⏪ | Reverts a previous commit |
+
+### Allowed scopes
 
 | Scope | Maps to |
 | --- | --- |
@@ -87,22 +107,17 @@ Follow the org-wide convention defined in `brig-id/.github/AGENTS.md` —
 | `ui` | `crates/brigid-ui` |
 | `workspace` | Root `Cargo.toml`, workspace-level changes |
 | `ci` | `.github/workflows/` |
-| `deps` | Dependency bumps (`Cargo.lock`, `Cargo.toml` version pins) |
+| `deps` | Dependency bumps |
 
-**Do not use a scope outside this list.** If a new crate is added, update:
-
-1. This table
-2. `.vscode/settings.json` → `conventionalCommits.scopes`
-3. `.github/workflows/conventional-commits.yml` → `scopes` input
-
-### Examples
+**Do not use a scope outside this list.** If a new crate is added, update this table,
+`.vscode/settings.json`, and `.github/workflows/conventional-commits.yml`.
 
 ```text
 feat(api): ✨ add delete passkey endpoint
 fix(store): 🐛 prevent cross-user credential deletion
 test(webauthn): ✅ add softpasskey registration roundtrip
 chore(deps): 📦 bump uuid from 1.23.1 to 1.23.2
-ci(ci): 👷 add conventional commit PR check
+ci(ci): 👷 add conventional commit check
 ```
 
 ## Commands
