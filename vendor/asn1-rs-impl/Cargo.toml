@@ -1,0 +1,17 @@
+[package]
+name = "asn1-rs-impl"
+version = "0.2.0"
+edition = "2018"
+description = "Implementation details for the `asn1-rs` crate (patched for Rust 1.86+)"
+license = "MIT/Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# features = ["proc-macro"] is required on proc-macro2 >= 1.0.86 so that
+# `From<proc_macro::Span>` for `proc_macro2::Span` remains available inside
+# proc-macro crates on recent Rust toolchains.
+proc-macro2 = { version = "1", features = ["proc-macro"] }
+quote = "1"
+syn = "2.0"

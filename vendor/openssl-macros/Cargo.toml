@@ -1,0 +1,16 @@
+[package]
+name = "openssl-macros"
+version = "0.1.1"
+edition = "2018"
+description = "Internal macros used by the openssl crate (patched for Rust 1.96)"
+license = "MIT/Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# Only proc-macro2 + syn needed; quote is no longer used in the patched impl.
+# This avoids the round-trip through quote::ToTokens that drops the `c` prefix
+# on C string literals when compiled with Rust 1.96.
+proc-macro2 = { version = "1", features = ["proc-macro"] }
+syn = { version = "2", features = ["full"] }

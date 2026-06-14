@@ -18,7 +18,6 @@ issues, pull requests. No exceptions.
 | `brigid-webauthn` | Passkey registration and authentication flows |
 | `brigid-oidc` | ID Token issuance, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
-| `brigid-ui` | Leptos SSR skeleton (login page — UI replaced by Qwik in `brig-id/web`) |
 
 ## Current phases
 
@@ -104,7 +103,6 @@ Format: `type(scope): <emoji> description`
 | `webauthn` | `crates/brigid-webauthn` |
 | `oidc` | `crates/brigid-oidc` |
 | `api` | `crates/brigid-api` |
-| `ui` | `crates/brigid-ui` |
 | `workspace` | Root `Cargo.toml`, workspace-level changes |
 | `ci` | `.github/workflows/` |
 | `deps` | Dependency bumps |
