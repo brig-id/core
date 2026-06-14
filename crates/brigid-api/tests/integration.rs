@@ -1066,3 +1066,112 @@ async fn delete_passkey_requires_bearer_token() {
         "missing token must return 401"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Passkey management: GET /auth/passkeys
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_passkeys_returns_registered_passkeys() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // xff_base "10.30.1" → setup IPs 10.30.1.1–5, list request on 10.30.1.6
+    let (id_token, user_id, passkey_id) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "lp_alice@localhost",
+        &rp_origin,
+        &mut auth_client,
+        "10.30.1",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={user_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.30.1.6")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK, "list must return 200");
+    let passkeys: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(passkeys.len(), 1, "user should have exactly one passkey");
+    let listed_id: Uuid = serde_json::from_value(passkeys[0]["id"].clone()).unwrap();
+    assert_eq!(listed_id, passkey_id, "listed passkey id must match registered id");
+}
+
+#[tokio::test]
+async fn list_passkeys_wrong_user_returns_403() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    let (alice_token, _, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "lp_alice2@localhost",
+        &rp_origin,
+        &mut auth_alice,
+        "10.30.2",
+    )
+    .await;
+    let (_, bob_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "lp_bob@localhost",
+        &rp_origin,
+        &mut auth_bob,
+        "10.30.3",
+    )
+    .await;
+
+    // Alice's token + Bob's user_id — VSID mismatch → 403
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={bob_id}"))
+                .header("authorization", format!("Bearer {alice_token}"))
+                .header("x-forwarded-for", "10.30.2.6")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "wrong user must get 403");
+}
+
+#[tokio::test]
+async fn list_passkeys_requires_bearer_token() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={}", Uuid::new_v4()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "missing token must return 401");
+}
