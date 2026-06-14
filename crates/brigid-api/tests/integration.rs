@@ -387,6 +387,10 @@ async fn register_and_login_roundtrip() {
         login_json["id_token"].is_string(),
         "expected id_token in response"
     );
+    assert!(
+        login_json["user_id"].is_string(),
+        "expected user_id in login response"
+    );
 }
 
 #[tokio::test]
@@ -750,5 +754,315 @@ async fn cors_allows_configured_origin() {
             .and_then(|v| v.to_str().ok()),
         Some("https://allowed.example.com"),
         "configured origin must be reflected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Passkey management: DELETE /auth/passkeys/{id}
+// ---------------------------------------------------------------------------
+
+/// Registers a user and completes a login, returning (id_token, user_id, passkey_id).
+///
+/// Each of the 5 setup requests uses a distinct IP derived from `xff_base` so
+/// that no bucket exceeds the burst limit of 5. The caller is free to use any
+/// IP it likes for the actual request under test.
+async fn register_and_login_for_passkey_tests(
+    app: axum::Router,
+    username: &str,
+    rp_origin: &url::Url,
+    auth_client: &mut webauthn_authenticator_rs::WebauthnAuthenticator<
+        webauthn_authenticator_rs::softpasskey::SoftPasskey,
+    >,
+    xff_base: &str,
+) -> (String, Uuid, Uuid) {
+    // Register begin (IP .1)
+    let xff1 = format!("{xff_base}.1");
+    let body = serde_json::json!({ "username": username });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", &xff1)
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j: serde_json::Value = response_body_json(resp.into_body()).await;
+    let session_id: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let reg_cred = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+
+    // Register finish (IP .2)
+    let xff2 = format!("{xff_base}.2");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/finish")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", &xff2)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": session_id,
+                        "credential": reg_cred,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Login begin (IP .3)
+    let xff3 = format!("{xff_base}.3");
+    let login_body = serde_json::json!({ "username": username, "client_id": "test-client" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/begin")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", &xff3)
+                .body(Body::from(serde_json::to_vec(&login_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j: serde_json::Value = response_body_json(resp.into_body()).await;
+    let login_session: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let rcr: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let auth_cred = auth_client
+        .do_authentication(rp_origin.clone(), rcr)
+        .unwrap();
+
+    // Login finish (IP .4)
+    let xff4 = format!("{xff_base}.4");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login/finish")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", &xff4)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": login_session,
+                        "credential": auth_cred,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j: serde_json::Value = response_body_json(resp.into_body()).await;
+    let id_token = j["id_token"].as_str().unwrap().to_owned();
+    let user_id: Uuid = serde_json::from_value(j["user_id"].clone()).unwrap();
+
+    // List passkeys to get the credential id (IP .5)
+    let xff5 = format!("{xff_base}.5");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={user_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", &xff5)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let passkeys: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        !passkeys.is_empty(),
+        "user should have at least one passkey"
+    );
+    let passkey_id: Uuid = serde_json::from_value(passkeys[0]["id"].clone()).unwrap();
+
+    (id_token, user_id, passkey_id)
+}
+
+#[tokio::test]
+async fn delete_passkey_roundtrip() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // xff_base "10.20.1" → setup IPs 10.20.1.1–10.20.1.5 (one each), DELETE on 10.20.1.6
+    let (id_token, user_id, passkey_id) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "dp_alice@localhost",
+        &rp_origin,
+        &mut auth_client,
+        "10.20.1",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/auth/passkeys/{passkey_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.20.1.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "delete passkey must return 200"
+    );
+}
+
+#[tokio::test]
+async fn delete_passkey_wrong_user_returns_403() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // Each user's setup uses its own /24 so no bucket accumulates.
+    // xff_base "10.20.2" → 10.20.2.1–5 for alice's setup
+    // xff_base "10.20.3" → 10.20.3.1–5 for bob's setup; DELETE on 10.20.2.6
+    let (alice_token, _, alice_passkey) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "dp_alice2@localhost",
+        &rp_origin,
+        &mut auth_alice,
+        "10.20.2",
+    )
+    .await;
+    let (_, bob_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "dp_bob@localhost",
+        &rp_origin,
+        &mut auth_bob,
+        "10.20.3",
+    )
+    .await;
+
+    // Alice's token but Bob's user_id — VSID mismatch → 403
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/auth/passkeys/{alice_passkey}"))
+                .header("authorization", format!("Bearer {alice_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.20.2.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": bob_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "wrong user must get 403"
+    );
+}
+
+#[tokio::test]
+async fn delete_passkey_unknown_id_returns_404() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // xff_base "10.20.4" → setup IPs 10.20.4.1–5, DELETE on 10.20.4.6
+    let (id_token, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "dp_carol@localhost",
+        &rp_origin,
+        &mut auth_client,
+        "10.20.4",
+    )
+    .await;
+
+    let nonexistent_id = Uuid::new_v4();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/auth/passkeys/{nonexistent_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.20.4.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown passkey id must return 404"
+    );
+}
+
+#[tokio::test]
+async fn delete_passkey_requires_bearer_token() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/auth/passkeys/{}", Uuid::new_v4()))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": Uuid::new_v4() })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "missing token must return 401"
     );
 }
