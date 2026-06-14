@@ -2,7 +2,12 @@
 
 use std::{sync::Arc, time::Instant};
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use brigid_did::build_did_web;
 use brigid_identity::{RootId, compute_vsid};
 use brigid_oidc::{IssuanceParams, issue_token};
@@ -61,6 +66,21 @@ pub struct FinishLoginRequest {
 #[derive(Serialize)]
 pub struct LoginResponse {
     pub id_token: String,
+    /// Internal user UUID, returned alongside the OIDC token so the UI can
+    /// supply it on endpoints that require explicit `user_id` authorization
+    /// (e.g. `DELETE /auth/passkeys/{id}`). Not embedded in the JWT itself to
+    /// avoid tying the opaque `sub` claim to a stable internal identifier.
+    pub user_id: Uuid,
+}
+
+#[derive(Deserialize)]
+pub struct DeletePasskeyRequest {
+    pub user_id: Uuid,
+}
+
+#[derive(Serialize)]
+pub struct PasskeySummary {
+    pub id: Uuid,
 }
 
 /// `POST /auth/register/begin`
@@ -307,7 +327,92 @@ pub async fn login_finish(
 
     let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
 
-    Ok((StatusCode::OK, Json(LoginResponse { id_token })))
+    Ok((
+        StatusCode::OK,
+        Json(LoginResponse {
+            id_token,
+            user_id: pending.user_id,
+        }),
+    ))
+}
+
+/// `DELETE /auth/passkeys/{id}`
+///
+/// Deletes a passkey belonging to the authenticated user. The body must carry
+/// the caller's `user_id` (returned by `/auth/login/finish`); the handler
+/// cross-checks it against the token's VSID to prevent one user from deleting
+/// another user's passkey even if they somehow obtain the correct passkey UUID.
+pub async fn delete_passkey(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Path(passkey_id): Path<Uuid>,
+    Json(body): Json<DeletePasskeyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Recompute the VSID for the claimed user and verify it matches the token.
+    let user = state
+        .store
+        .fetch_user(body.user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+
+    let expected_vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected_vsid.as_str() != claims.sub {
+        return Err(ApiError::Forbidden);
+    }
+
+    state
+        .store
+        .delete_credential(body.user_id, passkey_id)
+        .await
+        .map_err(|e| match e {
+            brigid_store::Error::NotFound => ApiError::NotFound,
+            other => internal!(other),
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
+/// `GET /auth/passkeys`
+///
+/// Lists the passkeys registered for the authenticated user. The caller must
+/// supply their `user_id` (returned by `/auth/login/finish`) as a query
+/// parameter; the handler cross-checks it against the token's VSID.
+pub async fn list_passkeys(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id: Uuid = params
+        .get("user_id")
+        .ok_or_else(|| ApiError::BadRequest("user_id query param required".into()))?
+        .parse()
+        .map_err(|_| ApiError::BadRequest("user_id must be a valid UUID".into()))?;
+
+    let user = state
+        .store
+        .fetch_user(user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+
+    let expected_vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected_vsid.as_str() != claims.sub {
+        return Err(ApiError::Forbidden);
+    }
+
+    let creds = state
+        .store
+        .fetch_credentials(user_id)
+        .await
+        .map_err(|e| internal!(e))?;
+
+    let summaries: Vec<PasskeySummary> =
+        creds.iter().map(|c| PasskeySummary { id: c.id }).collect();
+
+    Ok((StatusCode::OK, Json(summaries)))
 }
 
 /// `POST /auth/logout`
