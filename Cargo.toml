@@ -6,7 +6,6 @@ members = [
     "crates/brigid-webauthn",
     "crates/brigid-oidc",
     "crates/brigid-api",
-    "crates/brigid-ui",
 ]
 resolver = "2"
 
@@ -24,7 +23,6 @@ brigid-identity = { path = "crates/brigid-identity" }
 brigid-webauthn = { path = "crates/brigid-webauthn" }
 brigid-oidc = { path = "crates/brigid-oidc" }
 brigid-api = { path = "crates/brigid-api" }
-brigid-ui = { path = "crates/brigid-ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hkdf = "0.12"
@@ -35,6 +33,23 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 url = "2"
 zeroize = { version = "1", features = ["derive"] }
+
+# Vendor patches for Rust 1.96 compatibility.
+#
+# asn1-rs-impl 0.2.0 / openssl-macros 0.1.1: omit `features = ["proc-macro"]`
+# on proc-macro2, breaking C string literal re-emission on Rust 1.96.
+#
+# webauthn-authenticator-rs 0.5.5: the `softpasskey` feature unnecessarily
+# enables `softtoken` → `ctap2`, which contains a futures::select! macro that
+# triggers a Rust 1.96 hygiene regression (predicate fn-param not visible
+# inside the macro expansion). The patch removes the `softtoken` dep from the
+# `softpasskey` feature since SoftPasskey itself does not require it.
+#
+# Remove each entry when the upstream crate ships a fix.
+[patch.crates-io]
+asn1-rs-impl = { path = "vendor/asn1-rs-impl" }
+openssl-macros = { path = "vendor/openssl-macros" }
+webauthn-authenticator-rs = { path = "vendor/webauthn-authenticator-rs" }
 
 [profile.release]
 panic = "abort"
