@@ -12,7 +12,7 @@ use axum::{
         HeaderName, HeaderValue, Request,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
@@ -102,11 +102,9 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
-            // Static CSP suitable for the JSON API endpoints currently exposed
-            // (no inline scripts, no hydration). When the Leptos SSR UI
-            // (`brigid-ui`, Phase 6) is mounted on this router it must replace
-            // `script-src 'self'` with a per-response `nonce-<base64>` policy
-            // — see AGENTS.md "CSP header" invariant. Tracked in phase-6.md.
+            // Static CSP for the JSON API. The Qwik UI (phase 2, `brig-id/web`)
+            // is served as static files — `script-src 'self'` holds with no
+            // nonce needed because Qwik generates no inline scripts in SSG mode.
             HeaderValue::from_static(
                 "default-src 'self'; \
                  script-src 'self'; \
@@ -138,6 +136,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
+                axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])
             .allow_headers([CONTENT_TYPE, AUTHORIZATION])
@@ -166,6 +165,8 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/auth/login/begin", post(auth::login_begin))
         .route("/auth/login/finish", post(auth::login_finish))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/passkeys", get(auth::list_passkeys))
+        .route("/auth/passkeys/{id}", delete(auth::delete_passkey))
         .layer(GovernorLayer::new(governor_conf));
 
     let discovery_routes = Router::new()
