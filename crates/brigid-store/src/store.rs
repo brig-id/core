@@ -266,6 +266,27 @@ pub async fn update_credential(
     Ok(())
 }
 
+/// DELETE a [`Credential`] by `(user_id, cred_id)`.
+///
+/// The double-column predicate prevents cross-user deletion: a caller who
+/// knows `cred_id` but not the matching `user_id` cannot remove it. Returns
+/// [`Error::NotFound`] when zero rows are affected (credential absent or
+/// `user_id` mismatch), letting callers distinguish a legitimate 404 from an
+/// authorisation failure without leaking whether the ID exists at all.
+pub async fn delete_credential(pool: &SqlitePool, user_id: Uuid, cred_id: Uuid) -> Result<()> {
+    let result = sqlx::query("DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?")
+        .bind(cred_id.to_string())
+        .bind(user_id.to_string())
+        .execute(pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+
+    Ok(())
+}
+
 /// Fetch all [`Credential`]s for a user, decrypting `data` on read.
 pub async fn fetch_credentials(
     pool: &SqlitePool,
@@ -342,6 +363,10 @@ impl EncryptedStore {
 
     pub async fn fetch_credentials(&self, user_id: Uuid) -> Result<Vec<Credential>> {
         fetch_credentials(&self.pool, &self.master, user_id).await
+    }
+
+    pub async fn delete_credential(&self, user_id: Uuid, cred_id: Uuid) -> Result<()> {
+        delete_credential(&self.pool, user_id, cred_id).await
     }
 
     pub async fn fetch_user_by_username(
@@ -664,6 +689,58 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.is_none());
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_credential_removes_row(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        let user_id = user.id;
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let cred = Credential {
+            id: Uuid::new_v4(),
+            user_id,
+            data: b"webauthn-cred".to_vec(),
+        };
+        store_credential(&pool, &master, &cred).await.unwrap();
+
+        delete_credential(&pool, user_id, cred.id).await.unwrap();
+
+        let remaining = fetch_credentials(&pool, &master, user_id).await.unwrap();
+        assert!(remaining.is_empty(), "credential should be deleted");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_credential_wrong_user_returns_not_found(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        let user_id = user.id;
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let cred = Credential {
+            id: Uuid::new_v4(),
+            user_id,
+            data: b"webauthn-cred".to_vec(),
+        };
+        store_credential(&pool, &master, &cred).await.unwrap();
+
+        let other_user_id = Uuid::new_v4();
+        let result = delete_credential(&pool, other_user_id, cred.id).await;
+        assert!(
+            matches!(result, Err(Error::NotFound)),
+            "wrong user_id should return NotFound, got {result:?}"
+        );
+
+        // Credential must still be present
+        let remaining = fetch_credentials(&pool, &master, user_id).await.unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "credential must survive a failed delete"
+        );
+        Ok(())
     }
 
     /// `OffsetDateTime::format(&Rfc3339)` returns `Err` for years outside
