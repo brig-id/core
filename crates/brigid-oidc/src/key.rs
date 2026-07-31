@@ -1,6 +1,6 @@
 use ed25519_dalek::SigningKey;
 use pkcs8::EncodePrivateKey;
-use rand_core::OsRng;
+use rand_core::UnwrapErr;
 use uuid::Uuid;
 
 /// An Ed25519 signing key used to issue and verify OIDC ID Tokens.
@@ -12,7 +12,7 @@ pub struct OidcSigningKey {
 impl OidcSigningKey {
     /// Generate a fresh Ed25519 keypair with a random `kid`.
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(getrandom::SysRng));
         Self {
             kid: Uuid::new_v4().to_string(),
             signing_key,

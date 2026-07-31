@@ -13,9 +13,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 url.workspace = true
-ed25519-dalek = { version = "3", features = ["rand_core", "pkcs8"] }
-jsonwebtoken = "10"
-rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "3", features = ["rand_core", "pkcs8", "alloc"] }
+# jsonwebtoken 10 requires picking a CryptoProvider; rust_crypto matches the
+# ed25519-dalek-based signing this crate already uses (no new C dependency).
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# `OsRng` moved out of rand_core 0.10 into getrandom's `SysRng`.
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 base64ct = { version = "1", features = ["alloc"] }
 pkcs8 = { version = "0.11", features = ["alloc"] }
 
