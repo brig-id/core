@@ -6,15 +6,17 @@ on:
   push:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Commit messages follow conventional commits + gitmoji
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # The action does its own checkout (fetch-depth 0) by default; scopes
+      # are auto-read from .vscode/settings.json (conventionalCommits.scopes)
+      # since this repo has no scopes.json file.
+      - uses: helpers4/action/conventional-commits@6fddd178620e7325d446a246c38a44f979569fc4 # main @ 2026-07-29
         with:
-          fetch-depth: 0
-
-      - uses: helpers4/action-conventional-commits@v1
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-comment: "none"
