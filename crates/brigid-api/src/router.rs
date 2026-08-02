@@ -156,7 +156,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             trust_header: state.trust_forwarded_for,
         })
         .finish()
-        .unwrap();
+        // `finish()` only returns `None` when `burst_size` or `period` is
+        // zero — both are non-zero literals above (5 and 3s), so this
+        // always succeeds.
+        .expect("burst_size and period are both non-zero literals above");
 
     // Protected auth routes with rate limiting.
     let auth_routes = Router::new()
