@@ -1,0 +1,38 @@
+[package]
+name = "brigid-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# `fuzz/` lives inside the `core` workspace but must not be a member of it —
+# cargo-fuzz's build (ASan, sancov instrumentation) is incompatible with the
+# rest of the workspace's normal build. An empty `[workspace]` table detaches
+# it into its own standalone workspace, same as brig-id/crypto's fuzz/ setup.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+brigid-identity = { path = "../crates/brigid-identity" }
+brigid-did = { path = "../crates/brigid-did" }
+brigid-oidc = { path = "../crates/brigid-oidc" }
+
+[[bin]]
+name = "fuzz_parse_identifier"
+path = "fuzz_targets/fuzz_parse_identifier.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_did_web_resolve"
+path = "fuzz_targets/fuzz_did_web_resolve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_jwt_validate"
+path = "fuzz_targets/fuzz_jwt_validate.rs"
+test = false
+doc = false

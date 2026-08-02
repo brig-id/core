@@ -1,0 +1,7 @@
+target
+corpus
+artifacts
+coverage
+# Matches brig-id/crypto's fuzz/ convention — left floating so fuzzing
+# always exercises current-compatible dependency versions.
+Cargo.lock
