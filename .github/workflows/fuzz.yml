@@ -1,0 +1,87 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main, dev]
+  schedule:
+    # Run daily at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_parse_identifier
+          - fuzz_did_web_resolve
+          - fuzz_jwt_validate
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-binstall
+        # Pinned action commit (v1.21.1) — fetches a checksummed cargo-binstall
+        # binary from its signed GitHub release. Matches brig-id/crypto's fuzz.yml.
+        uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
+
+      - name: Install cargo-fuzz
+        # Use the upstream prebuilt binary from the cargo-fuzz GitHub release
+        # (checksum verified by cargo-binstall), avoiding both the supply-chain
+        # risk of an unlocked `cargo install` and build failures from an older
+        # pinned Cargo.lock inside cargo-fuzz's own release. Version pinned to
+        # match brig-id/crypto's fuzz.yml.
+        run: cargo binstall --no-confirm --version 0.13.1 cargo-fuzz
+
+      - name: Restore corpus cache
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzzer (120 s)
+        # `--target x86_64-unknown-linux-gnu` is required: cargo-binstall fetches
+        # the statically-linked musl release of cargo-fuzz, which embeds its own
+        # compile-time target tuple (`x86_64-unknown-linux-musl`) as the default
+        # fuzz build target. Building fuzzers for musl is incompatible with the
+        # address sanitizer (`sanitizer is incompatible with statically linked
+        # libc`), so we pin the build to the runner's native glibc triple.
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=120 -max_len=4096
+
+      - name: Ensure corpus directory exists
+        # actions/cache/save fails the step if the path does not exist. The
+        # fuzzer creates the directory the first time it persists an input,
+        # but a build/tooling failure earlier in `cargo fuzz run` would leave
+        # the path missing and mask the real error behind a cache-save error.
+        if: always()
+        run: mkdir -p fuzz/corpus/${{ matrix.target }}
+
+      - name: Save corpus cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: crash-${{ matrix.target }}-${{ github.sha }}
+          # `if-no-files-found: ignore` avoids masking a build/tooling failure
+          # with an artifact-upload error: when the fuzzer never reached the
+          # crash-writing stage, the artifacts directory simply does not exist.
+          if-no-files-found: ignore
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
