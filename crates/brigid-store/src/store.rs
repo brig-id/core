@@ -444,6 +444,112 @@ impl EncryptedStore {
         Ok(())
     }
 
+    /// Re-encrypts every row under `new_master`, replacing this store's key.
+    ///
+    /// Decrypts each `users` row's `username`/`server`/`did_web` (and
+    /// recomputes `username_index`, itself HKDF-derived from the master
+    /// key — a stale index computed under the old key would never match a
+    /// lookup computed under the new one post-rotation) and each
+    /// `webauthn_credentials` row's `data`, both under the current
+    /// (pre-rotation) key, then re-encrypts under `new_master`. All of it
+    /// runs in one transaction: any failure — a decrypt error, a database
+    /// error, anything — rolls back the entire rotation via `tx`'s `Drop`,
+    /// leaving every row exactly as it was under the old key. On success,
+    /// this store's own key is updated to `new_master` so it keeps working
+    /// against what it just wrote.
+    ///
+    /// Does **not** touch `sessions` or `jti_blacklist` — neither table
+    /// stores anything encrypted under the master key.
+    ///
+    /// # Rotation is not free of side effects
+    ///
+    /// The master key is also the root of two things this method does not
+    /// (and cannot, from here) fix up:
+    /// - [`brigid_identity::derive_vsid_salt`] derives the VSID salt from
+    ///   the master key, and VSIDs themselves are never stored — they're
+    ///   recomputed on demand from `(did_root, client_id, salt)`. Rotating
+    ///   the master key changes the salt, which changes the VSID (the OIDC
+    ///   `sub` claim) for *every* user, for *every* relying party,
+    ///   simultaneously. Any relying party that correlates users by VSID
+    ///   loses that continuity across a rotation — there is no way to
+    ///   preserve it without storing VSIDs (defeating their point) or
+    ///   storing the salt separately from the key it's meant to rotate away
+    ///   from.
+    /// - `leaf`'s OIDC signing key is derived from the master key at
+    ///   startup (`derive_user_key(master, b"oidc-signing-key", ...)`), not
+    ///   stored. Rotating invalidates every previously issued `id_token`
+    ///   immediately, not just after its natural expiry.
+    ///
+    /// Callers (the `leaf rotate-key` CLI) must surface both of these
+    /// plainly — this is an operational consequence to document and warn
+    /// about, not a bug to route around.
+    pub async fn rotate_master_key(&mut self, new_master: MasterKey) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        let user_rows = sqlx::query("SELECT id, username, server, did_web FROM users")
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in user_rows {
+            let id_str: String = row.try_get("id")?;
+            let id: Uuid = id_str.parse()?;
+            let username_raw: Vec<u8> = row.try_get("username")?;
+            let server_raw: Vec<u8> = row.try_get("server")?;
+            let did_web_raw: Vec<u8> = row.try_get("did_web")?;
+
+            let old_key = user_key(&self.master, &id)?;
+            let username = dec(&old_key, &username_raw)?;
+            let server = dec(&old_key, &server_raw)?;
+            let did_web = dec(&old_key, &did_web_raw)?;
+
+            let new_key = user_key(&new_master, &id)?;
+            let username_enc = enc(&new_key, &username)?;
+            let server_enc = enc(&new_key, &server)?;
+            let did_web_enc = enc(&new_key, &did_web)?;
+
+            let username_str = String::from_utf8(username)?;
+            let server_str = String::from_utf8(server)?;
+            let new_idx = username_index(&new_master, &username_str, &server_str)?;
+
+            sqlx::query(
+                "UPDATE users SET username = ?, server = ?, did_web = ?, username_index = ? \
+                 WHERE id = ?",
+            )
+            .bind(username_enc)
+            .bind(server_enc)
+            .bind(did_web_enc)
+            .bind(new_idx)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let cred_rows = sqlx::query("SELECT id, user_id, data FROM webauthn_credentials")
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in cred_rows {
+            let cred_id: String = row.try_get("id")?;
+            let user_id_str: String = row.try_get("user_id")?;
+            let user_id: Uuid = user_id_str.parse()?;
+            let data_raw: Vec<u8> = row.try_get("data")?;
+
+            let old_key = user_key(&self.master, &user_id)?;
+            let data = dec(&old_key, &data_raw)?;
+
+            let new_key = user_key(&new_master, &user_id)?;
+            let data_enc = enc(&new_key, &data)?;
+
+            sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
+                .bind(data_enc)
+                .bind(cred_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        self.master = new_master;
+        Ok(())
+    }
+
     /// Persist a revoked JTI in the database so it remains blacklisted across
     /// server restarts for the duration of its token lifetime.
     ///
@@ -840,5 +946,124 @@ mod tests {
             "wrong master key should not find the user"
         );
         Ok(())
+    }
+
+    fn new_master() -> MasterKey {
+        MasterKey::from_hex(&"cd".repeat(32)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rotate_master_key_round_trip() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+
+        let user = sample_user();
+        let user_id = user.id;
+        store.store_user(&user).await.unwrap();
+        let cred = Credential {
+            id: Uuid::new_v4(),
+            user_id,
+            data: b"webauthn-credential-bytes".to_vec(),
+        };
+        store.store_credential(&cred).await.unwrap();
+
+        store.rotate_master_key(new_master()).await.unwrap();
+
+        // The store's own key was updated — every existing accessor keeps
+        // working transparently against what rotation just wrote.
+        let fetched = store.fetch_user(user_id).await.unwrap().unwrap();
+        assert_eq!(fetched.username, "alice");
+        assert_eq!(fetched.server, "example.com");
+        assert_eq!(fetched.did_web, "did:web:example.com:u:alice");
+
+        let creds = store.fetch_credentials(user_id).await.unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].data, b"webauthn-credential-bytes");
+
+        // The username_index was recomputed under the new key too — lookup
+        // by username must still resolve, not just lookup by id.
+        let found = store
+            .fetch_user_by_username("alice", "example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, user_id);
+    }
+
+    #[tokio::test]
+    async fn rotate_master_key_old_key_can_no_longer_decrypt() {
+        let old_master = master();
+        let mut store = EncryptedStore::new("sqlite::memory:", old_master)
+            .await
+            .unwrap();
+
+        let user = sample_user();
+        let user_id = user.id;
+        store.store_user(&user).await.unwrap();
+
+        store.rotate_master_key(new_master()).await.unwrap();
+
+        // Read the now-rotated rows back out with the *old* key, standalone
+        // (not through `store`, which already moved on to the new key).
+        let result = fetch_user(&store.pool, &master(), user_id).await;
+        assert!(
+            result.is_err(),
+            "the old master key should no longer decrypt rotated data"
+        );
+    }
+
+    /// A failure partway through rotation (a malformed blob it can't decrypt)
+    /// must roll back the *entire* transaction, not leave some rows rotated
+    /// and others not.
+    #[tokio::test]
+    async fn rotate_master_key_rolls_back_entirely_on_partial_failure() {
+        let old_master = master();
+        let mut store = EncryptedStore::new("sqlite::memory:", old_master)
+            .await
+            .unwrap();
+
+        // A normal, validly-encrypted user — processed successfully by the
+        // `users` half of the rotation before the credential below is ever
+        // reached.
+        let user = sample_user();
+        let user_id = user.id;
+        store.store_user(&user).await.unwrap();
+
+        // A credential with a deliberately malformed blob — too short to be
+        // a valid AES-GCM blob (nonce alone is 12 bytes) — inserted directly
+        // via raw SQL, bypassing `store_credential`'s normal encryption, so
+        // rotation's `dec()` call on it fails.
+        let cred_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+            .bind(cred_id.to_string())
+            .bind(user_id.to_string())
+            .bind(vec![0xde, 0xad, 0xbe])
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let result = store.rotate_master_key(new_master()).await;
+        assert!(
+            result.is_err(),
+            "rotation should fail on the malformed credential blob"
+        );
+
+        // The store itself only swaps to the new key on success — after a
+        // failed rotation it must still be usable with the *old* key.
+        let fetched = store.fetch_user(user_id).await.unwrap().unwrap();
+        assert_eq!(fetched.username, "alice", "user row must not be rotated");
+
+        // Prove it at the SQL level too: the username_index computed under
+        // the old key must still be the one on disk — if the `users` UPDATE
+        // had actually committed before the credential failure, it wouldn't.
+        let old_idx = username_index(&master(), "alice", "example.com").unwrap();
+        let row = sqlx::query("SELECT username_index FROM users WHERE id = ?")
+            .bind(user_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let stored_idx: String = row.try_get("username_index").unwrap();
+        assert_eq!(stored_idx, old_idx, "username_index must not be rotated");
     }
 }
