@@ -19,16 +19,10 @@ issues, pull requests. No exceptions.
 | `brigid-oidc` | ID Token issuance, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
 
-## Current phases
+## Roadmap & planning
 
-See `/workspaces/.dev/phases/` for the v2 plan:
-
-| File | Phase | Status |
-| --- | --- | --- |
-| `phase-1.md` | API finalization (`DELETE /auth/passkeys`, `user_id` in `LoginResponse`) | ⬜ |
-| `phase-2.md` | Qwik UI (`brig-id/web`) | ⬜ |
-| `phase-3.md` | Integration & E2E (`server-leaf`) | ⬜ |
-| `phase-4.md` | Release v0.1.0 | ⬜ |
+TODOs, backlog ideas, and phase/release status for this repo are tracked as cards in
+[brig-id Project 1](https://github.com/orgs/brig-id/projects/1), not in local files.
 
 ## Hard security constraints
 
