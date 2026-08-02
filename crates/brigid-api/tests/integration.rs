@@ -1109,7 +1109,10 @@ async fn list_passkeys_returns_registered_passkeys() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(passkeys.len(), 1, "user should have exactly one passkey");
     let listed_id: Uuid = serde_json::from_value(passkeys[0]["id"].clone()).unwrap();
-    assert_eq!(listed_id, passkey_id, "listed passkey id must match registered id");
+    assert_eq!(
+        listed_id, passkey_id,
+        "listed passkey id must match registered id"
+    );
 }
 
 #[tokio::test]
@@ -1154,7 +1157,11 @@ async fn list_passkeys_wrong_user_returns_403() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "wrong user must get 403");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "wrong user must get 403"
+    );
 }
 
 #[tokio::test]
@@ -1173,5 +1180,9 @@ async fn list_passkeys_requires_bearer_token() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "missing token must return 401");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "missing token must return 401"
+    );
 }
