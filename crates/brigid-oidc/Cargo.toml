@@ -16,7 +16,7 @@ url.workspace = true
 ed25519-dalek = { version = "3", features = ["rand_core", "pkcs8", "alloc"] }
 # jsonwebtoken 10 requires picking a CryptoProvider; rust_crypto matches the
 # ed25519-dalek-based signing this crate already uses (no new C dependency).
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # `OsRng` moved out of rand_core 0.10 into getrandom's `SysRng`.
 rand_core = "0.10"
 getrandom = { version = "0.4", features = ["sys_rng"] }
