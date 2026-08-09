@@ -16,6 +16,9 @@ pub enum Error {
 
     #[error("invalid public key: {0}")]
     InvalidKey(String),
+
+    #[error("did:web resolution failed: {0}")]
+    Resolution(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
