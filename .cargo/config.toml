@@ -2,7 +2,7 @@
 #
 # `mold` cuts incremental link time dramatically but is not part of a default
 # Rust install — on a host without `mold` on `$PATH`, even `cargo test` would
-# fail before compilation. The brig·id devcontainer (`brig-id/.dev`) installs
+# fail before compilation. The brig·id devcontainer (`brig-id/roots`) installs
 # it and exports `RUSTFLAGS="-C link-arg=-fuse-ld=mold"`, so the default
 # environment still gets the speedup without forcing it on contributors who
 # build outside the devcontainer or on CI runners that do not pre-install it.
