@@ -8,6 +8,13 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
+    ignore:
+      # sha3 0.12 dropped the `digest::core_api::CoreProxy` impl (rewrote to a
+      # monolithic sponge-based struct), which breaks Hkdf<Sha3_256>/Hmac<Sha3_256>
+      # construction. No fix released upstream yet — see RustCrypto/hashes.
+      # Remove once hmac/hkdf regain compatibility with sha3 >=0.12.
+      - dependency-name: "sha3"
+        versions: [">=0.12.0"]
     groups:
       rustcrypto-traits:
         # All RustCrypto crates that share digest/crypto-common/signature traits
