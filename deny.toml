@@ -12,6 +12,8 @@ allow = [
   "CDLA-Permissive-2.0",
   "MPL-2.0",
   "BSL-1.0",
+  # This workspace's own license.
+  "LGPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
 
