@@ -899,6 +899,69 @@ async fn register_and_login_for_passkey_tests(
     (id_token, user_id, passkey_id)
 }
 
+/// Adds a second credential to `user_id` (already registered/logged in via
+/// `register_and_login_for_passkey_tests`), using a distinct authenticator
+/// to stand in for a different physical key. Uses two IPs starting at
+/// `xff_base_start` (begin, finish).
+async fn add_credential_for_tests(
+    app: axum::Router,
+    id_token: &str,
+    user_id: Uuid,
+    rp_origin: &url::Url,
+    xff_base: &str,
+    xff_start: u8,
+) {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/begin")
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", format!("{xff_base}.{xff_start}"))
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "add/begin must return 200");
+    let j: serde_json::Value = response_body_json(resp.into_body()).await;
+    let session_id: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+
+    let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let reg_cred = second_authenticator
+        .do_registration(rp_origin.clone(), ccr)
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/finish")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", format!("{xff_base}.{}", xff_start + 1))
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": session_id,
+                        "credential": reg_cred,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "add/finish must return 200");
+}
+
 #[tokio::test]
 async fn delete_passkey_roundtrip() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
@@ -909,7 +972,9 @@ async fn delete_passkey_roundtrip() {
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
-    // xff_base "10.20.1" → setup IPs 10.20.1.1–10.20.1.5 (one each), DELETE on 10.20.1.6
+    // xff_base "10.20.1" → setup IPs 10.20.1.1–10.20.1.5 (one each), add a
+    // 2nd credential on .6/.7 (deleting the sole passkey is now refused —
+    // see delete_passkey_last_one_returns_409), DELETE on .8, list on .9.
     let (id_token, user_id, passkey_id) = register_and_login_for_passkey_tests(
         app.clone(),
         "dp_alice@localhost",
@@ -919,14 +984,17 @@ async fn delete_passkey_roundtrip() {
     )
     .await;
 
+    add_credential_for_tests(app.clone(), &id_token, user_id, &rp_origin, "10.20.1", 6).await;
+
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{passkey_id}"))
                 .header("authorization", format!("Bearer {id_token}"))
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "10.20.1.6")
+                .header("x-forwarded-for", "10.20.1.8")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
                 ))
@@ -939,6 +1007,68 @@ async fn delete_passkey_roundtrip() {
         resp.status(),
         StatusCode::OK,
         "delete passkey must return 200"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={user_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.20.1.9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let passkeys: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(passkeys.len(), 1, "one credential must remain, not zero");
+}
+
+#[tokio::test]
+async fn delete_passkey_last_one_returns_409() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // xff_base "10.20.5" → setup IPs 10.20.5.1–5, DELETE attempt on .6.
+    // brig·id is passkey-only: deleting someone's last credential would
+    // permanently lock them out, so this must be refused.
+    let (id_token, user_id, passkey_id) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "dp_solo@localhost",
+        &rp_origin,
+        &mut auth_client,
+        "10.20.5",
+    )
+    .await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/auth/passkeys/{passkey_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.20.5.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "deleting the last passkey must be refused"
     );
 }
 

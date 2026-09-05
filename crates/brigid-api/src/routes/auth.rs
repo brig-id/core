@@ -471,6 +471,23 @@ pub async fn delete_passkey(
         return Err(ApiError::Forbidden);
     }
 
+    // brig·id is passkey-only — there is no password or other fallback to
+    // sign in with. Deleting the last credential would permanently lock the
+    // user out of their own account, so refuse it outright. Checked against
+    // the actual credential list (not the delete call's own NotFound) so an
+    // unknown passkey_id still reports 404, not a misleading 409.
+    let remaining = state
+        .store
+        .fetch_credentials(body.user_id)
+        .await
+        .map_err(|e| internal!(e))?;
+    if !remaining.iter().any(|c| c.id == passkey_id) {
+        return Err(ApiError::NotFound);
+    }
+    if remaining.len() <= 1 {
+        return Err(ApiError::Conflict("cannot delete your last passkey".into()));
+    }
+
     state
         .store
         .delete_credential(body.user_id, passkey_id)
