@@ -78,6 +78,11 @@ pub struct DeletePasskeyRequest {
     pub user_id: Uuid,
 }
 
+#[derive(Deserialize)]
+pub struct BeginAddCredentialRequest {
+    pub user_id: Uuid,
+}
+
 #[derive(Serialize)]
 pub struct PasskeySummary {
     pub id: Uuid,
@@ -106,7 +111,7 @@ pub async fn register_begin(
     let user_id = Uuid::new_v4();
     let (ccr, reg_state) = state
         .webauthn
-        .begin_registration(user_id, &body.username)
+        .begin_registration(user_id, &body.username, None)
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
@@ -197,6 +202,110 @@ pub async fn register_finish(
             }
             other => internal!(other),
         })?;
+
+    Ok(StatusCode::OK)
+}
+
+/// `POST /auth/passkeys/add/begin`
+///
+/// Starts a WebAuthn registration ceremony that adds an additional
+/// credential to the *already-registered* identity behind the presented
+/// token — unlike `register_begin`, this never creates a new user/DID. The
+/// caller must supply their `user_id`; the handler cross-checks it against
+/// the token's VSID, same as `delete_passkey`/`list_passkeys`.
+pub async fn add_credential_begin(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Json(body): Json<BeginAddCredentialRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = state
+        .store
+        .fetch_user(body.user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+
+    let expected_vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected_vsid.as_str() != claims.sub {
+        return Err(ApiError::Forbidden);
+    }
+
+    // Exclude the user's existing credentials so an authenticator that
+    // supports it can refuse to re-enrol a key that's already registered.
+    let existing = load_passkeys(&state.store, user.id)
+        .await
+        .map_err(|e| internal!(e))?;
+    let exclude_credentials = existing.iter().map(|p| p.cred_id().clone()).collect();
+
+    let (ccr, reg_state) = state
+        .webauthn
+        .begin_registration(user.id, &user.username, Some(exclude_credentials))
+        .map_err(|e| internal!(e))?;
+
+    let session_id = Uuid::new_v4();
+    state.evict_expired_pending();
+    {
+        let mut map = state
+            .pending_registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
+            return Err(ApiError::TooManyRequests);
+        }
+        map.insert(
+            session_id,
+            PendingRegistration {
+                user_id: user.id,
+                username: user.username,
+                server: user.server,
+                state: reg_state,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(BeginRegisterResponse {
+            session_id,
+            challenge: ccr,
+        }),
+    ))
+}
+
+/// `POST /auth/passkeys/add/finish`
+///
+/// Finishes the ceremony started by `add_credential_begin`. Ownership was
+/// already verified at `begin` time and is bound into the opaque
+/// `session_id` (same trust model as `register_finish`/`login_finish`), so
+/// this handler does not re-check the caller's token.
+pub async fn add_credential_finish(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FinishRegisterRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let pending = state
+        .pending_registrations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&body.session_id)
+        .ok_or(ApiError::BadRequest("unknown session".into()))?;
+
+    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
+        return Err(ApiError::BadRequest("session expired".into()));
+    }
+
+    let passkey = state
+        .webauthn
+        .finish_registration(&pending.state, &body.credential)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let cred = passkey_to_credential(pending.user_id, &passkey).map_err(|e| internal!(e))?;
+    state
+        .store
+        .store_credential(&cred)
+        .await
+        .map_err(|e| internal!(e))?;
 
     Ok(StatusCode::OK)
 }

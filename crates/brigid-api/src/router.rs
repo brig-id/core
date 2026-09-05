@@ -170,6 +170,11 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/passkeys", get(auth::list_passkeys))
         .route("/auth/passkeys/{id}", delete(auth::delete_passkey))
+        .route("/auth/passkeys/add/begin", post(auth::add_credential_begin))
+        .route(
+            "/auth/passkeys/add/finish",
+            post(auth::add_credential_finish),
+        )
         .layer(GovernorLayer::new(governor_conf));
 
     let discovery_routes = Router::new()

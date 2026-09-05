@@ -1186,3 +1186,178 @@ async fn list_passkeys_requires_bearer_token() {
         "missing token must return 401"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Passkey management: POST /auth/passkeys/add/begin + /finish
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn add_credential_roundtrip() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    // xff_base "10.40.1" → setup IPs 10.40.1.1–5, add begin/finish on .6/.7,
+    // list-passkeys check on .8.
+    let (id_token, user_id, _first_passkey) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "ac_alice@localhost",
+        &rp_origin,
+        &mut auth_client,
+        "10.40.1",
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/begin")
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.40.1.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": user_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "add/begin must return 200");
+    let j: serde_json::Value = response_body_json(resp.into_body()).await;
+    let session_id: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+
+    // A distinct authenticator stands in for a second physical key.
+    let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let reg_cred = second_authenticator
+        .do_registration(rp_origin.clone(), ccr)
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/finish")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.40.1.7")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "session_id": session_id,
+                        "credential": reg_cred,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "add/finish must return 200");
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/auth/passkeys?user_id={user_id}"))
+                .header("authorization", format!("Bearer {id_token}"))
+                .header("x-forwarded-for", "10.40.1.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let passkeys: Vec<serde_json::Value> =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        passkeys.len(),
+        2,
+        "identity must now have two distinct credentials, not a second identity"
+    );
+}
+
+#[tokio::test]
+async fn add_credential_wrong_user_returns_403() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    let (alice_token, _, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "ac_alice2@localhost",
+        &rp_origin,
+        &mut auth_alice,
+        "10.40.2",
+    )
+    .await;
+    let (_, bob_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "ac_bob@localhost",
+        &rp_origin,
+        &mut auth_bob,
+        "10.40.3",
+    )
+    .await;
+
+    // Alice's token but Bob's user_id — VSID mismatch → 403, same as
+    // delete_passkey/list_passkeys.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/begin")
+                .header("authorization", format!("Bearer {alice_token}"))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.40.2.6")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": bob_id })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "wrong user must get 403"
+    );
+}
+
+#[tokio::test]
+async fn add_credential_begin_requires_bearer_token() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/passkeys/add/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "user_id": Uuid::new_v4() })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "missing token must return 401"
+    );
+}
