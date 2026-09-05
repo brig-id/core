@@ -2,7 +2,7 @@ name: Fuzz
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, "dev/*"]
   schedule:
     # Run daily at 03:00 UTC
     - cron: "0 3 * * *"
