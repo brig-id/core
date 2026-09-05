@@ -30,14 +30,24 @@ impl WebauthnService {
     }
 
     /// Start a passkey registration challenge.
+    ///
+    /// `exclude_credentials` should list the user's existing credential IDs
+    /// when adding an additional passkey to an already-registered identity,
+    /// so the authenticator can refuse to re-register a physical key that's
+    /// already enrolled. Pass `None` for a brand-new identity (no existing
+    /// credentials to exclude).
     pub fn begin_registration(
         &self,
         user_id: Uuid,
         username: &str,
+        exclude_credentials: Option<Vec<CredentialID>>,
     ) -> Result<(CreationChallengeResponse, PasskeyRegistration)> {
-        Ok(self
-            .webauthn
-            .start_passkey_registration(user_id, username, username, None)?)
+        Ok(self.webauthn.start_passkey_registration(
+            user_id,
+            username,
+            username,
+            exclude_credentials,
+        )?)
     }
 
     /// Verify the registration response and return the passkey.
@@ -221,7 +231,7 @@ mod tests {
         username: &str,
     ) -> Passkey {
         let user_id = Uuid::new_v4();
-        let (ccr, reg_state) = svc.begin_registration(user_id, username).unwrap();
+        let (ccr, reg_state) = svc.begin_registration(user_id, username, None).unwrap();
         let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
         svc.finish_registration(&reg_state, &reg_resp).unwrap()
     }
@@ -233,7 +243,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
-        let (ccr, reg_state) = svc.begin_registration(user_id, "alice").unwrap();
+        let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
         let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
         let passkey = svc.finish_registration(&reg_state, &reg_resp).unwrap();
 
@@ -263,8 +273,8 @@ mod tests {
         let auth_b = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
         let uid = Uuid::new_v4();
-        let (ccr_a, _state_a) = svc.begin_registration(uid, "alice").unwrap();
-        let (_ccr_b, state_b) = svc.begin_registration(uid, "bob").unwrap();
+        let (ccr_a, _state_a) = svc.begin_registration(uid, "alice", None).unwrap();
+        let (_ccr_b, state_b) = svc.begin_registration(uid, "bob", None).unwrap();
 
         // Respond to challenge A, but try to finish with state B → mismatch.
         let resp_a = auth_a.do_registration(rp_origin.clone(), ccr_a).unwrap();
