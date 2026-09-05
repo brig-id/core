@@ -105,13 +105,19 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             // Static CSP for the JSON API. The Qwik UI (phase 2, `brig-id/web`)
             // is served as static files — `script-src 'self'` holds with no
             // nonce needed because Qwik generates no inline scripts in SSG mode.
+            //
+            // img-src/connect-src additionally allow Unsplash: the login/
+            // register pages fetch a daily background photo directly from
+            // the browser (`app/src/lib/unsplash.ts`) — there's no
+            // app-side server to proxy it through, this static UI is served
+            // as files by this very binary.
             HeaderValue::from_static(
                 "default-src 'self'; \
                  script-src 'self'; \
                  style-src 'self'; \
-                 img-src 'self' data:; \
+                 img-src 'self' data: https://images.unsplash.com; \
                  font-src 'self'; \
-                 connect-src 'self'; \
+                 connect-src 'self' https://api.unsplash.com; \
                  frame-ancestors 'none'; \
                  object-src 'none'; \
                  base-uri 'self'",
