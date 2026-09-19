@@ -56,7 +56,7 @@ fn username_index(master: &MasterKey, username: &str, server: &str) -> Result<St
     input.extend_from_slice(server.as_bytes());
     let key = brigid_crypto::hkdf::derive_user_key(master, &input, b"username-lookup")
         .map_err(crate::Error::from)?;
-    Ok(hex::encode(*key))
+    Ok(helpers4::hex::encode(&*key))
 }
 
 /// Encrypt `plaintext` with `key`; returns the serialised nonce+ciphertext blob.
