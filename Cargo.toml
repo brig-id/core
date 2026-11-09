@@ -13,7 +13,7 @@ resolver = "2"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 publish = false
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 brigid-crypto = { git = "https://github.com/brig-id/crypto", tag = "v0.1.0" }
