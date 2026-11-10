@@ -330,6 +330,13 @@ pub async fn store_identity(
     master: &MasterKey,
     identity: &Identity,
 ) -> Result<()> {
+    insert_identity(pool, master, identity).await
+}
+
+async fn insert_identity<'e, E>(executor: E, master: &MasterKey, identity: &Identity) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let name = brigid_identity::validate_name(&identity.name)?;
     brigid_identity::validate_logo(&identity.logo)?;
     let description = match &identity.description {
@@ -351,7 +358,7 @@ pub async fn store_identity(
     .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
     .bind(fmt_time(identity.created_at)?)
     .bind(fmt_time(identity.updated_at)?)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(map_sqlx_unique)?;
     Ok(())
@@ -567,11 +574,18 @@ impl EncryptedStore {
     /// credentials, every re-registration attempt collides on the unique
     /// username index). The transaction guarantees the two rows either both
     /// commit or both roll back.
+    ///
+    /// `identities` (the account's starter identities) are inserted in the
+    /// same transaction; each must belong to `user`.
     pub async fn register_user_with_credential(
         &self,
         user: &User,
         cred: &Credential,
+        identities: &[Identity],
     ) -> Result<()> {
+        if identities.iter().any(|i| i.account_id != user.id) {
+            return Err(Error::CredentialUserMismatch);
+        }
         // Defend against a mismatched credential reaching the transaction:
         // the credential's `data` is encrypted under `cred.user_id`'s per-user
         // key, so committing a `Credential` whose `user_id` differs from the
@@ -619,6 +633,10 @@ impl EncryptedStore {
             .bind(cred_data_enc)
             .execute(&mut *tx)
             .await?;
+
+        for identity in identities {
+            insert_identity(&mut *tx, &self.master, identity).await?;
+        }
 
         tx.commit().await?;
         Ok(())

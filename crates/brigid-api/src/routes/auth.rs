@@ -192,9 +192,10 @@ pub async fn register_finish(
     // with "no credentials"). The store-level transaction commits both or
     // neither.
     let cred = passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
+    let identities = crate::routes::identities::starter_identities(&state, user_id)?;
     state
         .store
-        .register_user_with_credential(&user, &cred)
+        .register_user_with_credential(&user, &cred, &identities)
         .await
         .map_err(|e| match e {
             brigid_store::Error::Duplicate => {
@@ -412,6 +413,23 @@ pub async fn login_finish(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
+
+    // Accounts created before identities existed get the starter set on
+    // their first sign-in (ADR-002).
+    let existing = state
+        .store
+        .fetch_identities(user.id)
+        .await
+        .map_err(|e| internal!(e))?;
+    if existing.is_empty() {
+        for identity in crate::routes::identities::starter_identities(&state, user.id)? {
+            state
+                .store
+                .store_identity(&identity)
+                .await
+                .map_err(|e| internal!(e))?;
+        }
+    }
 
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/').to_string();
