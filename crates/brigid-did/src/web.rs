@@ -152,13 +152,11 @@ async fn fetch_document_inner(url: &str, allow_private: bool) -> Result<DIDDocum
             "DNS lookup for {host} returned no addresses"
         )));
     }
-    if !allow_private {
-        if let Some(bad) = addrs.iter().find(|a| is_disallowed_target(a.ip())) {
-            return Err(Error::Resolution(format!(
-                "refusing to resolve did:web host {host} to a private/internal address ({})",
-                bad.ip()
-            )));
-        }
+    if !allow_private && let Some(bad) = addrs.iter().find(|a| is_disallowed_target(a.ip())) {
+        return Err(Error::Resolution(format!(
+            "refusing to resolve did:web host {host} to a private/internal address ({})",
+            bad.ip()
+        )));
     }
 
     // Bound the whole operation so a slow or stalled remote DID host cannot

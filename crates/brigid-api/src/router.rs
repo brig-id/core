@@ -45,17 +45,16 @@ impl KeyExtractor for ForwardedForExtractor {
         // Only consult x-forwarded-for when a trusted reverse proxy is known to
         // set it (see `AppState::trust_forwarded_for`). Otherwise an attacker
         // could forge the header to evade rate limits.
-        if self.trust_header {
-            if let Some(ip) = req
+        if self.trust_header
+            && let Some(ip) = req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.split(',').next())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-            {
-                return Ok(ip);
-            }
+        {
+            return Ok(ip);
         }
         // Real TCP peer address injected by
         // `into_make_service_with_connect_info::<SocketAddr>()`.
