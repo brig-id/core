@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
+    #[error("invalid identity profile: {0}")]
+    InvalidProfile(String),
     #[error("crypto error: {0}")]
     Crypto(String),
 }

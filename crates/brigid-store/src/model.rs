@@ -23,3 +23,20 @@ pub struct Credential {
     pub user_id: Uuid,
     pub data: Vec<u8>,
 }
+
+/// An identity: what a relying party sees. It belongs to one account (`users`).
+///
+/// `did` is `did:web:<host>:i:<id>`, built from the immutable `id`, so renaming
+/// never changes the VSID derived from it. `logo` is an `icon:<style>:<name>`
+/// reference.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub did: String,
+    pub name: String,
+    pub logo: String,
+    pub description: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}

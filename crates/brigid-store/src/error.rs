@@ -20,6 +20,10 @@ pub enum Error {
     #[error("UUID parse error: {0}")]
     Uuid(#[from] uuid::Error),
 
+    /// An identity's name, logo or description failed validation.
+    #[error("invalid identity: {0}")]
+    InvalidIdentity(#[from] brigid_identity::Error),
+
     #[error("timestamp error: {0}")]
     Time(String),
 

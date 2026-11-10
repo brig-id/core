@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 brigid-crypto.workspace = true
+brigid-identity.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
