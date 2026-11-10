@@ -312,6 +312,63 @@ pub async fn fetch_credentials(
     Ok(creds)
 }
 
+/// Longest passkey label, in characters.
+pub const CREDENTIAL_LABEL_MAX_CHARS: usize = 64;
+
+/// Name a passkey of `user_id` (trimmed; empty clears the label).
+/// [`Error::NotFound`] when the passkey is not the user's.
+pub async fn set_credential_label(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    user_id: Uuid,
+    cred_id: Uuid,
+    label: &str,
+) -> Result<()> {
+    let label = label.trim();
+    if label.chars().count() > CREDENTIAL_LABEL_MAX_CHARS || label.chars().any(char::is_control) {
+        return Err(Error::InvalidLabel);
+    }
+    let key = user_key(master, &user_id)?;
+    let label_enc = if label.is_empty() {
+        None
+    } else {
+        Some(enc(&key, label.as_bytes())?)
+    };
+    let result =
+        sqlx::query("UPDATE webauthn_credentials SET label = ? WHERE id = ? AND user_id = ?")
+            .bind(label_enc)
+            .bind(cred_id.to_string())
+            .bind(user_id.to_string())
+            .execute(pool)
+            .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
+/// The labels of `user_id`'s named passkeys, by credential id.
+pub async fn fetch_credential_labels(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    user_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, String>> {
+    let rows = sqlx::query(
+        "SELECT id, label FROM webauthn_credentials WHERE user_id = ? AND label IS NOT NULL",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let key = user_key(master, &user_id)?;
+    rows.iter()
+        .map(|row| {
+            let id: Uuid = row.try_get::<String, _>("id")?.parse()?;
+            let label = String::from_utf8(dec(&key, &row.try_get::<Vec<u8>, _>("label")?)?)?;
+            Ok((id, label))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Identities
 // ---------------------------------------------------------------------------
@@ -532,6 +589,22 @@ impl EncryptedStore {
         delete_credential(&self.pool, user_id, cred_id).await
     }
 
+    pub async fn set_credential_label(
+        &self,
+        user_id: Uuid,
+        cred_id: Uuid,
+        label: &str,
+    ) -> Result<()> {
+        set_credential_label(&self.pool, &self.master, user_id, cred_id, label).await
+    }
+
+    pub async fn fetch_credential_labels(
+        &self,
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        fetch_credential_labels(&self.pool, &self.master, user_id).await
+    }
+
     pub async fn store_identity(&self, identity: &Identity) -> Result<()> {
         store_identity(&self.pool, &self.master, identity).await
     }
@@ -721,7 +794,7 @@ impl EncryptedStore {
             .await?;
         }
 
-        let cred_rows = sqlx::query("SELECT id, user_id, data FROM webauthn_credentials")
+        let cred_rows = sqlx::query("SELECT id, user_id, data, label FROM webauthn_credentials")
             .fetch_all(&mut *tx)
             .await?;
         for row in cred_rows {
@@ -735,9 +808,14 @@ impl EncryptedStore {
 
             let new_key = user_key(&new_master, &user_id)?;
             let data_enc = enc(&new_key, &data)?;
+            let label_enc = row
+                .try_get::<Option<Vec<u8>>, _>("label")?
+                .map(|raw| dec(&old_key, &raw).and_then(|plain| enc(&new_key, &plain)))
+                .transpose()?;
 
-            sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ?")
+            sqlx::query("UPDATE webauthn_credentials SET data = ?, label = ? WHERE id = ?")
                 .bind(data_enc)
+                .bind(label_enc)
                 .bind(cred_id)
                 .execute(&mut *tx)
                 .await?;
@@ -1107,6 +1185,57 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn credential_labels_are_encrypted_and_scoped(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+        let cred = Credential {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            data: b"x".to_vec(),
+        };
+        store_credential(&pool, &master, &cred).await.unwrap();
+
+        assert!(
+            fetch_credential_labels(&pool, &master, user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        set_credential_label(&pool, &master, user.id, cred.id, "  Pixel 9 ")
+            .await
+            .unwrap();
+        let labels = fetch_credential_labels(&pool, &master, user.id)
+            .await
+            .unwrap();
+        assert_eq!(labels.get(&cred.id).map(String::as_str), Some("Pixel 9"));
+
+        let raw: Vec<u8> = sqlx::query_scalar("SELECT label FROM webauthn_credentials")
+            .fetch_one(&pool)
+            .await?;
+        assert!(!String::from_utf8_lossy(&raw).contains("Pixel"));
+
+        assert!(matches!(
+            set_credential_label(&pool, &master, Uuid::new_v4(), cred.id, "x").await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            set_credential_label(&pool, &master, user.id, cred.id, &"x".repeat(65)).await,
+            Err(Error::InvalidLabel)
+        ));
+        set_credential_label(&pool, &master, user.id, cred.id, "  ")
+            .await
+            .unwrap();
+        assert!(
+            fetch_credential_labels(&pool, &master, user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn wrong_master_key_fails_decryption(pool: SqlitePool) -> sqlx::Result<()> {
         let master = master();
         let user = sample_user();
@@ -1383,6 +1512,10 @@ mod tests {
             data: b"webauthn-credential-bytes".to_vec(),
         };
         store.store_credential(&cred).await.unwrap();
+        store
+            .set_credential_label(user_id, cred.id, "YubiKey")
+            .await
+            .unwrap();
         let ident = sample_identity(user_id);
         let ident_id = ident.id;
         store.store_identity(&ident).await.unwrap();
@@ -1401,6 +1534,10 @@ mod tests {
         assert_eq!(got.name, "Secret Persona");
         assert_eq!(got.description.as_deref(), Some("only my friends know"));
         assert_eq!(store.fetch_identities(user_id).await.unwrap().len(), 2);
+        assert_eq!(
+            store.fetch_credential_labels(user_id).await.unwrap()[&cred.id],
+            "YubiKey"
+        );
 
         // The store's own key was updated — every existing accessor keeps
         // working transparently against what rotation just wrote.

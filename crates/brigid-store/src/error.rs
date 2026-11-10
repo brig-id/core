@@ -24,6 +24,10 @@ pub enum Error {
     #[error("invalid identity: {0}")]
     InvalidIdentity(#[from] brigid_identity::Error),
 
+    /// A passkey label is too long or contains control characters.
+    #[error("invalid passkey label")]
+    InvalidLabel,
+
     #[error("timestamp error: {0}")]
     Time(String),
 

@@ -38,6 +38,17 @@ pub struct BeginRegisterResponse {
 pub struct FinishRegisterRequest {
     pub session_id: Uuid,
     pub credential: webauthn_rs::prelude::RegisterPublicKeyCredential,
+    /// Optional human-readable name for the new passkey ("Pixel 9").
+    /// WebAuthn does not carry the authenticator's name, so the user gives it.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RenamePasskeyRequest {
+    pub user_id: Uuid,
+    /// The new label; empty removes it.
+    pub label: String,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +97,7 @@ pub struct BeginAddCredentialRequest {
 #[derive(Serialize)]
 pub struct PasskeySummary {
     pub id: Uuid,
+    pub label: Option<String>,
 }
 
 /// `POST /auth/register/begin`
@@ -203,6 +215,7 @@ pub async fn register_finish(
             }
             other => internal!(other),
         })?;
+    apply_label(&state, user_id, cred.id, body.label.as_deref()).await?;
 
     Ok(StatusCode::OK)
 }
@@ -307,8 +320,60 @@ pub async fn add_credential_finish(
         .store_credential(&cred)
         .await
         .map_err(|e| internal!(e))?;
+    apply_label(&state, pending.user_id, cred.id, body.label.as_deref()).await?;
 
     Ok(StatusCode::OK)
+}
+
+async fn apply_label(
+    state: &AppState,
+    user_id: Uuid,
+    cred_id: Uuid,
+    label: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(label) = label else { return Ok(()) };
+    state
+        .store
+        .set_credential_label(user_id, cred_id, label)
+        .await
+        .map_err(|e| match e {
+            brigid_store::Error::InvalidLabel => {
+                ApiError::BadRequest("label: at most 64 characters, no control characters".into())
+            }
+            other => internal!(other),
+        })
+}
+
+/// `PATCH /auth/passkeys/{id}`: rename a passkey of the authenticated user.
+pub async fn rename_passkey(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Path(passkey_id): Path<Uuid>,
+    Json(body): Json<RenamePasskeyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = state
+        .store
+        .fetch_user(body.user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+    let expected_vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected_vsid.as_str() != claims.sub {
+        return Err(ApiError::Forbidden);
+    }
+    state
+        .store
+        .set_credential_label(user.id, passkey_id, &body.label)
+        .await
+        .map_err(|e| match e {
+            brigid_store::Error::NotFound => ApiError::NotFound,
+            brigid_store::Error::InvalidLabel => {
+                ApiError::BadRequest("label: at most 64 characters, no control characters".into())
+            }
+            other => internal!(other),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /auth/login/begin`
@@ -553,8 +618,18 @@ pub async fn list_passkeys(
         .await
         .map_err(|e| internal!(e))?;
 
-    let summaries: Vec<PasskeySummary> =
-        creds.iter().map(|c| PasskeySummary { id: c.id }).collect();
+    let mut labels = state
+        .store
+        .fetch_credential_labels(user_id)
+        .await
+        .map_err(|e| internal!(e))?;
+    let summaries: Vec<PasskeySummary> = creds
+        .iter()
+        .map(|c| PasskeySummary {
+            id: c.id,
+            label: labels.remove(&c.id),
+        })
+        .collect();
 
     Ok((StatusCode::OK, Json(summaries)))
 }
