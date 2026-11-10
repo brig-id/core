@@ -25,6 +25,12 @@ ignore = [
   # checking imports all DB backends). We do not use RSA or MySQL.
   # No fix available upstream.
   { id = "RUSTSEC-2023-0071", reason = "transitive via sqlx-macros-core; project uses SQLite only; no fix available" },
+  # Timing variability in crypto-bigint 0.5.x, pulled in by p256 via jsonwebtoken's `rust_crypto`
+  # feature; brigid-oidc only uses Algorithm::EdDSA, so the P-256 / ECDSA path is never executed.
+  { id = "RUSTSEC-2026-0387", reason = "p256/ECDSA code path unreachable: tokens use EdDSA only" },
+  # SQLite < 3.54 stale page-cache read with a crafted `-wal` file (libsqlite3-sys 0.30 via sqlx,
+  # no sqlx release bundles >= 0.39). leaf opens only its own database in its own volume.
+  { id = "RUSTSEC-2026-0459", reason = "needs a crafted -wal next to the database; only leaf writes its volume" },
 ]
 
 [bans]
