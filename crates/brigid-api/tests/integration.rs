@@ -1735,3 +1735,54 @@ async fn identity_templates_are_listed() {
         .collect();
     assert!(keys.contains(&"work") && keys.contains(&"isolated"));
 }
+
+#[tokio::test]
+async fn passkey_can_be_renamed() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (token, user_id, passkey_id) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "pk_label@localhost",
+        &rp_origin,
+        &mut dev,
+        "10.43.1",
+    )
+    .await;
+
+    let (status, _) = identity_request(
+        &app,
+        "PATCH",
+        &format!("/auth/passkeys/{passkey_id}"),
+        Some(&token),
+        "10.43.2.1",
+        Some(serde_json::json!({"user_id": user_id, "label": "Pixel 9"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, list) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/passkeys?user_id={user_id}"),
+        Some(&token),
+        "10.43.2.2",
+        None,
+    )
+    .await;
+    assert_eq!(list[0]["label"], "Pixel 9");
+
+    let (status, _) = identity_request(
+        &app,
+        "PATCH",
+        &format!("/auth/passkeys/{}", Uuid::new_v4()),
+        Some(&token),
+        "10.43.2.3",
+        Some(serde_json::json!({"user_id": user_id, "label": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
