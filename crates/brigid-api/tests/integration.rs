@@ -1491,3 +1491,189 @@ async fn add_credential_begin_requires_bearer_token() {
         "missing token must return 401"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identities: /account/identities
+// ---------------------------------------------------------------------------
+
+async fn identity_request(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    xff: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("x-forwarded-for", xff);
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    let body = match body {
+        Some(b) => {
+            req = req.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(&b).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn identities_require_a_bearer_token() {
+    let app = build_router(make_state().await, &[]);
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={}", Uuid::new_v4()),
+        None,
+        "10.40.0.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn identity_crud_roundtrip_and_isolation() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+
+    let mut alice_dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (alice_token, alice_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "id_alice@localhost",
+        &rp_origin,
+        &mut alice_dev,
+        "10.41.1",
+    )
+    .await;
+    let mut bob_dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (bob_token, bob_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "id_bob@localhost",
+        &rp_origin,
+        &mut bob_dev,
+        "10.41.2",
+    )
+    .await;
+
+    // Create
+    let (status, created) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&alice_token),
+        "10.41.3.1",
+        Some(serde_json::json!({
+            "user_id": alice_id,
+            "name": "  Pro  ",
+            "logo": "icon:solid:briefcase",
+            "description": "work"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["name"], "Pro");
+    assert!(created.get("did").is_none(), "the DID must not be exposed");
+    let ident_id = created["id"].as_str().unwrap().to_string();
+
+    // Validation: no name, bad logo
+    for bad in [
+        serde_json::json!({"user_id": alice_id, "name": " ", "logo": "icon:solid:x"}),
+        serde_json::json!({"user_id": alice_id, "name": "N", "logo": "https://x/y.png"}),
+    ] {
+        let (status, _) = identity_request(
+            &app,
+            "POST",
+            "/account/identities",
+            Some(&alice_token),
+            "10.41.3.2",
+            Some(bad),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // List
+    let (status, list) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={alice_id}"),
+        Some(&alice_token),
+        "10.41.3.3",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // Update: rename, clear the description
+    let (status, updated) = identity_request(
+        &app,
+        "PATCH",
+        &format!("/account/identities/{ident_id}"),
+        Some(&alice_token),
+        "10.41.3.4",
+        Some(serde_json::json!({"user_id": alice_id, "name": "Boulot", "description": ""})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["name"], "Boulot");
+    assert_eq!(updated["logo"], "icon:solid:briefcase");
+    assert!(updated["description"].is_null());
+
+    // Bob cannot act on Alice's account...
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={alice_id}"),
+        Some(&bob_token),
+        "10.41.4.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // ...nor reach her identity through his own account.
+    let (status, _) = identity_request(
+        &app,
+        "DELETE",
+        &format!("/account/identities/{ident_id}?user_id={bob_id}"),
+        Some(&bob_token),
+        "10.41.4.2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Delete
+    let (status, _) = identity_request(
+        &app,
+        "DELETE",
+        &format!("/account/identities/{ident_id}?user_id={alice_id}"),
+        Some(&alice_token),
+        "10.41.5.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, list) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={alice_id}"),
+        Some(&alice_token),
+        "10.41.5.2",
+        None,
+    )
+    .await;
+    assert!(list.as_array().unwrap().is_empty());
+}

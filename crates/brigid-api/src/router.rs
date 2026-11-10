@@ -12,7 +12,7 @@ use axum::{
         HeaderName, HeaderValue, Request,
         header::{AUTHORIZATION, CONTENT_TYPE},
     },
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
@@ -21,7 +21,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 use url::Url;
 
 use crate::{
-    routes::{auth, discovery, health},
+    routes::{auth, discovery, health, identities},
     state::AppState,
 };
 
@@ -179,6 +179,14 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route(
             "/auth/passkeys/add/finish",
             post(auth::add_credential_finish),
+        )
+        .route(
+            "/account/identities",
+            get(identities::list_identities).post(identities::create_identity),
+        )
+        .route(
+            "/account/identities/{id}",
+            patch(identities::update_identity).delete(identities::delete_identity),
         )
         .layer(GovernorLayer::new(governor_conf));
 

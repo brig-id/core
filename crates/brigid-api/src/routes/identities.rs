@@ -1,0 +1,216 @@
+//! Identity management for an account: `/account/identities`.
+//!
+//! An identity is what a relying party sees; it belongs to a private account
+//! (ADR-002). These endpoints are authorised the same way as the passkey
+//! endpoints: the caller names its `user_id` and the handler checks it against
+//! the bearer token's VSID. Splitting account sessions from RP tokens is a
+//! separate step.
+
+use std::sync::Arc;
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use brigid_identity::{compute_vsid, identity_did};
+use brigid_store::{Error as StoreError, Identity};
+use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
+
+use crate::{
+    error::{ApiError, internal},
+    middleware::AuthenticatedClaims,
+    state::AppState,
+};
+
+/// Public shape of an identity. The DID is deliberately not exposed: it is the
+/// VSID input and must not travel with display data.
+#[derive(Debug, Serialize)]
+pub struct IdentityView {
+    pub id: Uuid,
+    pub name: String,
+    pub logo: String,
+    pub description: Option<String>,
+    /// RFC 3339.
+    pub created_at: String,
+    /// RFC 3339.
+    pub updated_at: String,
+}
+
+impl From<Identity> for IdentityView {
+    fn from(i: Identity) -> Self {
+        Self {
+            id: i.id,
+            name: i.name,
+            logo: i.logo,
+            description: i.description,
+            created_at: i.created_at.format(&Rfc3339).unwrap_or_default(),
+            updated_at: i.updated_at.format(&Rfc3339).unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AccountQuery {
+    pub user_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateIdentityRequest {
+    pub user_id: Uuid,
+    pub name: String,
+    pub logo: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Every field but `user_id` is optional; an empty `description` clears it.
+#[derive(Debug, Deserialize)]
+pub struct UpdateIdentityRequest {
+    pub user_id: Uuid,
+    pub name: Option<String>,
+    pub logo: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Checks that the bearer token belongs to account `user_id`.
+async fn authorize(
+    state: &AppState,
+    claims: &brigid_oidc::Claims,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let user = state
+        .store
+        .fetch_user(user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+    let expected =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected.as_str() != claims.sub {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn map_store(e: StoreError) -> ApiError {
+    match e {
+        StoreError::InvalidIdentity(err) => ApiError::BadRequest(err.to_string()),
+        StoreError::NotFound => ApiError::NotFound,
+        other => internal!(other),
+    }
+}
+
+/// `GET /account/identities?user_id=`
+pub async fn list_identities(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Query(q): Query<AccountQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &claims, q.user_id).await?;
+    let identities = state
+        .store
+        .fetch_identities(q.user_id)
+        .await
+        .map_err(map_store)?;
+    let views: Vec<IdentityView> = identities.into_iter().map(Into::into).collect();
+    Ok((StatusCode::OK, Json(views)))
+}
+
+/// `POST /account/identities`
+pub async fn create_identity(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Json(body): Json<CreateIdentityRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &claims, body.user_id).await?;
+
+    let id = Uuid::new_v4();
+    let host = state
+        .base_url
+        .host_str()
+        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?;
+    let did = identity_did(host, id).map_err(|e| internal!(e))?;
+    let now = OffsetDateTime::now_utc();
+    let identity = Identity {
+        id,
+        account_id: body.user_id,
+        did,
+        name: body.name,
+        logo: body.logo,
+        description: body.description,
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .store
+        .store_identity(&identity)
+        .await
+        .map_err(map_store)?;
+
+    let stored = state
+        .store
+        .fetch_identity(body.user_id, id)
+        .await
+        .map_err(map_store)?
+        .ok_or(ApiError::NotFound)?;
+    Ok((StatusCode::CREATED, Json(IdentityView::from(stored))))
+}
+
+/// `PATCH /account/identities/{id}`
+pub async fn update_identity(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateIdentityRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &claims, body.user_id).await?;
+
+    let mut identity = state
+        .store
+        .fetch_identity(body.user_id, id)
+        .await
+        .map_err(map_store)?
+        .ok_or(ApiError::NotFound)?;
+    if let Some(name) = body.name {
+        identity.name = name;
+    }
+    if let Some(logo) = body.logo {
+        identity.logo = logo;
+    }
+    if let Some(description) = body.description {
+        identity.description = Some(description);
+    }
+    state
+        .store
+        .update_identity(&identity)
+        .await
+        .map_err(map_store)?;
+
+    let stored = state
+        .store
+        .fetch_identity(body.user_id, id)
+        .await
+        .map_err(map_store)?
+        .ok_or(ApiError::NotFound)?;
+    Ok((StatusCode::OK, Json(IdentityView::from(stored))))
+}
+
+/// `DELETE /account/identities/{id}?user_id=`
+pub async fn delete_identity(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Path(id): Path<Uuid>,
+    Query(q): Query<AccountQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &claims, q.user_id).await?;
+    state
+        .store
+        .delete_identity(q.user_id, id)
+        .await
+        .map_err(map_store)?;
+    Ok(StatusCode::NO_CONTENT)
+}
