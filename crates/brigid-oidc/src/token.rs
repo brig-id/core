@@ -305,4 +305,92 @@ mod tests {
         let token = issue_token(&test_params(&vsid, "client"), &key2, now()).unwrap();
         validate_token(&token, "https://example.com", "client", &key2, &mut store).unwrap();
     }
+
+    // ── Algorithm confusion (core#21) ───────────────────────────────────────
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64ct::Encoding;
+        base64ct::Base64UrlUnpadded::encode_string(bytes)
+    }
+
+    /// Claims that would pass every other check, so only the algorithm or the
+    /// signature can cause the rejection.
+    fn valid_claims_json() -> String {
+        serde_json::json!({
+            "sub": test_vsid().to_string(),
+            "iss": "https://example.com",
+            "aud": "my-client",
+            "exp": now() + 3600,
+            "iat": now(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "server": "example.com",
+            "alias_type": "public",
+        })
+        .to_string()
+    }
+
+    fn assert_rejected_everywhere(token: &str, key: &OidcSigningKey) {
+        let mut store = JtiStore::new();
+        assert!(
+            validate_token(token, "https://example.com", "my-client", key, &mut store).is_err(),
+            "validate_token accepted a forged token"
+        );
+        assert!(
+            decode_token(token, "https://example.com", None, key, &store).is_err(),
+            "decode_token accepted a forged token"
+        );
+    }
+
+    #[test]
+    fn alg_none_is_rejected() {
+        let key = test_key();
+        let header = format!(r#"{{"alg":"none","typ":"JWT","kid":"{}"}}"#, key.kid());
+        let unsigned = format!(
+            "{}.{}",
+            b64(header.as_bytes()),
+            b64(valid_claims_json().as_bytes())
+        );
+        // Both shapes seen in the wild: trailing dot with empty signature, and none.
+        assert_rejected_everywhere(&format!("{unsigned}."), &key);
+        assert_rejected_everywhere(&unsigned, &key);
+    }
+
+    /// The classic confusion: HMAC-sign with the server's *public* key as the
+    /// secret and hope the verifier picks the algorithm from the header.
+    #[test]
+    fn hs256_signed_with_the_public_key_is_rejected() {
+        let key = test_key();
+        let public = key.verifying_key().to_bytes();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some(key.kid().to_string());
+        let claims: serde_json::Value = serde_json::from_str(&valid_claims_json()).unwrap();
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&public),
+        )
+        .unwrap();
+        assert_rejected_everywhere(&token, &key);
+    }
+
+    /// A well-formed EdDSA token from another key, even claiming our `kid`.
+    #[test]
+    fn token_from_another_ed25519_key_is_rejected() {
+        let real = test_key();
+        let attacker = OidcSigningKey::from_raw_bytes(real.kid().to_string(), &[7u8; 32]);
+        let token = issue_token(&test_params(&test_vsid(), "my-client"), &attacker, now()).unwrap();
+        assert_rejected_everywhere(&token, &real);
+        // Sanity: the same token is accepted by the key that signed it.
+        let mut store = JtiStore::new();
+        assert!(
+            validate_token(
+                &token,
+                "https://example.com",
+                "my-client",
+                &attacker,
+                &mut store
+            )
+            .is_ok()
+        );
+    }
 }
