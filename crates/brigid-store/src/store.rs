@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Credential, User},
+    model::{Credential, Identity, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -313,6 +313,162 @@ pub async fn fetch_credentials(
 }
 
 // ---------------------------------------------------------------------------
+// Identities
+// ---------------------------------------------------------------------------
+
+fn fmt_time(t: OffsetDateTime) -> Result<String> {
+    t.format(&Rfc3339).map_err(|e| Error::Time(e.to_string()))
+}
+
+/// Validate and INSERT an [`Identity`]; `did`, `name` and `description` are
+/// encrypted with the owning account's key. The account must exist.
+///
+/// The name is trimmed and the fields validated (`brigid_identity::profile`);
+/// the stored values are the validated ones.
+pub async fn store_identity(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    identity: &Identity,
+) -> Result<()> {
+    let name = brigid_identity::validate_name(&identity.name)?;
+    brigid_identity::validate_logo(&identity.logo)?;
+    let description = match &identity.description {
+        Some(d) => brigid_identity::validate_description(d)?,
+        None => None,
+    };
+
+    let key = user_key(master, &identity.account_id)?;
+    sqlx::query(
+        "INSERT INTO identities \
+         (id, account_id, did, name, logo, description, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(identity.id.to_string())
+    .bind(identity.account_id.to_string())
+    .bind(enc(&key, identity.did.as_bytes())?)
+    .bind(enc(&key, name.as_bytes())?)
+    .bind(&identity.logo)
+    .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
+    .bind(fmt_time(identity.created_at)?)
+    .bind(fmt_time(identity.updated_at)?)
+    .execute(pool)
+    .await
+    .map_err(map_sqlx_unique)?;
+    Ok(())
+}
+
+fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Result<Identity> {
+    let id: Uuid = row.try_get::<String, _>("id")?.parse()?;
+    let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
+    let key = user_key(master, &account_id)?;
+
+    let did = String::from_utf8(dec(&key, &row.try_get::<Vec<u8>, _>("did")?)?)?;
+    let name = String::from_utf8(dec(&key, &row.try_get::<Vec<u8>, _>("name")?)?)?;
+    let description = row
+        .try_get::<Option<Vec<u8>>, _>("description")?
+        .map(|raw| dec(&key, &raw).and_then(|b| Ok(String::from_utf8(b)?)))
+        .transpose()?;
+    let parse = |col: &str| -> Result<OffsetDateTime> {
+        OffsetDateTime::parse(&row.try_get::<String, _>(col)?, &Rfc3339)
+            .map_err(|e| Error::Time(e.to_string()))
+    };
+
+    Ok(Identity {
+        id,
+        account_id,
+        did,
+        name,
+        logo: row.try_get("logo")?,
+        description,
+        created_at: parse("created_at")?,
+        updated_at: parse("updated_at")?,
+    })
+}
+
+const IDENTITY_COLUMNS: &str =
+    "id, account_id, did, name, logo, description, created_at, updated_at";
+
+/// Fetch one identity, only if it belongs to `account_id`.
+pub async fn fetch_identity(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    account_id: Uuid,
+    identity_id: Uuid,
+) -> Result<Option<Identity>> {
+    let row = sqlx::query(&format!(
+        "SELECT {IDENTITY_COLUMNS} FROM identities WHERE id = ? AND account_id = ?"
+    ))
+    .bind(identity_id.to_string())
+    .bind(account_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| identity_from_row(master, &r)).transpose()
+}
+
+/// All identities of an account, oldest first.
+pub async fn fetch_identities(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    account_id: Uuid,
+) -> Result<Vec<Identity>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {IDENTITY_COLUMNS} FROM identities WHERE account_id = ? \
+         ORDER BY created_at, id"
+    ))
+    .bind(account_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(|r| identity_from_row(master, r)).collect()
+}
+
+/// Change an identity's display fields (name, logo, description) and bump
+/// `updated_at`. The `did` never changes. [`Error::NotFound`] when the identity
+/// does not exist or belongs to another account.
+pub async fn update_identity(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    identity: &Identity,
+) -> Result<()> {
+    let name = brigid_identity::validate_name(&identity.name)?;
+    brigid_identity::validate_logo(&identity.logo)?;
+    let description = match &identity.description {
+        Some(d) => brigid_identity::validate_description(d)?,
+        None => None,
+    };
+
+    let key = user_key(master, &identity.account_id)?;
+    let result = sqlx::query(
+        "UPDATE identities SET name = ?, logo = ?, description = ?, updated_at = ? \
+         WHERE id = ? AND account_id = ?",
+    )
+    .bind(enc(&key, name.as_bytes())?)
+    .bind(&identity.logo)
+    .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
+    .bind(fmt_time(OffsetDateTime::now_utc())?)
+    .bind(identity.id.to_string())
+    .bind(identity.account_id.to_string())
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
+/// Delete an identity of `account_id`. [`Error::NotFound`] when absent.
+pub async fn delete_identity(pool: &SqlitePool, account_id: Uuid, identity_id: Uuid) -> Result<()> {
+    let result = sqlx::query("DELETE FROM identities WHERE id = ? AND account_id = ?")
+        .bind(identity_id.to_string())
+        .bind(account_id.to_string())
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // EncryptedStore wrapper
 // ---------------------------------------------------------------------------
 
@@ -367,6 +523,30 @@ impl EncryptedStore {
 
     pub async fn delete_credential(&self, user_id: Uuid, cred_id: Uuid) -> Result<()> {
         delete_credential(&self.pool, user_id, cred_id).await
+    }
+
+    pub async fn store_identity(&self, identity: &Identity) -> Result<()> {
+        store_identity(&self.pool, &self.master, identity).await
+    }
+
+    pub async fn fetch_identity(
+        &self,
+        account_id: Uuid,
+        identity_id: Uuid,
+    ) -> Result<Option<Identity>> {
+        fetch_identity(&self.pool, &self.master, account_id, identity_id).await
+    }
+
+    pub async fn fetch_identities(&self, account_id: Uuid) -> Result<Vec<Identity>> {
+        fetch_identities(&self.pool, &self.master, account_id).await
+    }
+
+    pub async fn update_identity(&self, identity: &Identity) -> Result<()> {
+        update_identity(&self.pool, &self.master, identity).await
+    }
+
+    pub async fn delete_identity(&self, account_id: Uuid, identity_id: Uuid) -> Result<()> {
+        delete_identity(&self.pool, account_id, identity_id).await
     }
 
     pub async fn fetch_user_by_username(
@@ -545,6 +725,38 @@ impl EncryptedStore {
                 .await?;
         }
 
+        let identity_rows =
+            sqlx::query("SELECT id, account_id, did, name, description FROM identities")
+                .fetch_all(&mut *tx)
+                .await?;
+        for row in identity_rows {
+            let id: String = row.try_get("id")?;
+            let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
+            let old_key = user_key(&self.master, &account_id)?;
+            let new_key = user_key(&new_master, &account_id)?;
+
+            let did = enc(
+                &new_key,
+                &dec(&old_key, &row.try_get::<Vec<u8>, _>("did")?)?,
+            )?;
+            let name = enc(
+                &new_key,
+                &dec(&old_key, &row.try_get::<Vec<u8>, _>("name")?)?,
+            )?;
+            let description = row
+                .try_get::<Option<Vec<u8>>, _>("description")?
+                .map(|raw| dec(&old_key, &raw).and_then(|plain| enc(&new_key, &plain)))
+                .transpose()?;
+
+            sqlx::query("UPDATE identities SET did = ?, name = ?, description = ? WHERE id = ?")
+                .bind(did)
+                .bind(name)
+                .bind(description)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         tx.commit().await?;
         self.master = new_master;
         Ok(())
@@ -687,6 +899,192 @@ mod tests {
             !String::from_utf8_lossy(&did_web_raw).contains("alice"),
             "DID readable in dump"
         );
+        Ok(())
+    }
+
+    fn sample_identity(account_id: Uuid) -> Identity {
+        let id = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        Identity {
+            id,
+            account_id,
+            did: format!("did:web:example.com:i:{id}"),
+            name: "Secret Persona".to_string(),
+            logo: "icon:solid:user-astronaut".to_string(),
+            description: Some("only my friends know".to_string()),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn identity_roundtrip_and_listing(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let a = sample_identity(user.id);
+        let mut b = sample_identity(user.id);
+        b.description = None;
+        store_identity(&pool, &master, &a).await.unwrap();
+        store_identity(&pool, &master, &b).await.unwrap();
+
+        let got = fetch_identity(&pool, &master, user.id, a.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.name, "Secret Persona");
+        assert_eq!(got.did, a.did);
+        assert_eq!(got.logo, "icon:solid:user-astronaut");
+        assert_eq!(got.description.as_deref(), Some("only my friends know"));
+        assert!(
+            fetch_identity(&pool, &master, user.id, b.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .is_none()
+        );
+        assert_eq!(
+            fetch_identities(&pool, &master, user.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    /// An identity is only reachable through its own account.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn identity_is_scoped_to_its_account(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let owner = sample_user();
+        let mut other = sample_user();
+        other.username = "bob".to_string();
+        other.did_web = "did:web:example.com:u:bob".to_string();
+        store_user(&pool, &master, &owner).await.unwrap();
+        store_user(&pool, &master, &other).await.unwrap();
+
+        let ident = sample_identity(owner.id);
+        store_identity(&pool, &master, &ident).await.unwrap();
+
+        assert!(
+            fetch_identity(&pool, &master, other.id, ident.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fetch_identities(&pool, &master, other.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            delete_identity(&pool, other.id, ident.id).await,
+            Err(Error::NotFound)
+        ));
+        let mut hijack = ident.clone();
+        hijack.account_id = other.id;
+        assert!(matches!(
+            update_identity(&pool, &master, &hijack).await,
+            Err(Error::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_changes_display_fields_but_not_the_did(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+        let mut ident = sample_identity(user.id);
+        store_identity(&pool, &master, &ident).await.unwrap();
+
+        ident.name = "  Renamed ".to_string();
+        ident.logo = "icon:brands:github".to_string();
+        ident.description = None;
+        ident.did = "did:web:evil.example:i:x".to_string(); // must be ignored
+        update_identity(&pool, &master, &ident).await.unwrap();
+
+        let got = fetch_identity(&pool, &master, user.id, ident.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.name, "Renamed");
+        assert_eq!(got.logo, "icon:brands:github");
+        assert!(got.description.is_none());
+        assert_eq!(got.did, format!("did:web:example.com:i:{}", ident.id));
+        assert!(got.updated_at >= got.created_at);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn invalid_identity_is_rejected_before_any_write(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+
+        let mut no_name = sample_identity(user.id);
+        no_name.name = "  ".to_string();
+        let mut bad_logo = sample_identity(user.id);
+        bad_logo.logo = "https://example.com/x.png".to_string();
+        for bad in [no_name, bad_logo] {
+            assert!(matches!(
+                store_identity(&pool, &master, &bad).await,
+                Err(Error::InvalidIdentity(_))
+            ));
+        }
+        assert!(
+            fetch_identities(&pool, &master, user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// A raw dump must not expose the name, the DID or the description.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn identity_dump_contains_no_plaintext(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+        store_identity(&pool, &master, &sample_identity(user.id))
+            .await
+            .unwrap();
+
+        let row = sqlx::query("SELECT did, name, description FROM identities")
+            .fetch_one(&pool)
+            .await?;
+        for (col, needle) in [(0, "did:web"), (1, "Persona"), (2, "friends")] {
+            let raw: Vec<u8> = row.try_get(col)?;
+            assert!(
+                !String::from_utf8_lossy(&raw).contains(needle),
+                "column {col} readable in dump"
+            );
+        }
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn identities_follow_their_account_on_delete(pool: SqlitePool) -> sqlx::Result<()> {
+        let master = master();
+        let user = sample_user();
+        store_user(&pool, &master, &user).await.unwrap();
+        store_identity(&pool, &master, &sample_identity(user.id))
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user.id.to_string())
+            .execute(&pool)
+            .await?;
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identities")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(left, 0);
         Ok(())
     }
 
@@ -967,8 +1365,24 @@ mod tests {
             data: b"webauthn-credential-bytes".to_vec(),
         };
         store.store_credential(&cred).await.unwrap();
+        let ident = sample_identity(user_id);
+        let ident_id = ident.id;
+        store.store_identity(&ident).await.unwrap();
+        let mut bare = sample_identity(user_id);
+        bare.description = None;
+        store.store_identity(&bare).await.unwrap();
 
         store.rotate_master_key(new_master()).await.unwrap();
+
+        // Identities were re-encrypted too, with and without a description.
+        let got = store
+            .fetch_identity(user_id, ident_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.name, "Secret Persona");
+        assert_eq!(got.description.as_deref(), Some("only my friends know"));
+        assert_eq!(store.fetch_identities(user_id).await.unwrap().len(), 2);
 
         // The store's own key was updated — every existing accessor keeps
         // working transparently against what rotation just wrote.

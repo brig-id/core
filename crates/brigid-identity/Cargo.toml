@@ -14,6 +14,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 base64ct = { version = "1", features = ["alloc"] }
 bs58 = "0.5"
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
