@@ -1615,7 +1615,14 @@ async fn identity_crud_roundtrip_and_isolation() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(list.as_array().unwrap().len(), 1);
+    // The three starter identities created at sign-up, plus this one.
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Public", "Personal", "Work", "Pro"]);
 
     // Update: rename, clear the description
     let (status, updated) = identity_request(
@@ -1675,5 +1682,56 @@ async fn identity_crud_roundtrip_and_isolation() {
         None,
     )
     .await;
-    assert!(list.as_array().unwrap().is_empty());
+    assert_eq!(list.as_array().unwrap().len(), 3);
+
+    // From a template, overriding only the name.
+    let (status, from_template) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&alice_token),
+        "10.41.6.1",
+        Some(serde_json::json!({"user_id": alice_id, "template": "family", "name": "Les Dupont"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(from_template["name"], "Les Dupont");
+    assert_eq!(from_template["logo"], "icon:solid:people-roof");
+    assert_eq!(
+        from_template["description"],
+        "Shared within a restricted circle."
+    );
+
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&alice_token),
+        "10.41.6.2",
+        Some(serde_json::json!({"user_id": alice_id, "template": "nope"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn identity_templates_are_listed() {
+    let app = build_router(make_state().await, &[]);
+    let (status, list) = identity_request(
+        &app,
+        "GET",
+        "/account/identity-templates",
+        None,
+        "10.42.0.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.contains(&"work") && keys.contains(&"isolated"));
 }

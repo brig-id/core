@@ -181,6 +181,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             post(auth::add_credential_finish),
         )
         .route(
+            "/account/identity-templates",
+            get(identities::list_templates),
+        )
+        .route(
             "/account/identities",
             get(identities::list_identities).post(identities::create_identity),
         )

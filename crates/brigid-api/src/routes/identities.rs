@@ -58,13 +58,86 @@ pub struct AccountQuery {
     pub user_id: Uuid,
 }
 
+/// Create from scratch (`name` and `logo` required) or from a `template`,
+/// whose defaults fill whatever the request leaves out.
 #[derive(Debug, Deserialize)]
 pub struct CreateIdentityRequest {
     pub user_id: Uuid,
-    pub name: String,
-    pub logo: String,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub logo: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TemplateView {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub logo: &'static str,
+    pub description: &'static str,
+}
+
+/// A new identity of `account_id` with a fresh id and DID.
+pub(crate) fn new_identity(
+    state: &AppState,
+    account_id: Uuid,
+    name: String,
+    logo: String,
+    description: Option<String>,
+) -> Result<Identity, ApiError> {
+    let id = Uuid::new_v4();
+    let host = state
+        .base_url
+        .host_str()
+        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?;
+    let did = identity_did(host, id).map_err(|e| internal!(e))?;
+    let now = OffsetDateTime::now_utc();
+    Ok(Identity {
+        id,
+        account_id,
+        did,
+        name,
+        logo,
+        description,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// The starter identities of a new account (ADR-002, core#48).
+pub(crate) fn starter_identities(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<Vec<Identity>, ApiError> {
+    brigid_identity::default_templates()
+        .map(|t| {
+            new_identity(
+                state,
+                account_id,
+                t.name.to_string(),
+                t.logo.to_string(),
+                Some(t.description.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// `GET /account/identity-templates`: the templates offered at creation.
+pub async fn list_templates() -> impl IntoResponse {
+    let views: Vec<TemplateView> = brigid_identity::TEMPLATES
+        .iter()
+        .map(|t| TemplateView {
+            key: t.key,
+            name: t.name,
+            logo: t.logo,
+            description: t.description,
+        })
+        .collect();
+    Json(views)
 }
 
 /// Every field but `user_id` is optional; an empty `description` clears it.
@@ -128,23 +201,26 @@ pub async fn create_identity(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize(&state, &claims, body.user_id).await?;
 
-    let id = Uuid::new_v4();
-    let host = state
-        .base_url
-        .host_str()
-        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?;
-    let did = identity_did(host, id).map_err(|e| internal!(e))?;
-    let now = OffsetDateTime::now_utc();
-    let identity = Identity {
-        id,
-        account_id: body.user_id,
-        did,
-        name: body.name,
-        logo: body.logo,
-        description: body.description,
-        created_at: now,
-        updated_at: now,
+    let template = match body.template.as_deref() {
+        Some(key) => Some(
+            brigid_identity::template(key)
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown template: {key}")))?,
+        ),
+        None => None,
     };
+    let name = body
+        .name
+        .or_else(|| template.map(|t| t.name.to_string()))
+        .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    let logo = body
+        .logo
+        .or_else(|| template.map(|t| t.logo.to_string()))
+        .ok_or_else(|| ApiError::BadRequest("logo is required".into()))?;
+    let description = body
+        .description
+        .or_else(|| template.map(|t| t.description.to_string()));
+    let identity = new_identity(&state, body.user_id, name, logo, description)?;
+    let id = identity.id;
     state
         .store
         .store_identity(&identity)
