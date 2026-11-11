@@ -207,6 +207,29 @@ async fn register_begin_rejects_invalid_username() {
 }
 
 #[tokio::test]
+async fn register_begin_rejects_a_username_on_another_server() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+
+    let body = serde_json::json!({ "username": "alice@elsewhere.example" });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register/begin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = response_body_json(resp.into_body()).await;
+    assert_eq!(json["error"], "accounts on this server end with @localhost");
+}
+
+#[tokio::test]
 async fn register_finish_rejects_malformed_credential() {
     // Sending a malformed credential (`{}`) trips Axum's JSON extractor before
     // the handler runs, yielding 422. The unknown-session branch (400) requires

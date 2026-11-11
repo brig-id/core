@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `brigid-api` — `POST /auth/register/begin` refuses a username on another
+  server (`alice@elsewhere.example`): an account's domain is this server's.
+  The `server` claim of every token now comes from the server's own
+  configuration instead of the stored account.
+- `brigid-api` — an internal error logs its cause; the log line used to carry
+  only the fixed "internal server error" text sent to the client.
+- `brigid-api` — CORS allows `PATCH`, used by the passkey and identity routes.
+
 ## [0.1.0] - 2026-09-04
 
 First tagged release, alongside `crypto`, `server-leaf`, and `app`.

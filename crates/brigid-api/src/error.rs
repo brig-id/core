@@ -45,8 +45,9 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
-            ApiError::Internal(_) => {
-                tracing::error!(error = %self, "internal server error");
+            ApiError::Internal(cause) => {
+                // The cause goes to the log only; the client gets a fixed message.
+                tracing::error!(error = %cause, "internal server error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),

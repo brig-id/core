@@ -119,6 +119,15 @@ impl AppState {
         self
     }
 
+    /// This server's host name: the domain of its accounts and the `server`
+    /// claim of the tokens it issues. Never taken from stored or
+    /// client-supplied data.
+    pub fn host(&self) -> Result<&str, crate::error::ApiError> {
+        self.base_url
+            .host_str()
+            .ok_or_else(|| crate::error::ApiError::Internal("base_url has no host".into()))
+    }
+
     /// The current key followed by the retired ones still in grace.
     pub fn oidc_verification_keys(&self) -> Vec<&OidcSigningKey> {
         std::iter::once(self.oidc_key.as_ref())

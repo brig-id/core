@@ -90,11 +90,7 @@ pub(crate) fn new_identity(
     description: Option<String>,
 ) -> Result<Identity, ApiError> {
     let id = Uuid::new_v4();
-    let host = state
-        .base_url
-        .host_str()
-        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?;
-    let did = identity_did(host, id).map_err(|e| internal!(e))?;
+    let did = identity_did(state.host()?, id).map_err(|e| internal!(e))?;
     let now = OffsetDateTime::now_utc();
     Ok(Identity {
         id,
@@ -307,12 +303,6 @@ pub async fn identity_token(
         .await
         .map_err(map_store)?
         .ok_or(ApiError::NotFound)?;
-    let server = state
-        .base_url
-        .host_str()
-        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?
-        .to_string();
-
     let vsid =
         compute_vsid(&identity.did, &body.client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
     let issuer = state.base_url.to_string();
@@ -321,7 +311,7 @@ pub async fn identity_token(
         vsid: &vsid,
         issuer: &issuer,
         client_id: &body.client_id,
-        server: &server,
+        server: state.host()?,
         ttl_secs: 3600,
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
