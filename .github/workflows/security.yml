@@ -3,8 +3,13 @@ name: Security Audit
 on:
   push:
     branches: [main, "dev/*"]
+  pull_request:
+    branches: [main, "dev/*"]
   schedule:
     - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
 
 jobs:
   security:
