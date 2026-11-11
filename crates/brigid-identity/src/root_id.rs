@@ -69,44 +69,17 @@ fn validate_username(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// A DNS hostname (RFC 1123 syntax), without a trailing dot: the server part
+/// is compared and stored as written, so `example.com.` must not pass for a
+/// second spelling of `example.com`.
 fn validate_server(s: &str) -> Result<()> {
-    if s.is_empty() {
-        return Err(Error::InvalidIdentifier("server is empty".into()));
-    }
-    // RFC 1035 §2.3.4 / RFC 1123: the total length of a hostname (excluding a
-    // single optional trailing dot used as a fully-qualified marker) must not
-    // exceed 253 octets. A longer string cannot represent a resolvable host
-    // and could let an attacker probe length-sensitive code paths downstream.
-    let canonical = s.strip_suffix('.').unwrap_or(s);
-    if canonical.len() > 253 {
+    if s.ends_with('.') {
         return Err(Error::InvalidIdentifier(format!(
-            "server hostname exceeds 253 octets in '{s}'"
+            "server '{s}' ends with a dot"
         )));
     }
-    for label in s.split('.') {
-        if label.is_empty() {
-            return Err(Error::InvalidIdentifier(format!(
-                "empty label in server '{s}'"
-            )));
-        }
-        // RFC 1035 §2.3.4: each DNS label is limited to 63 octets.
-        if label.len() > 63 {
-            return Err(Error::InvalidIdentifier(format!(
-                "label exceeds 63 octets in server '{s}'"
-            )));
-        }
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(Error::InvalidIdentifier(format!(
-                "invalid character in server '{s}'"
-            )));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(Error::InvalidIdentifier(format!(
-                "label starts or ends with hyphen in '{s}'"
-            )));
-        }
-    }
-    Ok(())
+    helpers4::net::is_valid_hostname(s)
+        .map_err(|e| Error::InvalidIdentifier(format!("invalid server '{s}': {e}")))
 }
 
 #[cfg(test)]
@@ -176,6 +149,16 @@ mod tests {
     #[test]
     fn server_label_ends_with_hyphen() {
         assert!(RootId::parse("alice@brig-.id").is_err());
+    }
+
+    #[test]
+    fn server_with_trailing_dot_is_rejected() {
+        assert!(RootId::parse("alice@brig.id.").is_err());
+    }
+
+    #[test]
+    fn server_that_is_an_ip_address_is_rejected() {
+        assert!(RootId::parse("alice@192.168.0.1").is_err());
     }
 
     #[test]

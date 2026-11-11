@@ -66,9 +66,10 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedClaims {
     }
 }
 
+/// The token of an `Authorization: Bearer <token>` header (RFC 6750).
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     headers
-        .get("authorization")
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(helpers4::http::bearer_token)
 }

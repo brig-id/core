@@ -1,13 +1,11 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 
+/// Unix time in seconds, as `exp` claims carry it. A clock set before 1970
+/// reads as 0: every entry then looks unexpired, which fails closed.
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    helpers4::time::unix_now().map_or(0, |secs| secs as i64)
 }
 
 /// In-memory JTI store for replay protection.

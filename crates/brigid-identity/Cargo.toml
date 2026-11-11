@@ -7,6 +7,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+helpers4 = { workspace = true, features = ["net", "validate"] }
 brigid-crypto.workspace = true
 hkdf = { workspace = true }
 sha3 = { workspace = true }
