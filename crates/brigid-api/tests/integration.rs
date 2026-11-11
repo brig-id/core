@@ -2315,3 +2315,102 @@ async fn registration_sessions_finish_only_as_what_they_began() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// ADR-003: signing up without a username. The server generates the handle,
+/// and with a client_id the new account is signed in by the same ceremony.
+#[tokio::test]
+async fn signup_without_username_signs_in() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/begin",
+        None,
+        "10.54.1.1",
+        Some(serde_json::json!({ "client_id": "test-client" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let name = j["challenge"]["publicKey"]["user"]["name"]
+        .as_str()
+        .unwrap();
+    let (username, server) = name.split_once('@').unwrap();
+    assert_eq!(server, "localhost");
+    assert_eq!(username.split('-').count(), 3, "generated handle: {name}");
+
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let cred = dev.do_registration(rp_origin.clone(), ccr).unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/finish",
+        None,
+        "10.54.1.2",
+        Some(serde_json::json!({
+            "session_id": j["session_id"],
+            "credential": cred,
+            "label": "1Password",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let token = j["id_token"].as_str().expect("signed in at signup");
+    let user_id: Uuid = serde_json::from_value(j["user_id"].clone()).unwrap();
+
+    // The session works, the passkey has its name, the starter identities exist.
+    let (status, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/passkeys?user_id={user_id}"),
+        Some(token),
+        "10.54.2.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j[0]["label"], "1Password");
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={user_id}"),
+        Some(token),
+        "10.54.2.2",
+        None,
+    )
+    .await;
+    assert_eq!(j.as_array().unwrap().len(), 3);
+
+    // Without client_id, signup still only creates the account.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/begin",
+        None,
+        "10.54.3.1",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let mut dev2 = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let cred = dev2.do_registration(rp_origin, ccr).unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/finish",
+        None,
+        "10.54.3.2",
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": cred })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(j.is_null(), "no token without client_id: {j}");
+}

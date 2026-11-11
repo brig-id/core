@@ -27,7 +27,14 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct BeginRegisterRequest {
-    pub username: String,
+    /// `username@this-server`. Absent: the server generates the username
+    /// (ADR-003: it is a hidden sign-in handle).
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Present: `finish` signs the new account in, with this audience, as
+    /// `/auth/login/begin`'s `client_id`.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -110,34 +117,39 @@ pub async fn register_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let root_id = RootId::parse(&body.username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
-    // An account lives on this server. `alice@elsewhere.example` would put a
-    // domain this server does not control in the account's DID.
-    let host = state.host()?;
-    if root_id.server != host {
-        return Err(ApiError::BadRequest(format!(
-            "accounts on this server end with @{host}"
-        )));
+    if body.client_id.as_deref() == Some("") {
+        return Err(ApiError::BadRequest("client_id must not be empty".into()));
     }
-
-    let existing = state
-        .store
-        .fetch_user_by_username(&root_id.username, &root_id.server)
-        .await
-        .map_err(|e| internal!(e))?;
-
-    if existing.is_some() {
-        return Err(ApiError::Conflict(format!(
-            "user {} already exists",
-            body.username
-        )));
-    }
+    let host = state.host()?.to_string();
+    let root_id = match body.username.as_deref() {
+        Some(handle) => {
+            let root_id = RootId::parse(handle).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            // An account lives on this server. `alice@elsewhere.example` would
+            // put a domain this server does not control in the account's DID.
+            if root_id.server != host {
+                return Err(ApiError::BadRequest(format!(
+                    "accounts on this server end with @{host}"
+                )));
+            }
+            if state
+                .store
+                .fetch_user_by_username(&root_id.username, &root_id.server)
+                .await
+                .map_err(|e| internal!(e))?
+                .is_some()
+            {
+                return Err(ApiError::Conflict(format!("user {handle} already exists")));
+            }
+            root_id
+        }
+        None => generated_root_id(&state, &host).await?,
+    };
+    let handle = format!("{}@{}", root_id.username, root_id.server);
 
     let user_id = Uuid::new_v4();
     let (ccr, reg_state) = state
         .webauthn
-        .begin_registration(user_id, &body.username, None)
+        .begin_registration(user_id, &handle, None)
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
@@ -156,7 +168,9 @@ pub async fn register_begin(
         map.insert(
             session_id,
             PendingRegistration {
-                purpose: RegistrationPurpose::Signup,
+                purpose: RegistrationPurpose::Signup {
+                    client_id: body.client_id,
+                },
                 user_id,
                 username: root_id.username.clone(),
                 server: root_id.server.clone(),
@@ -181,7 +195,7 @@ pub async fn register_finish(
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pending = take_pending_registration(&state, body.session_id, |p| {
-        matches!(p, RegistrationPurpose::Signup)
+        matches!(p, RegistrationPurpose::Signup { .. })
     })?;
 
     // Authoritative TTL check at finish time. `evict_expired_pending()` only
@@ -229,7 +243,40 @@ pub async fn register_finish(
         })?;
     apply_label(&state, user_id, cred.id, body.label.as_deref()).await?;
 
-    Ok(StatusCode::OK)
+    // Begun with a client_id: the new account is signed in (ADR-003).
+    let RegistrationPurpose::Signup { client_id } = pending.purpose else {
+        unreachable!("checked by take_pending_registration");
+    };
+    match client_id {
+        Some(client_id) => {
+            let id_token = account_token(&state, &user, &client_id)?;
+            Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })).into_response())
+        }
+        None => Ok(StatusCode::OK.into_response()),
+    }
+}
+
+/// A free generated username on this server (ADR-003). A clash with an
+/// existing account is retried; a few in a row means something else is wrong.
+async fn generated_root_id(state: &AppState, host: &str) -> Result<RootId, ApiError> {
+    for _ in 0..5 {
+        let username = brigid_identity::generate_username().map_err(|e| internal!(e))?;
+        let taken = state
+            .store
+            .fetch_user_by_username(&username, host)
+            .await
+            .map_err(|e| internal!(e))?
+            .is_some();
+        if !taken {
+            return Ok(RootId {
+                username,
+                server: host.to_string(),
+            });
+        }
+    }
+    Err(internal!(std::io::Error::other(
+        "no free generated username after 5 attempts"
+    )))
 }
 
 /// `POST /auth/passkeys/add/begin`
