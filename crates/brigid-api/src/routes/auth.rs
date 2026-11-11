@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, internal},
     middleware::AuthenticatedClaims,
-    state::{AppState, PendingAuthentication, PendingRegistration},
+    state::{AppState, PendingAuthentication, PendingLogin, PendingRegistration},
 };
 
 #[derive(Deserialize)]
@@ -53,7 +53,10 @@ pub struct RenamePasskeyRequest {
 
 #[derive(Deserialize)]
 pub struct BeginLoginRequest {
-    pub username: String,
+    /// `user@server`. Absent: username-less login with a discoverable
+    /// credential (passkey autofill), the authenticator names the user.
+    #[serde(default)]
+    pub username: Option<String>,
     /// Relying-party identifier (the OIDC `client_id`) that will receive the
     /// resulting ID Token. Required: the `aud` claim and the VSID embedded
     /// in the token are derived from this value, so the same physical user
@@ -381,26 +384,43 @@ pub async fn login_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let root_id = RootId::parse(&body.username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if body.client_id.is_empty() {
         return Err(ApiError::BadRequest("client_id is required".into()));
     }
 
-    let user = state
-        .store
-        .fetch_user_by_username(&root_id.username, &root_id.server)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-
-    let passkeys = load_passkeys(&state.store, user.id)
-        .await
-        .map_err(|e| internal!(e))?;
-
-    let (rcr, auth_state) = state
-        .webauthn
-        .begin_authentication(&passkeys)
-        .map_err(|e| internal!(e))?;
+    let (rcr, login) = match body.username.as_deref() {
+        Some(username) => {
+            let root_id =
+                RootId::parse(username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let user = state
+                .store
+                .fetch_user_by_username(&root_id.username, &root_id.server)
+                .await
+                .map_err(|e| internal!(e))?
+                .ok_or(ApiError::NotFound)?;
+            let passkeys = load_passkeys(&state.store, user.id)
+                .await
+                .map_err(|e| internal!(e))?;
+            let (rcr, auth_state) = state
+                .webauthn
+                .begin_authentication(&passkeys)
+                .map_err(|e| internal!(e))?;
+            (
+                rcr,
+                PendingLogin::Named {
+                    user_id: user.id,
+                    state: auth_state,
+                },
+            )
+        }
+        None => {
+            let (rcr, auth_state) = state
+                .webauthn
+                .begin_discoverable_authentication()
+                .map_err(|e| internal!(e))?;
+            (rcr, PendingLogin::Discoverable(auth_state))
+        }
+    };
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
@@ -415,9 +435,8 @@ pub async fn login_begin(
         map.insert(
             session_id,
             PendingAuthentication {
-                user_id: user.id,
                 client_id: body.client_id,
-                state: auth_state,
+                login,
                 created_at: Instant::now(),
             },
         );
@@ -449,14 +468,37 @@ pub async fn login_finish(
         return Err(ApiError::BadRequest("session expired".into()));
     }
 
-    let mut passkeys = load_passkeys(&state.store, pending.user_id)
-        .await
-        .map_err(|e| internal!(e))?;
-
-    let auth_result = state
-        .webauthn
-        .finish_authentication(&mut passkeys, &pending.state, &body.credential)
-        .map_err(|_| ApiError::Unauthorized)?;
+    let (user_id, passkeys, auth_result) = match pending.login {
+        PendingLogin::Named {
+            user_id,
+            state: auth_state,
+        } => {
+            let mut passkeys = load_passkeys(&state.store, user_id)
+                .await
+                .map_err(|e| internal!(e))?;
+            let result = state
+                .webauthn
+                .finish_authentication(&mut passkeys, &auth_state, &body.credential)
+                .map_err(|_| ApiError::Unauthorized)?;
+            (user_id, passkeys, result)
+        }
+        PendingLogin::Discoverable(auth_state) => {
+            // The user handle is only a claim until the assertion verifies
+            // against that user's own passkeys.
+            let user_id = state
+                .webauthn
+                .identify_discoverable_user(&body.credential)
+                .map_err(|_| ApiError::Unauthorized)?;
+            let mut passkeys = load_passkeys(&state.store, user_id)
+                .await
+                .map_err(|e| internal!(e))?;
+            let result = state
+                .webauthn
+                .finish_discoverable_authentication(&mut passkeys, auth_state, &body.credential)
+                .map_err(|_| ApiError::Unauthorized)?;
+            (user_id, passkeys, result)
+        }
+    };
 
     if auth_result.credential_updated {
         for passkey in &passkeys {
@@ -464,7 +506,7 @@ pub async fn login_finish(
                 serde_json::to_string(passkey.cred_id()).expect("CredentialID always serializes");
             let cred_id = cred_id_json.trim_matches('"').to_string();
             if cred_id == auth_result.credential_id {
-                update_passkey(&state.store, pending.user_id, passkey)
+                update_passkey(&state.store, user_id, passkey)
                     .await
                     .map_err(|e| internal!(e))?;
                 break;
@@ -474,7 +516,7 @@ pub async fn login_finish(
 
     let user = state
         .store
-        .fetch_user(pending.user_id)
+        .fetch_user(user_id)
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
@@ -519,13 +561,7 @@ pub async fn login_finish(
 
     let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
 
-    Ok((
-        StatusCode::OK,
-        Json(LoginResponse {
-            id_token,
-            user_id: pending.user_id,
-        }),
-    ))
+    Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })))
 }
 
 /// `DELETE /auth/passkeys/{id}`

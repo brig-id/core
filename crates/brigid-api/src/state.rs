@@ -10,7 +10,9 @@ use brigid_oidc::{JtiStore, OidcSigningKey};
 use brigid_store::EncryptedStore;
 use url::Url;
 use uuid::Uuid;
-use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration};
+use webauthn_rs::prelude::{
+    DiscoverableAuthentication, PasskeyAuthentication, PasskeyRegistration,
+};
 
 /// In-flight registration session keyed by a temporary session UUID.
 pub struct PendingRegistration {
@@ -22,16 +24,25 @@ pub struct PendingRegistration {
     pub created_at: Instant,
 }
 
+/// The WebAuthn state of a pending login: for a named user, or username-less
+/// (discoverable credential, the user is learnt from the response).
+pub enum PendingLogin {
+    Named {
+        user_id: Uuid,
+        state: PasskeyAuthentication,
+    },
+    Discoverable(DiscoverableAuthentication),
+}
+
 /// In-flight authentication session keyed by a temporary session UUID.
 pub struct PendingAuthentication {
-    pub user_id: Uuid,
     /// Relying-party identifier sent at `/auth/login/begin`. Bound into the
     /// pending session so the `aud` claim and VSID derived at
     /// `/auth/login/finish` cannot be changed between the two halves of the
     /// flow (an attacker controlling the second request must otherwise be
     /// able to swap the audience for a token they did not initiate).
     pub client_id: String,
-    pub state: PasskeyAuthentication,
+    pub login: PendingLogin,
     /// Timestamp when this session was created; used for TTL eviction.
     pub created_at: Instant,
 }

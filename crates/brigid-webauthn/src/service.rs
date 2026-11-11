@@ -100,6 +100,53 @@ impl WebauthnService {
             credential_updated,
         })
     }
+
+    /// Start a username-less (discoverable credential) authentication: the
+    /// authenticator picks the passkey and reveals the user handle.
+    pub fn begin_discoverable_authentication(
+        &self,
+    ) -> Result<(RequestChallengeResponse, DiscoverableAuthentication)> {
+        Ok(self.webauthn.start_discoverable_authentication()?)
+    }
+
+    /// The user id carried by a discoverable authentication response (the user
+    /// handle bound at registration). Only identifies; nothing is verified yet.
+    pub fn identify_discoverable_user(&self, response: &PublicKeyCredential) -> Result<Uuid> {
+        let (user_id, _) = self
+            .webauthn
+            .identify_discoverable_authentication(response)?;
+        Ok(user_id)
+    }
+
+    /// Verify a discoverable authentication against the identified user's
+    /// passkeys and update in-place counters, like [`Self::finish_authentication`].
+    pub fn finish_discoverable_authentication(
+        &self,
+        credentials: &mut [Passkey],
+        state: DiscoverableAuthentication,
+        response: &PublicKeyCredential,
+    ) -> Result<AuthResult> {
+        if credentials.is_empty() {
+            return Err(Error::NoCredentials);
+        }
+        let keys: Vec<DiscoverableKey> = credentials.iter().map(DiscoverableKey::from).collect();
+        let auth_result = self
+            .webauthn
+            .finish_discoverable_authentication(response, state, &keys)?;
+
+        let mut credential_updated = false;
+        for passkey in credentials.iter_mut() {
+            if passkey.update_credential(&auth_result) == Some(true) {
+                credential_updated = true;
+            }
+        }
+        let json = serde_json::to_string(auth_result.cred_id())
+            .expect("CredentialID always serializes to a valid JSON string");
+        Ok(AuthResult {
+            credential_id: json.trim_matches('"').to_string(),
+            credential_updated,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +306,82 @@ mod tests {
 
         assert!(!result.credential_id.is_empty());
         assert!(result.credential_updated);
+    }
+
+    /// Username-less login: the response identifies the user, and the
+    /// assertion verifies against that user's passkeys only (core#18).
+    #[test]
+    fn discoverable_authentication_roundtrip() {
+        let rp_origin = Url::parse("http://localhost:8080").unwrap();
+        let svc = test_service();
+        let user_id = Uuid::new_v4();
+        let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+        let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
+        let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+        let passkey = svc.finish_registration(&reg_state, &reg_resp).unwrap();
+
+        // SoftPasskey keeps no resident keys, so it needs the credential named
+        // in the request; a real authenticator finds it by itself. The server
+        // side state is the discoverable one either way.
+        let allow = |mut rcr: RequestChallengeResponse, pk: &Passkey| {
+            rcr.public_key.allow_credentials = vec![webauthn_rs_proto::AllowCredentials {
+                type_: "public-key".to_string(),
+                id: pk.cred_id().as_ref().to_vec().into(),
+                transports: None,
+            }];
+            rcr.mediation = None;
+            rcr
+        };
+        // It does not return the user handle either (not covered by the
+        // signature), so set it the way a resident-key authenticator would.
+        let with_handle = |mut resp: PublicKeyCredential, uid: Uuid| {
+            resp.response.user_handle = Some(uid.as_bytes().to_vec().into());
+            resp
+        };
+        let (rcr, state) = svc.begin_discoverable_authentication().unwrap();
+        let resp = with_handle(
+            auth_client
+                .do_authentication(rp_origin.clone(), allow(rcr, &passkey))
+                .unwrap(),
+            user_id,
+        );
+        assert_eq!(svc.identify_discoverable_user(&resp).unwrap(), user_id);
+
+        let mut creds = vec![passkey];
+        let result = svc
+            .finish_discoverable_authentication(&mut creds, state, &resp)
+            .unwrap();
+        assert!(!result.credential_id.is_empty());
+
+        // Someone else's passkeys do not verify the assertion.
+        let mut other = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let (ccr, reg_state) = svc.begin_registration(Uuid::new_v4(), "bob", None).unwrap();
+        let bob_key = svc
+            .finish_registration(
+                &reg_state,
+                &other.do_registration(rp_origin.clone(), ccr).unwrap(),
+            )
+            .unwrap();
+        let (rcr, state) = svc.begin_discoverable_authentication().unwrap();
+        let resp = with_handle(
+            auth_client
+                .do_authentication(rp_origin, allow(rcr, &creds[0]))
+                .unwrap(),
+            user_id,
+        );
+        assert!(
+            svc.finish_discoverable_authentication(&mut [bob_key], state, &resp)
+                .is_err()
+        );
+        assert!(matches!(
+            svc.finish_discoverable_authentication(
+                &mut [],
+                svc.begin_discoverable_authentication().unwrap().1,
+                &resp
+            ),
+            Err(Error::NoCredentials)
+        ));
     }
 
     // ------------------------------------------------------------------

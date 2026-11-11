@@ -18,6 +18,8 @@ uuid.workspace = true
 url.workspace = true
 webauthn-rs = { version = "0.5", features = [
   "danger-allow-state-serialisation",
+  # start/finish_discoverable_authentication: username-less passkey login.
+  "conditional-ui",
 ] }
 
 [dev-dependencies]
@@ -29,3 +31,4 @@ sqlx = { version = "0.8", features = [
 ] }
 time.workspace = true
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-rs-proto = "0.5"
