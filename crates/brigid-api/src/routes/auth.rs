@@ -20,7 +20,9 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, internal},
     middleware::AuthenticatedClaims,
-    state::{AppState, PendingAuthentication, PendingLogin, PendingRegistration},
+    state::{
+        AppState, PendingAuthentication, PendingLogin, PendingRegistration, RegistrationPurpose,
+    },
 };
 
 #[derive(Deserialize)]
@@ -154,6 +156,7 @@ pub async fn register_begin(
         map.insert(
             session_id,
             PendingRegistration {
+                purpose: RegistrationPurpose::Signup,
                 user_id,
                 username: root_id.username.clone(),
                 server: root_id.server.clone(),
@@ -177,12 +180,9 @@ pub async fn register_finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = state
-        .pending_registrations
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&body.session_id)
-        .ok_or(ApiError::BadRequest("unknown session".into()))?;
+    let pending = take_pending_registration(&state, body.session_id, |p| {
+        matches!(p, RegistrationPurpose::Signup)
+    })?;
 
     // Authoritative TTL check at finish time. `evict_expired_pending()` only
     // runs opportunistically when a new challenge is created; in the absence
@@ -282,6 +282,7 @@ pub async fn add_credential_begin(
         map.insert(
             session_id,
             PendingRegistration {
+                purpose: RegistrationPurpose::AddPasskey,
                 user_id: user.id,
                 username: user.username,
                 server: user.server,
@@ -310,12 +311,9 @@ pub async fn add_credential_finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = state
-        .pending_registrations
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&body.session_id)
-        .ok_or(ApiError::BadRequest("unknown session".into()))?;
+    let pending = take_pending_registration(&state, body.session_id, |p| {
+        matches!(p, RegistrationPurpose::AddPasskey)
+    })?;
 
     if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
         return Err(ApiError::BadRequest("session expired".into()));
@@ -337,7 +335,26 @@ pub async fn add_credential_finish(
     Ok(StatusCode::OK)
 }
 
-async fn apply_label(
+/// Removes and returns the pending registration `session_id` if it was begun
+/// for the purpose `expected` accepts. A session of another kind is left in
+/// place and reported as unknown, as a missing one is.
+pub(crate) fn take_pending_registration(
+    state: &AppState,
+    session_id: Uuid,
+    expected: impl Fn(&RegistrationPurpose) -> bool,
+) -> Result<PendingRegistration, ApiError> {
+    let mut map = state
+        .pending_registrations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match map.get(&session_id) {
+        Some(p) if expected(&p.purpose) => {}
+        _ => return Err(ApiError::BadRequest("unknown session".into())),
+    }
+    Ok(map.remove(&session_id).expect("checked above"))
+}
+
+pub(crate) async fn apply_label(
     state: &AppState,
     user_id: Uuid,
     cred_id: Uuid,
@@ -547,30 +564,37 @@ pub async fn login_finish(
         }
     }
 
-    let issuer = state.base_url.to_string();
-    let issuer = issuer.trim_end_matches('/').to_string();
     // Use the relying-party `client_id` captured at `/auth/login/begin` (and
     // bound into the pending session so it cannot be swapped between the
     // begin and finish requests). The `aud` claim and the VSID embedded in
     // the token are both derived from this value so the same physical user
     // presents a different opaque `sub` to each RP (AGENTS.md per-RP
     // correlation invariant).
-    let client_id = pending.client_id.clone();
-    let vsid =
-        compute_vsid(&user.did_web, &client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let id_token = account_token(&state, &user, &pending.client_id)?;
 
+    Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })))
+}
+
+/// The account token returned at the end of a sign-in ceremony (login,
+/// recovery): audience `client_id`, `sub` the account's VSID for it.
+pub(crate) fn account_token(
+    state: &AppState,
+    user: &User,
+    client_id: &str,
+) -> Result<String, ApiError> {
+    let issuer = state.base_url.to_string();
+    let issuer = issuer.trim_end_matches('/');
+    let vsid =
+        compute_vsid(&user.did_web, client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let params = IssuanceParams {
         vsid: &vsid,
-        issuer: &issuer,
-        client_id: &client_id,
+        issuer,
+        client_id,
         server: state.host()?,
         ttl_secs: 3600,
     };
-
-    let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
-
-    Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })))
+    issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))
 }
 
 /// `DELETE /auth/passkeys/{id}`
@@ -722,7 +746,7 @@ pub struct SessionResponse {
 
 /// The token's account, or `401` when it no longer exists: a session whose
 /// account was deleted must end cleanly, not linger client-side (core#47).
-async fn session_account(
+pub(crate) async fn session_account(
     state: &AppState,
     claims: &brigid_oidc::Claims,
     user_id: Uuid,

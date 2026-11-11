@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Credential, Identity, StoredOidcKey, User},
+    model::{Credential, Identity, RecoveryStatus, StoredOidcKey, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +72,14 @@ fn username_index(master: &MasterKey, username: &str, server: &str) -> Result<St
     input.extend_from_slice(&slen);
     input.extend_from_slice(server.as_bytes());
     let key = brigid_crypto::hkdf::derive_user_key(master, &input, b"username-lookup")
+        .map_err(crate::Error::from)?;
+    Ok(helpers4::hex::encode(&*key))
+}
+
+/// Keyed lookup index of a recovery code's recovery id (ADR-004), the same
+/// construction as [`username_index`] with its own context.
+fn recovery_index(master: &MasterKey, recovery_id: &[u8]) -> Result<String> {
+    let key = brigid_crypto::hkdf::derive_user_key(master, recovery_id, b"recovery-lookup")
         .map_err(crate::Error::from)?;
     Ok(helpers4::hex::encode(&*key))
 }
@@ -844,13 +852,118 @@ impl EncryptedStore {
         Ok(())
     }
 
+    // -- Account recovery (ADR-004) -------------------------------------------
+
+    /// Make `recovery_id`/`verifier` the account's recovery code, replacing
+    /// any previous one. `last_used_at` is kept.
+    pub async fn set_recovery_code(
+        &self,
+        user_id: Uuid,
+        recovery_id: &[u8],
+        verifier: &[u8],
+    ) -> Result<()> {
+        let key = user_key(&self.master, &user_id)?;
+        sqlx::query(
+            "INSERT INTO account_recovery (user_id, recovery_index, recovery_id, verifier, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(user_id) DO UPDATE SET recovery_index = excluded.recovery_index, \
+             recovery_id = excluded.recovery_id, verifier = excluded.verifier, \
+             created_at = excluded.created_at",
+        )
+        .bind(user_id.to_string())
+        .bind(recovery_index(&self.master, recovery_id)?)
+        .bind(enc(&key, recovery_id)?)
+        .bind(enc(&key, verifier)?)
+        .bind(fmt_time(OffsetDateTime::now_utc())?)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_unique)?;
+        Ok(())
+    }
+
+    /// Whether the account has a usable code, and when one was last used.
+    pub async fn recovery_status(&self, user_id: Uuid) -> Result<RecoveryStatus> {
+        let row = sqlx::query(
+            "SELECT created_at, used_at, recovery_index IS NOT NULL AS usable \
+             FROM account_recovery WHERE user_id = ?",
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(RecoveryStatus::default());
+        };
+        let parse = |s: Option<String>| {
+            s.map(|s| OffsetDateTime::parse(&s, &Rfc3339).map_err(|e| Error::Time(e.to_string())))
+                .transpose()
+        };
+        let usable: bool = row.try_get("usable")?;
+        Ok(RecoveryStatus {
+            code_created_at: if usable {
+                parse(row.try_get("created_at")?)?
+            } else {
+                None
+            },
+            last_used_at: parse(row.try_get("used_at")?)?,
+        })
+    }
+
+    /// The account and stored verifier of a usable code with `recovery_id`.
+    pub async fn find_recovery(&self, recovery_id: &[u8]) -> Result<Option<(Uuid, Vec<u8>)>> {
+        let row =
+            sqlx::query("SELECT user_id, verifier FROM account_recovery WHERE recovery_index = ?")
+                .bind(recovery_index(&self.master, recovery_id)?)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(row) = row else { return Ok(None) };
+        let user_id: Uuid = row.try_get::<String, _>("user_id")?.parse()?;
+        let key = user_key(&self.master, &user_id)?;
+        let verifier = dec(&key, &row.try_get::<Vec<u8>, _>("verifier")?)?;
+        Ok(Some((user_id, verifier)))
+    }
+
+    /// Recover the account: store its new passkey and consume the code, in one
+    /// transaction. `Ok(false)` (nothing written) when the code with
+    /// `recovery_id` is no longer the account's usable code: used meanwhile,
+    /// or replaced.
+    pub async fn recover_with_credential(
+        &self,
+        recovery_id: &[u8],
+        cred: &Credential,
+    ) -> Result<bool> {
+        let key = user_key(&self.master, &cred.user_id)?;
+        let mut tx = self.pool.begin().await?;
+        let consumed = sqlx::query(
+            "UPDATE account_recovery SET recovery_index = NULL, recovery_id = NULL, \
+             verifier = NULL, used_at = ? WHERE user_id = ? AND recovery_index = ?",
+        )
+        .bind(fmt_time(OffsetDateTime::now_utc())?)
+        .bind(cred.user_id.to_string())
+        .bind(recovery_index(&self.master, recovery_id)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if consumed != 1 {
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+            .bind(cred.id.to_string())
+            .bind(cred.user_id.to_string())
+            .bind(enc(&key, &cred.data)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Re-encrypts everything stored under the master key with `new_master`,
     /// which then replaces this store's key.
     ///
     /// Covers the encrypted columns of `users` (and `username_index`, which is
     /// derived from the master key: an index computed under the old key would
     /// never match a lookup computed under the new one), `webauthn_credentials`,
-    /// `identities`, `oidc_keys` and `server_secrets`. `jti_blacklist` holds
+    /// `identities`, `oidc_keys`, `server_secrets` and `account_recovery`
+    /// (whose index, like `username_index`, is recomputed). `jti_blacklist` holds
     /// nothing encrypted.
     ///
     /// One transaction: any failure rolls the whole rotation back and leaves
@@ -988,6 +1101,31 @@ impl EncryptedStore {
                 .bind(name)
                 .execute(&mut *tx)
                 .await?;
+        }
+
+        let recovery_rows = sqlx::query(
+            "SELECT user_id, recovery_id, verifier FROM account_recovery \
+             WHERE recovery_index IS NOT NULL",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in recovery_rows {
+            let user_id_str: String = row.try_get("user_id")?;
+            let user_id: Uuid = user_id_str.parse()?;
+            let old_key = user_key(&self.master, &user_id)?;
+            let new_key = user_key(&new_master, &user_id)?;
+            let recovery_id = dec(&old_key, &row.try_get::<Vec<u8>, _>("recovery_id")?)?;
+            let verifier = dec(&old_key, &row.try_get::<Vec<u8>, _>("verifier")?)?;
+            sqlx::query(
+                "UPDATE account_recovery SET recovery_index = ?, recovery_id = ?, verifier = ? \
+                 WHERE user_id = ?",
+            )
+            .bind(recovery_index(&new_master, &recovery_id)?)
+            .bind(enc(&new_key, &recovery_id)?)
+            .bind(enc(&new_key, &verifier)?)
+            .bind(user_id_str)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
@@ -1721,6 +1859,82 @@ mod tests {
 
         let after = store.vsid_secret(&[9u8; 32]).await.unwrap();
         assert_eq!(*before, *after);
+    }
+
+    #[tokio::test]
+    async fn recovery_code_lifecycle_and_master_rotation() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+        assert_eq!(
+            store.recovery_status(user.id).await.unwrap(),
+            RecoveryStatus::default()
+        );
+
+        store
+            .set_recovery_code(user.id, b"id-one!!", &[7u8; 32])
+            .await
+            .unwrap();
+        // Replacing the code makes the previous one unknown.
+        store
+            .set_recovery_code(user.id, b"id-two!!", &[9u8; 32])
+            .await
+            .unwrap();
+        assert!(store.find_recovery(b"id-one!!").await.unwrap().is_none());
+        assert!(
+            store
+                .recovery_status(user.id)
+                .await
+                .unwrap()
+                .code_created_at
+                .is_some()
+        );
+
+        // Nothing readable in the table.
+        let raw: Vec<Vec<u8>> = sqlx::query_scalar("SELECT verifier FROM account_recovery")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert!(raw.iter().all(|v| v.as_slice() != [9u8; 32]));
+
+        store.rotate_master_key(new_master()).await.unwrap();
+        let (found_user, verifier) = store.find_recovery(b"id-two!!").await.unwrap().unwrap();
+        assert_eq!(found_user, user.id);
+        assert_eq!(
+            verifier,
+            vec![9u8; 32],
+            "readable and findable after rotation"
+        );
+
+        let cred = Credential {
+            id: Uuid::new_v4(),
+            user_id: user.id,
+            data: b"new passkey".to_vec(),
+        };
+        assert!(
+            store
+                .recover_with_credential(b"id-two!!", &cred)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.fetch_credentials(user.id).await.unwrap().len(), 1);
+        // Consumed: a second use writes nothing.
+        let again = Credential {
+            id: Uuid::new_v4(),
+            ..cred.clone()
+        };
+        assert!(
+            !store
+                .recover_with_credential(b"id-two!!", &again)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.fetch_credentials(user.id).await.unwrap().len(), 1);
+        let status = store.recovery_status(user.id).await.unwrap();
+        assert!(status.code_created_at.is_none());
+        assert!(status.last_used_at.is_some());
     }
 
     #[tokio::test]
