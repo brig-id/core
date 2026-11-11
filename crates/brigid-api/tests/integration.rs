@@ -1966,3 +1966,81 @@ async fn session_check_refresh_and_deleted_account() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// ADR-002: a token for an identity carries the identity's VSID; two
+/// identities of one account are different subjects at the same RP, and
+/// neither equals the account's own subject.
+#[tokio::test]
+async fn identity_tokens_have_distinct_subjects() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    fn sub(token: &str) -> String {
+        use base64ct::Encoding as _;
+        let payload = token.split('.').nth(1).unwrap();
+        let bytes = base64ct::Base64UrlUnpadded::decode_vec(payload).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        claims["sub"].as_str().unwrap().to_string()
+    }
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (token, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "idtok@localhost",
+        &rp_origin,
+        &mut dev,
+        "10.46.1",
+    )
+    .await;
+
+    let (_, list) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities?user_id={user_id}"),
+        Some(&token),
+        "10.46.2.1",
+        None,
+    )
+    .await;
+    let ids: Vec<String> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_string())
+        .collect();
+
+    let mut subs = Vec::new();
+    for (n, id) in ids.iter().take(2).enumerate() {
+        let (status, j) = identity_request(
+            &app,
+            "POST",
+            &format!("/account/identities/{id}/token"),
+            Some(&token),
+            &format!("10.46.3.{n}"),
+            Some(serde_json::json!({"user_id": user_id, "client_id": "rp.example"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        subs.push(sub(j["id_token"].as_str().unwrap()));
+    }
+    assert_ne!(subs[0], subs[1], "two identities, two subjects");
+    assert_ne!(
+        subs[0],
+        sub(&token),
+        "the account's subject is never reused"
+    );
+
+    // Stable for the same identity and RP.
+    let (_, j) = identity_request(
+        &app,
+        "POST",
+        &format!("/account/identities/{}/token", ids[0]),
+        Some(&token),
+        "10.46.4.1",
+        Some(serde_json::json!({"user_id": user_id, "client_id": "rp.example"})),
+    )
+    .await;
+    assert_eq!(sub(j["id_token"].as_str().unwrap()), subs[0]);
+}

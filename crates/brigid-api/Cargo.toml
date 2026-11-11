@@ -32,6 +32,7 @@ webauthn-rs = { version = "0.5", features = [
 ] }
 
 [dev-dependencies]
+base64ct = { version = "1", features = ["alloc"] }
 brigid-crypto.workspace = true
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 tower = { version = "0.5", features = ["util"] }
