@@ -74,7 +74,7 @@ pub struct AppState {
     pub retired_oidc_keys: Vec<Arc<OidcSigningKey>>,
     pub jti_store: Arc<Mutex<JtiStore>>,
     pub base_url: Url,
-    /// Pre-computed VSID salt — caller must use `brigid_identity::derive_vsid_salt(&master)`.
+    /// The keying material of every VSID: `EncryptedStore::vsid_secret`.
     pub vsid_salt: [u8; 32],
     pub pending_registrations: Arc<Mutex<HashMap<Uuid, PendingRegistration>>>,
     pub pending_authentications: Arc<Mutex<HashMap<Uuid, PendingAuthentication>>>,

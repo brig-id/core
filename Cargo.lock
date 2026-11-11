@@ -1298,6 +1298,9 @@ name = "helpers4"
 version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c71c6658c99c307db6edf32ddf296351233059e205ff97403682c8448e90c0"
+dependencies = [
+ "getrandom 0.4.3",
+]
 
 [[package]]
 name = "hermit-abi"

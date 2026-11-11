@@ -41,6 +41,12 @@ fn oidc_seed_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
         .map_err(crate::Error::from)
 }
 
+/// The key that encrypts the rows of `server_secrets`.
+fn server_secret_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
+    brigid_crypto::hkdf::derive_user_key(master, b"server-secrets", b"store-fields")
+        .map_err(crate::Error::from)
+}
+
 /// Compute a stable, deterministic lookup index for `username@server`.
 ///
 /// Because `username` and `server` are stored encrypted, we cannot do a SQL
@@ -667,6 +673,50 @@ impl EncryptedStore {
         Ok(())
     }
 
+    // -- VSID secret (ADR-006) -------------------------------------------------
+
+    /// The VSID secret: the keying material of every VSID.
+    ///
+    /// It is stored, and a master key rotation re-encrypts it, so VSIDs
+    /// survive the rotation. The first call on a database stores it:
+    ///
+    /// - a database that already holds accounts keeps `derived`, the value
+    ///   those accounts' VSIDs were computed with until now (the salt derived
+    ///   from the master key), so that no VSID changes;
+    /// - an empty database gets 32 random bytes.
+    pub async fn vsid_secret(&self, derived: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+        let key = server_secret_key(&self.master)?;
+        let mut tx = self.pool.begin().await?;
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = 'vsid'")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let secret = match stored {
+            Some(raw) => Zeroizing::new(dec(&key, &raw)?),
+            None => {
+                let has_accounts: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users)")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                let secret = Zeroizing::new(if has_accounts {
+                    derived.to_vec()
+                } else {
+                    helpers4::random::random_bytes(32)?
+                });
+                sqlx::query("INSERT INTO server_secrets (name, value) VALUES ('vsid', ?)")
+                    .bind(enc(&key, &secret)?)
+                    .execute(&mut *tx)
+                    .await?;
+                secret
+            }
+        };
+        tx.commit().await?;
+        let secret: [u8; 32] = secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidBlob)?;
+        Ok(Zeroizing::new(secret))
+    }
+
     /// Delete keys retired before `before` (their grace period is over: every
     /// token they signed has expired). Returns how many were deleted.
     pub async fn prune_oidc_keys(&self, before: OffsetDateTime) -> Result<u64> {
@@ -790,45 +840,23 @@ impl EncryptedStore {
         Ok(())
     }
 
-    /// Re-encrypts every row under `new_master`, replacing this store's key.
+    /// Re-encrypts everything stored under the master key with `new_master`,
+    /// which then replaces this store's key.
     ///
-    /// Decrypts each `users` row's `username`/`server`/`did_web` (and
-    /// recomputes `username_index`, itself HKDF-derived from the master
-    /// key — a stale index computed under the old key would never match a
-    /// lookup computed under the new one post-rotation) and each
-    /// `webauthn_credentials` row's `data`, both under the current
-    /// (pre-rotation) key, then re-encrypts under `new_master`. All of it
-    /// runs in one transaction: any failure — a decrypt error, a database
-    /// error, anything — rolls back the entire rotation via `tx`'s `Drop`,
-    /// leaving every row exactly as it was under the old key. On success,
-    /// this store's own key is updated to `new_master` so it keeps working
-    /// against what it just wrote.
+    /// Covers the encrypted columns of `users` (and `username_index`, which is
+    /// derived from the master key: an index computed under the old key would
+    /// never match a lookup computed under the new one), `webauthn_credentials`,
+    /// `identities`, `oidc_keys` and `server_secrets`. `jti_blacklist` holds
+    /// nothing encrypted.
     ///
-    /// Does **not** touch `sessions` or `jti_blacklist` — neither table
-    /// stores anything encrypted under the master key.
+    /// One transaction: any failure rolls the whole rotation back and leaves
+    /// every row as it was under the old key.
     ///
-    /// # Rotation is not free of side effects
-    ///
-    /// The master key is also the root of two things this method does not
-    /// (and cannot, from here) fix up:
-    /// - [`brigid_identity::derive_vsid_salt`] derives the VSID salt from
-    ///   the master key, and VSIDs themselves are never stored — they're
-    ///   recomputed on demand from `(did_root, client_id, salt)`. Rotating
-    ///   the master key changes the salt, which changes the VSID (the OIDC
-    ///   `sub` claim) for *every* user, for *every* relying party,
-    ///   simultaneously. Any relying party that correlates users by VSID
-    ///   loses that continuity across a rotation — there is no way to
-    ///   preserve it without storing VSIDs (defeating their point) or
-    ///   storing the salt separately from the key it's meant to rotate away
-    ///   from.
-    /// - `leaf`'s OIDC signing key is derived from the master key at
-    ///   startup (`derive_user_key(master, b"oidc-signing-key", ...)`), not
-    ///   stored. Rotating invalidates every previously issued `id_token`
-    ///   immediately, not just after its natural expiry.
-    ///
-    /// Callers (the `leaf rotate-key` CLI) must surface both of these
-    /// plainly — this is an operational consequence to document and warn
-    /// about, not a bug to route around.
+    /// Nothing visible from outside changes: OIDC signing keys and the VSID
+    /// secret are stored, so issued tokens stay valid and every VSID keeps its
+    /// value. The one exception is a database that never called
+    /// [`Self::vsid_secret`]: its VSIDs were derived from the old master key
+    /// and nothing recorded that value.
     pub async fn rotate_master_key(&mut self, new_master: MasterKey) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
@@ -939,6 +967,21 @@ impl EncryptedStore {
             sqlx::query("UPDATE oidc_keys SET seed = ? WHERE kid = ?")
                 .bind(enc(&new_oidc, &seed)?)
                 .bind(kid)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let secret_rows = sqlx::query("SELECT name, value FROM server_secrets")
+            .fetch_all(&mut *tx)
+            .await?;
+        let old_secrets = server_secret_key(&self.master)?;
+        let new_secrets = server_secret_key(&new_master)?;
+        for row in secret_rows {
+            let name: String = row.try_get("name")?;
+            let value = Zeroizing::new(dec(&old_secrets, &row.try_get::<Vec<u8>, _>("value")?)?);
+            sqlx::query("UPDATE server_secrets SET value = ? WHERE name = ?")
+                .bind(enc(&new_secrets, &value)?)
+                .bind(name)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1628,6 +1671,58 @@ mod tests {
         let keys = store.oidc_signing_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].kid, "k2");
+    }
+
+    #[tokio::test]
+    async fn vsid_secret_is_random_on_a_new_database_and_stable() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let derived = [7u8; 32];
+
+        let first = store.vsid_secret(&derived).await.unwrap();
+        assert_ne!(
+            *first, derived,
+            "a new database does not reuse the derived salt"
+        );
+        assert_ne!(*first, [0u8; 32]);
+        let again = store.vsid_secret(&[9u8; 32]).await.unwrap();
+        assert_eq!(*first, *again, "stored once, then only read");
+
+        // Not stored in clear.
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = 'vsid'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(!raw.windows(32).any(|w| w == first.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn vsid_secret_keeps_the_derived_salt_when_accounts_exist() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        store.store_user(&sample_user()).await.unwrap();
+
+        let derived = [7u8; 32];
+        assert_eq!(*store.vsid_secret(&derived).await.unwrap(), derived);
+        // A later start derives a different value (rotated master key): the
+        // stored one still wins.
+        assert_eq!(*store.vsid_secret(&[9u8; 32]).await.unwrap(), derived);
+    }
+
+    #[tokio::test]
+    async fn vsid_secret_survives_a_master_key_rotation() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let before = store.vsid_secret(&[7u8; 32]).await.unwrap();
+
+        store.rotate_master_key(new_master()).await.unwrap();
+
+        let after = store.vsid_secret(&[9u8; 32]).await.unwrap();
+        assert_eq!(*before, *after);
     }
 
     #[tokio::test]

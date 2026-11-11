@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `brigid-store` — `EncryptedStore::vsid_secret`: the keying material of the
+  VSIDs is stored (table `server_secrets`, encrypted) instead of derived from
+  the master key at each start. `rotate_master_key` re-encrypts it, so a
+  master key rotation no longer changes every VSID. A database that already
+  holds accounts keeps the value it was using; a new one gets random bytes.
+
 ### Fixed
 
 - `brigid-api` — `POST /auth/register/begin` refuses a username on another
