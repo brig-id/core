@@ -4,6 +4,9 @@ on:
   push:
     branches: [main, "dev/*"]
 
+permissions:
+  contents: read
+
 jobs:
   coverage:
     uses: brig-id/.github/.github/workflows/coverage.yml@26e9a0393cb98cdb4f25e4d10f155230fb4db6f5

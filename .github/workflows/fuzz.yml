@@ -8,6 +8,9 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
@@ -21,13 +24,17 @@ jobs:
           - fuzz_jwt_validate
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: nightly
 
       - name: Install cargo-binstall
-        # Pinned action commit (v1.21.1) — fetches a checksummed cargo-binstall
+        # Pinned action commit — fetches a checksummed cargo-binstall
         # binary from its signed GitHub release. Matches brig-id/crypto's fuzz.yml.
         uses: cargo-bins/cargo-binstall@851112458b5f28a29e5bc14a690c3f283d9dcc6f # v1.26.2
 
@@ -40,7 +47,7 @@ jobs:
         run: cargo binstall --no-confirm --version 0.13.1 cargo-fuzz
 
       - name: Restore corpus cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
@@ -69,14 +76,14 @@ jobs:
 
       - name: Save corpus cache
         if: always()
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.sha }}
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crash-${{ matrix.target }}-${{ github.sha }}
           # `if-no-files-found: ignore` avoids masking a build/tooling failure

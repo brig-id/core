@@ -6,6 +6,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
   sbom:
     uses: brig-id/.github/.github/workflows/sbom.yml@26e9a0393cb98cdb4f25e4d10f155230fb4db6f5
