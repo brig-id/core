@@ -144,6 +144,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
+                axum::http::Method::PATCH,
                 axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])

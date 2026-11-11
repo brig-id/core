@@ -110,6 +110,15 @@ pub async fn register_begin(
 ) -> Result<impl IntoResponse, ApiError> {
     let root_id = RootId::parse(&body.username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    // An account lives on this server. `alice@elsewhere.example` would put a
+    // domain this server does not control in the account's DID.
+    let host = state.host()?;
+    if root_id.server != host {
+        return Err(ApiError::BadRequest(format!(
+            "accounts on this server end with @{host}"
+        )));
+    }
+
     let existing = state
         .store
         .fetch_user_by_username(&root_id.username, &root_id.server)
@@ -555,7 +564,7 @@ pub async fn login_finish(
         vsid: &vsid,
         issuer: &issuer,
         client_id: &client_id,
-        server: &user.server,
+        server: state.host()?,
         ttl_secs: 3600,
     };
 
@@ -768,7 +777,7 @@ pub async fn refresh_session(
         vsid: &vsid,
         issuer: &issuer,
         client_id: &claims.aud,
-        server: &user.server,
+        server: state.host()?,
         ttl_secs: 3600,
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
