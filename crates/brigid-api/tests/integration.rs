@@ -18,6 +18,31 @@ use uuid::Uuid;
 
 use brigid_api::{AppState, build_router};
 
+/// The server asks for a discoverable credential (`residentKey: required`,
+/// ADR-003); `SoftPasskey` keeps no resident keys and refuses such a request.
+/// The tests check the request, then relax it for the software authenticator
+/// (registration finish does not depend on it).
+fn for_soft_passkey(
+    mut ccr: webauthn_rs::prelude::CreationChallengeResponse,
+) -> webauthn_rs::prelude::CreationChallengeResponse {
+    let selection = ccr
+        .public_key
+        .authenticator_selection
+        .as_mut()
+        .expect("registration states an authenticator selection");
+    assert!(
+        selection.require_resident_key,
+        "registration must ask for a discoverable credential"
+    );
+    assert_eq!(
+        serde_json::to_value(selection.resident_key).unwrap(),
+        "required"
+    );
+    selection.resident_key = Some(webauthn_rs_proto::ResidentKeyRequirement::Discouraged);
+    selection.require_resident_key = false;
+    ccr
+}
+
 fn master() -> MasterKey {
     MasterKey::from_hex(&"ab".repeat(32)).unwrap()
 }
@@ -341,7 +366,9 @@ async fn register_and_login_roundtrip() {
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
 
     // -- Perform registration with soft passkey --
-    let reg_credential = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+    let reg_credential = auth_client
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
 
     // -- Register finish --
     let finish_body = serde_json::json!({
@@ -448,7 +475,9 @@ async fn register_begin_conflict_for_duplicate_user() {
     let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
-    let reg_credential = auth_client.do_registration(rp_origin, ccr).unwrap();
+    let reg_credential = auth_client
+        .do_registration(rp_origin, for_soft_passkey(ccr))
+        .unwrap();
 
     let finish_body = serde_json::json!({
         "session_id": session_id,
@@ -539,7 +568,9 @@ async fn logout_blacklists_token() {
     let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
-    let reg_credential = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+    let reg_credential = auth_client
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
 
     let resp = app
         .clone()
@@ -866,7 +897,9 @@ async fn register_and_login_for_passkey_tests(
     let session_id: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
-    let reg_cred = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+    let reg_cred = auth_client
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
 
     // Register finish (IP .2)
     let xff2 = format!("{xff_base}.2");
@@ -1008,7 +1041,7 @@ async fn add_credential_for_tests(
 
     let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let reg_cred = second_authenticator
-        .do_registration(rp_origin.clone(), ccr)
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
 
     let resp = app
@@ -1437,7 +1470,7 @@ async fn add_credential_roundtrip() {
     // A distinct authenticator stands in for a second physical key.
     let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let reg_cred = second_authenticator
-        .do_registration(rp_origin.clone(), ccr)
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
 
     let resp = app
@@ -2201,7 +2234,9 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     let session_id = j["session_id"].clone();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
-    let cred = new_device.do_registration(rp_origin.clone(), ccr).unwrap();
+    let cred = new_device
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
 
     // A recovery session can't be finished as a signup.
     let finish_body = serde_json::json!({
@@ -2294,7 +2329,9 @@ async fn registration_sessions_finish_only_as_what_they_began() {
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
     let mut second = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let cred = second.do_registration(rp_origin.clone(), ccr).unwrap();
+    let cred = second
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
     let body = serde_json::json!({ "session_id": j["session_id"], "credential": cred });
     for (uri, ip) in [
         ("/auth/register/finish", "10.53.3.1"),
@@ -2346,7 +2383,9 @@ async fn signup_without_username_signs_in() {
 
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
-    let cred = dev.do_registration(rp_origin.clone(), ccr).unwrap();
+    let cred = dev
+        .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
+        .unwrap();
     let (status, j) = identity_request(
         &app,
         "POST",
@@ -2401,7 +2440,9 @@ async fn signup_without_username_signs_in() {
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
     let mut dev2 = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let cred = dev2.do_registration(rp_origin, ccr).unwrap();
+    let cred = dev2
+        .do_registration(rp_origin, for_soft_passkey(ccr))
+        .unwrap();
     let (status, j) = identity_request(
         &app,
         "POST",
