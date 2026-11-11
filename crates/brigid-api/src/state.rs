@@ -18,8 +18,10 @@ use webauthn_rs::prelude::{
 /// accepts only its own kind, so a session begun to add a passkey (or to
 /// recover an account) cannot be completed as something else.
 pub enum RegistrationPurpose {
-    /// A new account (`/auth/register/*`).
-    Signup,
+    /// A new account (`/auth/register/*`). With a `client_id`, `finish`
+    /// signs the new account in (audience `client_id`), so signing up takes
+    /// one passkey prompt.
+    Signup { client_id: Option<String> },
     /// One more passkey for a signed-in account (`/auth/passkeys/add/*`).
     AddPasskey,
     /// A passkey enrolled with a recovery code (`/auth/recovery/*`). The
