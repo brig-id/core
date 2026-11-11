@@ -1786,3 +1786,103 @@ async fn passkey_can_be_renamed() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Username-less login (core#18): no username at begin, the user is taken
+/// from the passkey's user handle and the assertion is verified against that
+/// user's passkeys.
+#[tokio::test]
+async fn discoverable_login_roundtrip() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (_, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "disco@localhost",
+        &rp_origin,
+        &mut dev,
+        "10.44.1",
+    )
+    .await;
+
+    // A first named login only to learn the credential id SoftPasskey needs:
+    // it keeps no resident keys, so the request must name the credential.
+    let (_, named) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        "10.44.2.1",
+        Some(serde_json::json!({"username": "disco@localhost", "client_id": "test-client"})),
+    )
+    .await;
+    let allow = named["challenge"]["publicKey"]["allowCredentials"].clone();
+
+    let begin = |xff: &'static str| {
+        let app = app.clone();
+        async move {
+            identity_request(
+                &app,
+                "POST",
+                "/auth/login/begin",
+                None,
+                xff,
+                Some(serde_json::json!({"client_id": "test-client"})),
+            )
+            .await
+        }
+    };
+
+    let (status, j) = begin("10.44.2.2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        j["challenge"]["publicKey"]["allowCredentials"]
+            .as_array()
+            .is_none_or(|a| a.is_empty()),
+        "a discoverable challenge names no credential"
+    );
+    let session: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let mut rcr: RequestChallengeResponse = serde_json::from_value(j["challenge"].clone()).unwrap();
+    rcr.public_key.allow_credentials = serde_json::from_value(allow.clone()).unwrap();
+    rcr.mediation = None;
+    let mut cred: PublicKeyCredential = dev.do_authentication(rp_origin.clone(), rcr).unwrap();
+    cred.response.user_handle = Some(user_id.as_bytes().to_vec().into());
+
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/finish",
+        None,
+        "10.44.2.3",
+        Some(serde_json::json!({"session_id": session, "credential": cred})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_value::<Uuid>(j["user_id"].clone()).unwrap(),
+        user_id
+    );
+    assert!(j["id_token"].as_str().is_some());
+
+    // An unknown user handle is refused cleanly.
+    let (_, j) = begin("10.44.3.1").await;
+    let session: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
+    let mut rcr: RequestChallengeResponse = serde_json::from_value(j["challenge"].clone()).unwrap();
+    rcr.public_key.allow_credentials = serde_json::from_value(allow).unwrap();
+    rcr.mediation = None;
+    let mut cred: PublicKeyCredential = dev.do_authentication(rp_origin, rcr).unwrap();
+    cred.response.user_handle = Some(Uuid::new_v4().as_bytes().to_vec().into());
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/finish",
+        None,
+        "10.44.3.2",
+        Some(serde_json::json!({"session_id": session, "credential": cred})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

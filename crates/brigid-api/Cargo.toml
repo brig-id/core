@@ -27,6 +27,8 @@ tower_governor = "0.8"
 tracing = "0.1"
 webauthn-rs = { version = "0.5", features = [
   "danger-allow-state-serialisation",
+  # start/finish_discoverable_authentication: username-less passkey login.
+  "conditional-ui",
 ] }
 
 [dev-dependencies]
