@@ -45,7 +45,9 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 - **OIDC** — `jti` store must have TTL = token `exp`; never grow unbounded.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
   (`default-src 'self'`, no `unsafe-inline`).
-- **Rate limiting** — all `/auth/*` routes: 20 req/min per IP via `tower-governor`.
+- **Rate limiting** — per client IP via `tower-governor`: the WebAuthn ceremonies
+  (register, login, add-passkey finish) 20 req/min in bursts of 5; the routes that need a
+  session 60 req/min in bursts of 30.
 
 ## Architecture quick-reference
 

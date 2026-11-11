@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `brigid-api` — an internal error logs its cause; the log line used to carry
   only the fixed "internal server error" text sent to the client.
 - `brigid-api` — CORS allows `PATCH`, used by the passkey and identity routes.
+- `brigid-api` — the account routes (session, passkeys, identities) have their
+  own rate limit, 60 requests per minute in bursts of 30. They shared the
+  20-per-minute, burst-of-5 quota of the WebAuthn ceremonies, so signing up
+  and signing in left none for the first account page ("Request failed
+  (429)").
 
 ## [0.1.0] - 2026-09-04
 
