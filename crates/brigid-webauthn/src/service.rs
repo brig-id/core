@@ -451,7 +451,6 @@ mod tests {
             id: user_id,
             username: "bob".to_string(),
             server: "localhost".to_string(),
-            did_web: "did:web:localhost:u:bob".to_string(),
             created_at: OffsetDateTime::now_utc(),
         };
         store.store_user(&user).await.unwrap();

@@ -14,7 +14,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use brigid_identity::{compute_vsid, identity_did};
+use brigid_identity::{account_subject, identity_vsid};
 use brigid_store::{Error as StoreError, Identity};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -81,38 +81,31 @@ pub struct TemplateView {
     pub description: &'static str,
 }
 
-/// A new identity of `account_id` with a fresh id and DID.
+/// A new identity of `account_id` with a fresh id (ADR-007: the id is what
+/// its VSIDs are derived from).
 pub(crate) fn new_identity(
-    state: &AppState,
     account_id: Uuid,
     name: String,
     logo: String,
     description: Option<String>,
-) -> Result<Identity, ApiError> {
-    let id = Uuid::new_v4();
-    let did = identity_did(state.host()?, id).map_err(|e| internal!(e))?;
+) -> Identity {
     let now = OffsetDateTime::now_utc();
-    Ok(Identity {
-        id,
+    Identity {
+        id: Uuid::new_v4(),
         account_id,
-        did,
         name,
         logo,
         description,
         created_at: now,
         updated_at: now,
-    })
+    }
 }
 
 /// The starter identities of a new account (ADR-002, core#48).
-pub(crate) fn starter_identities(
-    state: &AppState,
-    account_id: Uuid,
-) -> Result<Vec<Identity>, ApiError> {
+pub(crate) fn starter_identities(account_id: Uuid) -> Vec<Identity> {
     brigid_identity::default_templates()
         .map(|t| {
             new_identity(
-                state,
                 account_id,
                 t.name.to_string(),
                 t.logo.to_string(),
@@ -157,8 +150,7 @@ async fn authorize(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
-    let expected =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let expected = account_subject(user.id, &claims.aud, &state.vsid_salt);
     if expected.as_str() != claims.sub {
         return Err(ApiError::Forbidden);
     }
@@ -215,7 +207,7 @@ pub async fn create_identity(
     let description = body
         .description
         .or_else(|| template.map(|t| t.description.to_string()));
-    let identity = new_identity(&state, body.user_id, name, logo, description)?;
+    let identity = new_identity(body.user_id, name, logo, description);
     let id = identity.id;
     state
         .store
@@ -303,8 +295,7 @@ pub async fn identity_token(
         .await
         .map_err(map_store)?
         .ok_or(ApiError::NotFound)?;
-    let vsid =
-        compute_vsid(&identity.did, &body.client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let vsid = identity_vsid(identity.id, &body.client_id, &state.vsid_salt);
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/').to_string();
     let params = brigid_oidc::IssuanceParams {

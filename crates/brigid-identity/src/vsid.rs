@@ -5,13 +5,15 @@ use hkdf::Hkdf;
 use sha3::Sha3_256;
 
 use brigid_crypto::MasterKey;
+use uuid::Uuid;
 
-/// A Virtual Stable Identifier (VSID): stable per `(did_root, client_id, salt)`,
-/// non-correlable across services (different `client_id` → different VSID).
+/// A Virtual Stable Identifier (VSID): the `sub` a relying party sees for an
+/// identity ([ADR-007] in the spec). Stable per `(identity, client_id)`, and
+/// different for every `client_id`, so two relying parties can't link their
+/// users. Computed from the identity's UUID: renaming the account, moving the
+/// server to another domain or rotating the master key changes no VSID.
 ///
-/// INVARIANTS:
-/// - MUST be derived from a root DID (`did:web:…`) only.
-/// - MUST NOT be derived from an alias or a virtual identity.
+/// [ADR-007]: https://github.com/brig-id/spec/blob/main/decisions/007-identifiers.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vsid(String);
 
@@ -42,131 +44,112 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
     arr
 }
 
-/// Computes the VSID from a root DID, client identifier, and salt.
-///
-/// Formula:
-/// ```text
-/// HKDF-SHA3-256(
-///   IKM  = salt,
-///   salt = b"" (none, already a derived key),
-///   info = "brigid-vsid-v1" ||
-///          u32_be(len(did_root)) || did_root ||
-///          u32_be(len(client_id)) || client_id
-/// )[..32]
-/// ```
-/// Length-prefixed fields prevent collisions (`:` appears in DIDs).
-/// Result is base64url-encoded without padding.
-///
-/// # Invariants
-///
-/// `did_root` MUST be a root DID (`did:web:…`). Passing an alias or a virtual
-/// identity DID here violates the VSID security model.
-pub fn compute_vsid(did_root: &str, client_id: &str, salt: &[u8]) -> crate::Result<Vsid> {
-    // The prefix check alone would accept malformed values like `did:web:`
-    // (empty body) or values containing path separators (`/`) that are not
-    // valid did:web syntax. Validate the body strictly so we never derive a
-    // VSID from clearly malformed input.
-    //
-    // Note: brig\u00b7id uses multi-component did:web identifiers of the form
-    // `did:web:<host>:u:<username>` for root public identities, so embedded
-    // `:` characters are permitted. Leading/trailing `:` and `/` are not.
-    let body = did_root.strip_prefix("did:web:").ok_or_else(|| {
-        crate::Error::InvalidIdentifier("did_root must be a did:web: DID".to_string())
-    })?;
-    if body.is_empty()
-        || body.contains('/')
-        || body.starts_with(':')
-        || body.ends_with(':')
-        || body.contains("::")
-    {
-        return Err(crate::Error::InvalidIdentifier(
-            "did_root has malformed did:web syntax".to_string(),
-        ));
-    }
-    let dr_len = (did_root.len() as u32).to_be_bytes();
-    let ci_len = (client_id.len() as u32).to_be_bytes();
-
-    let mut info = Vec::with_capacity(14 + 4 + did_root.len() + 4 + client_id.len());
-    info.extend_from_slice(b"brigid-vsid-v1");
-    info.extend_from_slice(&dr_len);
-    info.extend_from_slice(did_root.as_bytes());
-    info.extend_from_slice(&ci_len);
+/// `HKDF-SHA3-256(ikm = secret, info = label || id (16 bytes) ||
+/// u32_be(len(client_id)) || client_id)[..32]`, unpadded base64url. The id has
+/// a fixed length and `client_id` is length-prefixed, so the input is
+/// unambiguous; `label` keeps the two kinds of subject apart.
+fn derive_subject(label: &[u8], id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
+    let mut info = Vec::with_capacity(label.len() + 16 + 4 + client_id.len());
+    info.extend_from_slice(label);
+    info.extend_from_slice(id.as_bytes());
+    info.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
     info.extend_from_slice(client_id.as_bytes());
-
-    // `salt` is already a 32-byte HKDF-derived value — use it as IKM with no
-    // additional salt (HKDF without a salt uses a zero-filled hash-length pad).
-    let hk = Hkdf::<Sha3_256>::new(None, salt);
+    // `secret` is 32 random (or HKDF-derived) bytes: used as IKM with no salt.
+    let hk = Hkdf::<Sha3_256>::new(None, secret);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm)
         .expect("32 bytes always fits within HKDF output limit");
-    Ok(Vsid(Base64UrlUnpadded::encode_string(&okm)))
+    Vsid(Base64UrlUnpadded::encode_string(&okm))
+}
+
+/// The VSID of identity `identity_id` at relying party `client_id`
+/// (`info` label `brigid-vsid-v2`). `secret` is the deployment's VSID secret
+/// (ADR-006).
+pub fn identity_vsid(identity_id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
+    derive_subject(b"brigid-vsid-v2", identity_id, client_id, secret)
+}
+
+/// The `sub` of an account's own session token at `client_id` (label
+/// `brigid-account-sub-v1`): never equal to any identity's VSID. Only until
+/// ADR-005 replaces account tokens with a server-side session.
+pub fn account_subject(account_id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
+    derive_subject(b"brigid-account-sub-v1", account_id, client_id, secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_master() -> MasterKey {
-        MasterKey::from_hex(&"42".repeat(32)).unwrap()
-    }
+    const SECRET: [u8; 32] = [7u8; 32];
 
-    const DID_ROOT: &str = "did:web:brig.id:u:berenger";
-
-    #[test]
-    fn vsid_is_stable() {
-        let master = test_master();
-        let salt = derive_vsid_salt(&master);
-        let v1 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
-        let v2 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
-        assert_eq!(v1, v2, "same inputs must produce the same VSID");
+    fn id(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
     }
 
     #[test]
-    fn vsid_non_correlable_across_clients() {
-        let master = test_master();
-        let salt = derive_vsid_salt(&master);
-        let v1 = compute_vsid(DID_ROOT, "app1", &salt).unwrap();
-        let v2 = compute_vsid(DID_ROOT, "app2", &salt).unwrap();
-        assert_ne!(v1, v2, "different client_id must yield different VSID");
-    }
-
-    #[test]
-    fn vsid_differs_across_salts() {
-        let s1 = [0u8; 32];
-        let s2 = [1u8; 32];
-        let v1 = compute_vsid(DID_ROOT, "app1", &s1).unwrap();
-        let v2 = compute_vsid(DID_ROOT, "app1", &s2).unwrap();
-        assert_ne!(v1, v2, "different salt must yield different VSID");
-    }
-
-    #[test]
-    fn vsid_never_derived_from_alias() {
-        // Invariant: compute_vsid rejects non-root-DID inputs at the call site,
-        // preventing alias or virtual identity DIDs from leaking into VSIDs.
-        let master = test_master();
-        let salt = derive_vsid_salt(&master);
-        assert!(
-            compute_vsid("did:web:brig.id:u:berenger", "app1", &salt).is_ok(),
-            "root did:web: DID must be accepted"
-        );
-        assert!(
-            compute_vsid("_berenger_alias", "app1", &salt).is_err(),
-            "non-DID alias must be rejected"
+    fn deterministic() {
+        assert_eq!(
+            identity_vsid(id(1), "app1", &SECRET),
+            identity_vsid(id(1), "app1", &SECRET)
         );
     }
 
     #[test]
-    fn vsid_display_and_as_str() {
-        let v = compute_vsid(DID_ROOT, "app1", &[0u8; 32]).unwrap();
-        assert_eq!(v.as_str(), v.to_string());
-        assert!(!v.as_str().is_empty());
+    fn different_client_different_vsid() {
+        assert_ne!(
+            identity_vsid(id(1), "app1", &SECRET),
+            identity_vsid(id(1), "app2", &SECRET)
+        );
     }
 
     #[test]
-    fn derive_vsid_salt_is_deterministic() {
-        let master = test_master();
-        let s1 = derive_vsid_salt(&master);
-        let s2 = derive_vsid_salt(&master);
-        assert_eq!(s1, s2);
+    fn different_identity_different_vsid() {
+        assert_ne!(
+            identity_vsid(id(1), "app1", &SECRET),
+            identity_vsid(id(2), "app1", &SECRET)
+        );
+    }
+
+    #[test]
+    fn depends_on_the_secret() {
+        assert_ne!(
+            identity_vsid(id(1), "app1", &SECRET),
+            identity_vsid(id(1), "app1", &[8u8; 32])
+        );
+    }
+
+    #[test]
+    fn an_account_subject_is_never_an_identity_vsid() {
+        assert_ne!(
+            account_subject(id(1), "app1", &SECRET),
+            identity_vsid(id(1), "app1", &SECRET)
+        );
+    }
+
+    #[test]
+    fn client_id_is_length_prefixed() {
+        // Without the prefix, ("a", id) and ("", id ‖ "a") could meet; with a
+        // fixed-length id they can't, and the prefix covers the rest.
+        assert_ne!(
+            identity_vsid(id(1), "ab", &SECRET),
+            identity_vsid(id(1), "a", &SECRET)
+        );
+    }
+
+    /// Pins the formula: an accidental change would move every VSID.
+    #[test]
+    fn known_answer() {
+        let v = identity_vsid(id(1), "https://rp.example", &SECRET);
+        assert_eq!(v.as_str().len(), 43);
+        assert_eq!(v.as_str(), KNOWN_VSID, "VSID v2 formula changed");
+    }
+
+    // Recomputed independently (Python hmac + sha3_256, HKDF per RFC 5869).
+    const KNOWN_VSID: &str = "II-Ekb91b_YeEn5OsWse5EwHrg7DMPI6daf30K1JQoE";
+
+    #[test]
+    fn derive_vsid_salt_is_stable() {
+        let m = MasterKey::from_hex(&"42".repeat(32)).unwrap();
+        assert_eq!(derive_vsid_salt(&m), derive_vsid_salt(&m));
     }
 }

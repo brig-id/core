@@ -1,17 +1,13 @@
-//! brigid-did: DID:web and DID:peer resolution for brig·id.
+//! brigid-did: the server's own DID document.
 //!
-//! - `build_did_web` / `did_web_to_url` / `resolve_did_web` — DID:web
-//! - `generate_did_peer` / `resolve_did_peer` — DID:peer (numalgo 2, Ed25519)
-//! - `did_document_handler` — construct a DID Core document for `.well-known/did.json`
+//! Only the server has a DID (`did:web:<server>`, `/.well-known/did.json`), which
+//! publishes the key that signs its tokens. Accounts and identities are
+//! identified by UUIDs (ADR-007 in the spec).
 
 pub mod error;
 pub mod handler;
 pub mod model;
-pub mod peer;
-pub mod web;
 
 pub use error::{Error, Result};
-pub use handler::{did_document_handler, did_root_document_handler};
-pub use model::{DIDDocument, Did, VerificationMethod};
-pub use peer::{generate_did_peer, resolve_did_peer};
-pub use web::{build_did_web, did_web_to_url, resolve_did_web};
+pub use handler::did_root_document_handler;
+pub use model::{DIDDocument, VerificationMethod};
