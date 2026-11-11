@@ -22,6 +22,9 @@ webauthn-rs = { version = "0.5", features = [
   "conditional-ui",
 ] }
 
+# ResidentKeyRequirement, to ask for discoverable credentials at registration.
+webauthn-rs-proto = "0.5"
+
 [dev-dependencies]
 sqlx = { version = "0.8", features = [
   "sqlite",
@@ -31,4 +34,3 @@ sqlx = { version = "0.8", features = [
 ] }
 time.workspace = true
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
-webauthn-rs-proto = "0.5"

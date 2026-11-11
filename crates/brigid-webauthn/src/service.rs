@@ -42,12 +42,14 @@ impl WebauthnService {
         username: &str,
         exclude_credentials: Option<Vec<CredentialID>>,
     ) -> Result<(CreationChallengeResponse, PasskeyRegistration)> {
-        Ok(self.webauthn.start_passkey_registration(
+        let (mut ccr, state) = self.webauthn.start_passkey_registration(
             user_id,
             username,
             username,
             exclude_credentials,
-        )?)
+        )?;
+        require_discoverable(&mut ccr);
+        Ok((ccr, state))
     }
 
     /// Verify the registration response and return the passkey.
@@ -229,9 +231,34 @@ pub async fn update_passkey(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Asks the authenticator for a discoverable credential (`residentKey:
+/// required`). Signing in takes no username (ADR-003): the passkey itself
+/// names the account, which only a discoverable credential can do.
+/// webauthn-rs' passkey registration asks for `discouraged`; synced passkey
+/// providers make discoverable credentials anyway, but a security key would
+/// not, and the user could then never sign in with it.
+fn require_discoverable(ccr: &mut CreationChallengeResponse) {
+    let selection = ccr
+        .public_key
+        .authenticator_selection
+        .get_or_insert_with(Default::default);
+    selection.resident_key = Some(webauthn_rs_proto::ResidentKeyRequirement::Required);
+    selection.require_resident_key = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SoftPasskey` keeps no resident keys: relax the discoverable-credential
+    /// request, after checking it is there.
+    fn soft(mut ccr: CreationChallengeResponse) -> CreationChallengeResponse {
+        let selection = ccr.public_key.authenticator_selection.as_mut().unwrap();
+        assert!(selection.require_resident_key);
+        selection.resident_key = Some(webauthn_rs_proto::ResidentKeyRequirement::Discouraged);
+        selection.require_resident_key = false;
+        ccr
+    }
     use brigid_crypto::MasterKey;
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -279,7 +306,9 @@ mod tests {
     ) -> Passkey {
         let user_id = Uuid::new_v4();
         let (ccr, reg_state) = svc.begin_registration(user_id, username, None).unwrap();
-        let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+        let reg_resp = auth_client
+            .do_registration(rp_origin.clone(), soft(ccr))
+            .unwrap();
         svc.finish_registration(&reg_state, &reg_resp).unwrap()
     }
 
@@ -291,7 +320,9 @@ mod tests {
         let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
         let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
-        let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+        let reg_resp = auth_client
+            .do_registration(rp_origin.clone(), soft(ccr))
+            .unwrap();
         let passkey = svc.finish_registration(&reg_state, &reg_resp).unwrap();
 
         let creds = vec![passkey];
@@ -318,7 +349,9 @@ mod tests {
         let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
         let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
-        let reg_resp = auth_client.do_registration(rp_origin.clone(), ccr).unwrap();
+        let reg_resp = auth_client
+            .do_registration(rp_origin.clone(), soft(ccr))
+            .unwrap();
         let passkey = svc.finish_registration(&reg_state, &reg_resp).unwrap();
 
         // SoftPasskey keeps no resident keys, so it needs the credential named
@@ -360,7 +393,7 @@ mod tests {
         let bob_key = svc
             .finish_registration(
                 &reg_state,
-                &other.do_registration(rp_origin.clone(), ccr).unwrap(),
+                &other.do_registration(rp_origin.clone(), soft(ccr)).unwrap(),
             )
             .unwrap();
         let (rcr, state) = svc.begin_discoverable_authentication().unwrap();
@@ -400,7 +433,9 @@ mod tests {
         let (_ccr_b, state_b) = svc.begin_registration(uid, "bob", None).unwrap();
 
         // Respond to challenge A, but try to finish with state B → mismatch.
-        let resp_a = auth_a.do_registration(rp_origin.clone(), ccr_a).unwrap();
+        let resp_a = auth_a
+            .do_registration(rp_origin.clone(), soft(ccr_a))
+            .unwrap();
         let _ = auth_b; // suppress unused warning
         let result = svc.finish_registration(&state_b, &resp_a);
         assert!(result.is_err());

@@ -77,7 +77,9 @@ mod tests {
     fn the_key_is_multibase_with_the_ed25519_prefix() {
         let doc = did_root_document_handler("brig.id", &sample_key()).unwrap();
         let mb = &doc.verification_method[0].public_key_multibase;
-        let decoded = bs58::decode(mb.strip_prefix('z').unwrap()).into_vec().unwrap();
+        let decoded = bs58::decode(mb.strip_prefix('z').unwrap())
+            .into_vec()
+            .unwrap();
         assert_eq!(&decoded[..2], &MULTICODEC_ED25519);
         assert_eq!(&decoded[2..], &sample_key());
     }
