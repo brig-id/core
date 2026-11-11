@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Credential, Identity, User},
+    model::{Credential, Identity, StoredOidcKey, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,13 @@ use crate::{
 /// `Result` is an artefact of the RustCrypto API surface.
 fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
     brigid_crypto::hkdf::derive_user_key(master, user_id.as_bytes(), b"store-fields")
+        .map_err(crate::Error::from)
+}
+
+/// The key that encrypts OIDC signing seeds: derived from the master key with
+/// a fixed context, so it changes (and the seeds are re-encrypted) on rotation.
+fn oidc_seed_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
+    brigid_crypto::hkdf::derive_user_key(master, b"oidc-signing-keys", b"store-fields")
         .map_err(crate::Error::from)
 }
 
@@ -605,6 +612,74 @@ impl EncryptedStore {
         fetch_credential_labels(&self.pool, &self.master, user_id).await
     }
 
+    // -- OIDC signing keys (core#22) ------------------------------------------
+
+    /// Every stored signing key, the current one first, then retired ones,
+    /// newest first.
+    pub async fn oidc_signing_keys(&self) -> Result<Vec<StoredOidcKey>> {
+        let rows = sqlx::query(
+            "SELECT kid, seed, created_at, retired_at FROM oidc_keys \
+             ORDER BY retired_at IS NOT NULL, created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let key = oidc_seed_key(&self.master)?;
+        let parse =
+            |s: String| OffsetDateTime::parse(&s, &Rfc3339).map_err(|e| Error::Time(e.to_string()));
+        rows.into_iter()
+            .map(|row| {
+                let plain = Zeroizing::new(dec(&key, &row.try_get::<Vec<u8>, _>("seed")?)?);
+                let seed: [u8; 32] = plain
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::InvalidBlob)?;
+                Ok(StoredOidcKey {
+                    kid: row.try_get("kid")?,
+                    seed: Zeroizing::new(seed),
+                    created_at: parse(row.try_get("created_at")?)?,
+                    retired_at: row
+                        .try_get::<Option<String>, _>("retired_at")?
+                        .map(parse)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Store `seed` as the new current signing key and retire the previous
+    /// current one (it keeps verifying until [`Self::prune_oidc_keys`]).
+    pub async fn add_oidc_signing_key(&self, kid: &str, seed: &[u8; 32]) -> Result<()> {
+        let key = oidc_seed_key(&self.master)?;
+        let now = fmt_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE oidc_keys SET retired_at = ? WHERE retired_at IS NULL")
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO oidc_keys (kid, seed, created_at) VALUES (?, ?, ?)")
+            .bind(kid)
+            .bind(enc(&key, seed)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_unique)?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete keys retired before `before` (their grace period is over: every
+    /// token they signed has expired). Returns how many were deleted.
+    pub async fn prune_oidc_keys(&self, before: OffsetDateTime) -> Result<u64> {
+        // RFC 3339 UTC timestamps written by this store compare correctly as
+        // text: same format, same offset.
+        let result =
+            sqlx::query("DELETE FROM oidc_keys WHERE retired_at IS NOT NULL AND retired_at < ?")
+                .bind(fmt_time(before)?)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn store_identity(&self, identity: &Identity) -> Result<()> {
         store_identity(&self.pool, &self.master, identity).await
     }
@@ -849,6 +924,21 @@ impl EncryptedStore {
                 .bind(name)
                 .bind(description)
                 .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let oidc_rows = sqlx::query("SELECT kid, seed FROM oidc_keys")
+            .fetch_all(&mut *tx)
+            .await?;
+        let old_oidc = oidc_seed_key(&self.master)?;
+        let new_oidc = oidc_seed_key(&new_master)?;
+        for row in oidc_rows {
+            let kid: String = row.try_get("kid")?;
+            let seed = Zeroizing::new(dec(&old_oidc, &row.try_get::<Vec<u8>, _>("seed")?)?);
+            sqlx::query("UPDATE oidc_keys SET seed = ? WHERE kid = ?")
+                .bind(enc(&new_oidc, &seed)?)
+                .bind(kid)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1495,6 +1585,49 @@ mod tests {
 
     fn new_master() -> MasterKey {
         MasterKey::from_hex(&"cd".repeat(32)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oidc_keys_rotate_retire_prune_and_survive_master_rotation() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        assert!(store.oidc_signing_keys().await.unwrap().is_empty());
+
+        store.add_oidc_signing_key("k1", &[1u8; 32]).await.unwrap();
+        store.add_oidc_signing_key("k2", &[2u8; 32]).await.unwrap();
+        let keys = store.oidc_signing_keys().await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].kid, "k2", "current key first");
+        assert!(keys[0].retired_at.is_none());
+        assert_eq!(*keys[1].seed, [1u8; 32]);
+        assert!(keys[1].retired_at.is_some(), "the previous key is retired");
+
+        // The seed is not stored in clear.
+        let raw: Vec<Vec<u8>> = sqlx::query_scalar("SELECT seed FROM oidc_keys")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            raw.iter()
+                .all(|r| r.as_slice() != [1u8; 32] && r.as_slice() != [2u8; 32])
+        );
+
+        store.rotate_master_key(new_master()).await.unwrap();
+        let keys = store.oidc_signing_keys().await.unwrap();
+        assert_eq!(
+            *keys[0].seed, [2u8; 32],
+            "seeds re-encrypted under the new key"
+        );
+
+        // Pruning only drops retired keys older than the cut-off.
+        let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        assert_eq!(store.prune_oidc_keys(past).await.unwrap(), 0);
+        let future = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        assert_eq!(store.prune_oidc_keys(future).await.unwrap(), 1);
+        let keys = store.oidc_signing_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kid, "k2");
     }
 
     #[tokio::test]

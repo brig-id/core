@@ -67,7 +67,11 @@ pub(crate) const PENDING_SESSION_MAX_CAPACITY: usize = 10_000;
 pub struct AppState {
     pub store: Arc<EncryptedStore>,
     pub webauthn: Arc<brigid_webauthn::WebauthnService>,
+    /// The key that signs new tokens.
     pub oidc_key: Arc<OidcSigningKey>,
+    /// Keys retired by a rotation but still within their grace period: tokens
+    /// they signed still verify and they stay in the JWKS (core#22).
+    pub retired_oidc_keys: Vec<Arc<OidcSigningKey>>,
     pub jti_store: Arc<Mutex<JtiStore>>,
     pub base_url: Url,
     /// Pre-computed VSID salt — caller must use `brigid_identity::derive_vsid_salt(&master)`.
@@ -95,6 +99,7 @@ impl AppState {
             store: Arc::new(store),
             webauthn: Arc::new(webauthn),
             oidc_key: Arc::new(oidc_key),
+            retired_oidc_keys: Vec::new(),
             jti_store: Arc::new(Mutex::new(JtiStore::new())),
             base_url,
             vsid_salt,
@@ -105,6 +110,20 @@ impl AppState {
             // Caddy (or another trusted proxy) terminates the public TLS edge.
             trust_forwarded_for: false,
         }
+    }
+
+    /// Keys retired by a rotation that must keep verifying their tokens.
+    #[must_use]
+    pub fn with_retired_oidc_keys(mut self, keys: Vec<OidcSigningKey>) -> Self {
+        self.retired_oidc_keys = keys.into_iter().map(Arc::new).collect();
+        self
+    }
+
+    /// The current key followed by the retired ones still in grace.
+    pub fn oidc_verification_keys(&self) -> Vec<&OidcSigningKey> {
+        std::iter::once(self.oidc_key.as_ref())
+            .chain(self.retired_oidc_keys.iter().map(AsRef::as_ref))
+            .collect()
     }
 
     /// Evict pending sessions older than [`PENDING_SESSION_TTL`].

@@ -143,6 +143,25 @@ pub fn decode_token(
     Ok(claims)
 }
 
+/// [`decode_token`] against a set of keys: the current one and those retired
+/// within the grace period of a rotation. The key is chosen by the token's
+/// `kid` header; a token without `kid`, or with an unknown one, is rejected.
+pub fn decode_token_with_keys(
+    jwt: &str,
+    expected_issuer: &str,
+    expected_aud: Option<&str>,
+    keys: &[&OidcSigningKey],
+    jti_store: &JtiStore,
+) -> Result<Claims> {
+    let header = jsonwebtoken::decode_header(jwt)?;
+    let kid = header.kid.ok_or(Error::UnknownKey)?;
+    let key = keys
+        .iter()
+        .find(|k| k.kid() == kid)
+        .ok_or(Error::UnknownKey)?;
+    decode_token(jwt, expected_issuer, expected_aud, key, jti_store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +410,70 @@ mod tests {
                 &mut store
             )
             .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_key_tests {
+    use super::*;
+    use brigid_crypto::MasterKey;
+    use brigid_identity::{compute_vsid, derive_vsid_salt};
+
+    fn token_from(key: &OidcSigningKey) -> String {
+        let salt = derive_vsid_salt(&MasterKey::from_hex(&"ab".repeat(32)).unwrap());
+        let vsid = compute_vsid("did:web:example.com", "c", &salt).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        issue_token(
+            &IssuanceParams {
+                vsid: &vsid,
+                issuer: "https://example.com",
+                client_id: "c",
+                server: "example.com",
+                ttl_secs: 3600,
+            },
+            key,
+            now,
+        )
+        .unwrap()
+    }
+
+    /// During a rotation, tokens signed by the retired key still verify; a
+    /// key outside the set does not, even if it reuses a known `kid`.
+    #[test]
+    fn picks_the_key_by_kid() {
+        let old = OidcSigningKey::from_seed(&[1u8; 32]);
+        let new = OidcSigningKey::from_seed(&[2u8; 32]);
+        let store = JtiStore::new();
+        let keys = [&new, &old];
+        for k in [&old, &new] {
+            decode_token_with_keys(&token_from(k), "https://example.com", None, &keys, &store)
+                .unwrap();
+        }
+        let stranger = OidcSigningKey::from_seed(&[3u8; 32]);
+        assert!(matches!(
+            decode_token_with_keys(
+                &token_from(&stranger),
+                "https://example.com",
+                None,
+                &keys,
+                &store
+            ),
+            Err(Error::UnknownKey)
+        ));
+        let impostor = OidcSigningKey::from_raw_bytes(old.kid().to_string(), &[4u8; 32]);
+        assert!(
+            decode_token_with_keys(
+                &token_from(&impostor),
+                "https://example.com",
+                None,
+                &keys,
+                &store
+            )
+            .is_err()
         );
     }
 }

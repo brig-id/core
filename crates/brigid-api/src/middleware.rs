@@ -6,7 +6,7 @@ use axum::{
     extract::FromRequestParts,
     http::{HeaderMap, request::Parts},
 };
-use brigid_oidc::{Claims, decode_token};
+use brigid_oidc::{Claims, decode_token_with_keys};
 
 use crate::{error::ApiError, state::AppState};
 
@@ -42,8 +42,14 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedClaims {
         // already prove the issuer minted the token.
         let claims = {
             let jti_store = state.jti_store.lock().unwrap_or_else(|e| e.into_inner());
-            decode_token(&token, &issuer, None, &state.oidc_key, &jti_store)
-                .map_err(|_| ApiError::Unauthorized)?
+            decode_token_with_keys(
+                &token,
+                &issuer,
+                None,
+                &state.oidc_verification_keys(),
+                &jti_store,
+            )
+            .map_err(|_| ApiError::Unauthorized)?
         }; // MutexGuard dropped here, before any .await
 
         // Also check the persistent DB blacklist so revocations survive restarts.

@@ -22,6 +22,8 @@ rand_core = "0.10"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 base64ct = { version = "1", features = ["alloc"] }
 pkcs8 = { version = "0.11", features = ["alloc"] }
+# RFC 7638 JWK thumbprint (the `kid` of stored signing keys).
+sha2 = "0.11"
 
 [dev-dependencies]
 brigid-crypto.workspace = true
