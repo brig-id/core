@@ -8,6 +8,8 @@ pub enum Error {
     Expired,
     #[error("invalid audience")]
     InvalidAudience,
+    #[error("token signed by an unknown key")]
+    UnknownKey,
     #[error("JTI replay detected")]
     JtiReplay,
     #[error("invalid token TTL (overflow or out of i64 range)")]

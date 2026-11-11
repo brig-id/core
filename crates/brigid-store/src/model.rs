@@ -40,3 +40,12 @@ pub struct Identity {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
+
+/// A stored OIDC signing key: its `kid` and decrypted 32-byte seed.
+/// `retired_at` is `None` for the current key.
+pub struct StoredOidcKey {
+    pub kid: String,
+    pub seed: zeroize::Zeroizing<[u8; 32]>,
+    pub created_at: OffsetDateTime,
+    pub retired_at: Option<OffsetDateTime>,
+}
