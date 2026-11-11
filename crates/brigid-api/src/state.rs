@@ -14,8 +14,26 @@ use webauthn_rs::prelude::{
     DiscoverableAuthentication, PasskeyAuthentication, PasskeyRegistration,
 };
 
+/// What a registration ceremony was started for. Each `finish` endpoint
+/// accepts only its own kind, so a session begun to add a passkey (or to
+/// recover an account) cannot be completed as something else.
+pub enum RegistrationPurpose {
+    /// A new account (`/auth/register/*`).
+    Signup,
+    /// One more passkey for a signed-in account (`/auth/passkeys/add/*`).
+    AddPasskey,
+    /// A passkey enrolled with a recovery code (`/auth/recovery/*`). The
+    /// code's recovery id is consumed at `finish`; `client_id` is the audience
+    /// of the token returned then, bound here like a login's.
+    Recovery {
+        recovery_id: [u8; brigid_identity::recovery::RECOVERY_ID_LEN],
+        client_id: String,
+    },
+}
+
 /// In-flight registration session keyed by a temporary session UUID.
 pub struct PendingRegistration {
+    pub purpose: RegistrationPurpose,
     pub user_id: Uuid,
     pub username: String,
     pub server: String,

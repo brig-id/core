@@ -21,7 +21,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 use url::Url;
 
 use crate::{
-    routes::{auth, discovery, health, identities},
+    routes::{auth, discovery, health, identities, recovery},
     state::AppState,
 };
 
@@ -184,6 +184,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/auth/passkeys/add/finish",
             post(auth::add_credential_finish),
         )
+        // Recovery is a ceremony too, and its code is what an attacker would
+        // guess: it shares this stricter limit (ADR-004: no lockout).
+        .route("/auth/recovery/begin", post(recovery::begin))
+        .route("/auth/recovery/finish", post(recovery::finish))
         .layer(limit(Duration::from_secs(3), 5));
 
     let account_routes = Router::new()
@@ -196,6 +200,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             delete(auth::delete_passkey).patch(auth::rename_passkey),
         )
         .route("/auth/passkeys/add/begin", post(auth::add_credential_begin))
+        .route(
+            "/account/recovery-code",
+            get(recovery::status).post(recovery::create_code),
+        )
         .route(
             "/account/identity-templates",
             get(identities::list_templates),

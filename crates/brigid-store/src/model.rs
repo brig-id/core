@@ -49,3 +49,12 @@ pub struct StoredOidcKey {
     pub created_at: OffsetDateTime,
     pub retired_at: Option<OffsetDateTime>,
 }
+
+/// Where an account stands with its recovery code (ADR-004).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryStatus {
+    /// When the current code was generated; `None` when there is no usable code.
+    pub code_created_at: Option<OffsetDateTime>,
+    /// When a code was last used to recover the account.
+    pub last_used_at: Option<OffsetDateTime>,
+}

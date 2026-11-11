@@ -2114,3 +2114,204 @@ async fn identity_tokens_have_distinct_subjects() {
     .await;
     assert_eq!(sub(j["id_token"].as_str().unwrap()), subs[0]);
 }
+
+// ---------------------------------------------------------------------------
+// Account recovery (ADR-004)
+// ---------------------------------------------------------------------------
+
+/// The whole recovery path: create a code, lose the passkey, enrol a new one
+/// with the code, sign in; the code is consumed and a typo or a wrong code is
+/// refused without a lookup or with a plain 401.
+#[tokio::test]
+async fn recovery_code_enrols_a_new_passkey_once() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut first_device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (token, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "recover@localhost",
+        &rp_origin,
+        &mut first_device,
+        "10.52.1",
+    )
+    .await;
+
+    // No code yet.
+    let uri = format!("/account/recovery-code?user_id={user_id}");
+    let (status, j) = identity_request(&app, "GET", &uri, Some(&token), "10.52.2.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(j["code_created_at"].is_null());
+
+    // A code needs a session.
+    let (status, _) = identity_request(&app, "POST", &uri, None, "10.52.2.2", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, j) = identity_request(&app, "POST", &uri, Some(&token), "10.52.2.3", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let code = j["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 49, "{code}");
+    let (_, j) = identity_request(&app, "GET", &uri, Some(&token), "10.52.2.4", None).await;
+    assert!(j["code_created_at"].is_string());
+
+    // A typo is caught before any lookup; a well-formed wrong code is a 401.
+    let mut typo: Vec<char> = code.chars().collect();
+    typo[0] = if typo[0] == 'A' { 'C' } else { 'A' };
+    let typo: String = typo.into_iter().collect();
+    let begin = |code: &str| serde_json::json!({ "code": code, "client_id": "test-client" });
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        "10.52.3.1",
+        Some(begin(&typo)),
+    )
+    .await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED,
+        "{status}"
+    );
+    let other = brigid_identity::RecoveryCode::generate().unwrap().display();
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        "10.52.3.2",
+        Some(begin(&other)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The first device is lost: a new one enrols with the code.
+    let mut new_device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        "10.52.4.1",
+        Some(begin(&code.to_lowercase())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let session_id = j["session_id"].clone();
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let cred = new_device.do_registration(rp_origin.clone(), ccr).unwrap();
+
+    // A recovery session can't be finished as a signup.
+    let finish_body = serde_json::json!({
+        "session_id": session_id,
+        "credential": cred,
+        "label": "New phone",
+    });
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/finish",
+        None,
+        "10.52.4.2",
+        Some(finish_body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/finish",
+        None,
+        "10.52.4.3",
+        Some(finish_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["user_id"].as_str().unwrap(), user_id.to_string());
+    let new_token = j["id_token"].as_str().unwrap().to_string();
+
+    // Signed in: two passkeys now, the new one named.
+    let (status, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/passkeys?user_id={user_id}"),
+        Some(&new_token),
+        "10.52.5.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let passkeys = j.as_array().unwrap();
+    assert_eq!(passkeys.len(), 2);
+    assert!(passkeys.iter().any(|p| p["label"] == "New phone"));
+
+    // Consumed: the same code no longer works, and the status says when it was used.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        "10.52.6.1",
+        Some(begin(&code)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, j) = identity_request(&app, "GET", &uri, Some(&new_token), "10.52.6.2", None).await;
+    assert!(j["code_created_at"].is_null());
+    assert!(j["last_used_at"].is_string());
+}
+
+/// A session begun to add a passkey can't be completed as a new account.
+#[tokio::test]
+async fn registration_sessions_finish_only_as_what_they_began() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let app = build_router(make_state().await, &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (token, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "purpose@localhost",
+        &rp_origin,
+        &mut device,
+        "10.53.1",
+    )
+    .await;
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/begin",
+        Some(&token),
+        "10.53.2.1",
+        Some(serde_json::json!({ "user_id": user_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let mut second = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let cred = second.do_registration(rp_origin.clone(), ccr).unwrap();
+    let body = serde_json::json!({ "session_id": j["session_id"], "credential": cred });
+    for (uri, ip) in [
+        ("/auth/register/finish", "10.53.3.1"),
+        ("/auth/recovery/finish", "10.53.3.2"),
+    ] {
+        let (status, _) = identity_request(&app, "POST", uri, None, ip, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    // Still finishable as what it began.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/finish",
+        None,
+        "10.53.3.3",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
