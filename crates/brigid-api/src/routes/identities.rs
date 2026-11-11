@@ -275,6 +275,61 @@ pub async fn update_identity(
     Ok((StatusCode::OK, Json(IdentityView::from(stored))))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IdentityTokenRequest {
+    pub user_id: Uuid,
+    /// The relying party that will receive the token (`aud`).
+    pub client_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdentityTokenResponse {
+    pub id_token: String,
+}
+
+/// `POST /account/identities/{id}/token`: an ID token **for this identity**
+/// at `client_id` (ADR-002). Its `sub` is the VSID of the identity's DID, so
+/// two identities of one account are different subjects at the same relying
+/// party, and the account itself is never presented.
+pub async fn identity_token(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    Path(id): Path<Uuid>,
+    Json(body): Json<IdentityTokenRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize(&state, &claims, body.user_id).await?;
+    if body.client_id.is_empty() {
+        return Err(ApiError::BadRequest("client_id is required".into()));
+    }
+    let identity = state
+        .store
+        .fetch_identity(body.user_id, id)
+        .await
+        .map_err(map_store)?
+        .ok_or(ApiError::NotFound)?;
+    let server = state
+        .base_url
+        .host_str()
+        .ok_or_else(|| ApiError::Internal("base_url has no host".into()))?
+        .to_string();
+
+    let vsid =
+        compute_vsid(&identity.did, &body.client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let issuer = state.base_url.to_string();
+    let issuer = issuer.trim_end_matches('/').to_string();
+    let params = brigid_oidc::IssuanceParams {
+        vsid: &vsid,
+        issuer: &issuer,
+        client_id: &body.client_id,
+        server: &server,
+        ttl_secs: 3600,
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let id_token =
+        brigid_oidc::issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
+    Ok((StatusCode::OK, Json(IdentityTokenResponse { id_token })))
+}
+
 /// `DELETE /account/identities/{id}?user_id=`
 pub async fn delete_identity(
     State(state): State<Arc<AppState>>,

@@ -200,6 +200,10 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}",
             patch(identities::update_identity).delete(identities::delete_identity),
         )
+        .route(
+            "/account/identities/{id}/token",
+            post(identities::identity_token),
+        )
         .layer(GovernorLayer::new(governor_conf));
 
     let discovery_routes = Router::new()

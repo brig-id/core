@@ -299,6 +299,7 @@ name = "brigid-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64ct",
  "brigid-crypto",
  "brigid-did",
  "brigid-identity",
