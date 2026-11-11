@@ -698,3 +698,100 @@ pub async fn logout(
         .blacklist(&claims.jti, claims.exp);
     Ok(StatusCode::OK)
 }
+
+#[derive(Deserialize)]
+pub struct SessionQuery {
+    pub user_id: Uuid,
+}
+
+#[derive(Serialize)]
+pub struct SessionResponse {
+    pub user_id: Uuid,
+    /// Unix time at which the presented token expires.
+    pub expires_at: i64,
+}
+
+/// The token's account, or `401` when it no longer exists: a session whose
+/// account was deleted must end cleanly, not linger client-side (core#47).
+async fn session_account(
+    state: &AppState,
+    claims: &brigid_oidc::Claims,
+    user_id: Uuid,
+) -> Result<User, ApiError> {
+    let user = state
+        .store
+        .fetch_user(user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::Unauthorized)?;
+    let expected_vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    if expected_vsid.as_str() != claims.sub {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(user)
+}
+
+/// `GET /auth/session?user_id=`: is this session still good? `200` with its
+/// expiry, or `401` (expired, revoked, or the account is gone) so the client
+/// signs out.
+pub async fn session(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    axum::extract::Query(q): axum::extract::Query<SessionQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = session_account(&state, &claims, q.user_id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(SessionResponse {
+            user_id: user.id,
+            expires_at: claims.exp,
+        }),
+    ))
+}
+
+/// `POST /auth/session/refresh?user_id=`: swap a still-valid token for a fresh
+/// one (same audience, new expiry) and revoke the old one, so an active
+/// session slides while an idle one expires.
+pub async fn refresh_session(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedClaims(claims): AuthenticatedClaims,
+    axum::extract::Query(q): axum::extract::Query<SessionQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = session_account(&state, &claims, q.user_id).await?;
+
+    let issuer = state.base_url.to_string();
+    let issuer = issuer.trim_end_matches('/').to_string();
+    let vsid =
+        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let params = IssuanceParams {
+        vsid: &vsid,
+        issuer: &issuer,
+        client_id: &claims.aud,
+        server: &user.server,
+        ttl_secs: 3600,
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
+
+    // Revoke the old token only once the new one exists (durable first, as
+    // in logout).
+    state
+        .store
+        .blacklist_jti(&claims.jti, claims.exp)
+        .await
+        .map_err(|e| internal!(e))?;
+    state
+        .jti_store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .blacklist(&claims.jti, claims.exp);
+
+    Ok((
+        StatusCode::OK,
+        Json(LoginResponse {
+            id_token,
+            user_id: user.id,
+        }),
+    ))
+}

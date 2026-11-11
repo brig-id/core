@@ -1886,3 +1886,83 @@ async fn discoverable_login_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// core#47: a session can be checked and refreshed; the old token dies on
+/// refresh, and a session whose account is gone answers 401.
+#[tokio::test]
+async fn session_check_refresh_and_deleted_account() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (token, user_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "sess@localhost",
+        &rp_origin,
+        &mut dev,
+        "10.45.1",
+    )
+    .await;
+
+    let (status, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/session?user_id={user_id}"),
+        Some(&token),
+        "10.45.2.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(j["expires_at"].as_i64().unwrap() > 0);
+
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        &format!("/auth/session/refresh?user_id={user_id}"),
+        Some(&token),
+        "10.45.2.2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let fresh = j["id_token"].as_str().unwrap().to_string();
+    assert_ne!(fresh, token);
+
+    // The old token is revoked, the new one works.
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/session?user_id={user_id}"),
+        Some(&token),
+        "10.45.2.3",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/session?user_id={user_id}"),
+        Some(&fresh),
+        "10.45.2.4",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another account's id: refused.
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/session?user_id={}", Uuid::new_v4()),
+        Some(&fresh),
+        "10.45.3.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

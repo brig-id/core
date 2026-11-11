@@ -173,6 +173,8 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/auth/login/begin", post(auth::login_begin))
         .route("/auth/login/finish", post(auth::login_finish))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/session", get(auth::session))
+        .route("/auth/session/refresh", post(auth::refresh_session))
         .route("/auth/passkeys", get(auth::list_passkeys))
         .route(
             "/auth/passkeys/{id}",
