@@ -723,6 +723,53 @@ async fn rate_limit_triggers_after_burst() {
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
+/// The account routes have their own, larger quota: a client that used up
+/// the ceremonies' burst can still load its account pages.
+#[tokio::test]
+async fn account_routes_do_not_share_the_ceremony_quota() {
+    let state = make_state().await;
+    let app = build_router(state, &[]);
+    let get = |uri: &'static str| {
+        Request::builder()
+            .uri(uri)
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let begin = || {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/login/begin")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "10.0.0.2")
+            .body(Body::from(
+                r#"{"username":"test@localhost","client_id":"c"}"#,
+            ))
+            .unwrap()
+    };
+
+    for _ in 0..5 {
+        app.clone().oneshot(begin()).await.unwrap();
+    }
+    let throttled = app.clone().oneshot(begin()).await.unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 30 account requests in a row pass; the 31st is throttled.
+    for _ in 0..30 {
+        let resp = app
+            .clone()
+            .oneshot(get("/account/identity-templates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .oneshot(get("/account/identity-templates"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
 // ---------------------------------------------------------------------------
 // CORS
 // ---------------------------------------------------------------------------

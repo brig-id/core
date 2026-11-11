@@ -151,31 +151,42 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             .allow_headers([CONTENT_TYPE, AUTHORIZATION])
     };
 
-    // Rate limiter for /auth/* routes: 1 token every 3 s per IP, burst of 5.
-    // Sustained rate = 60s / 3s = 20 req/min per IP, matching the security
-    // requirement in AGENTS.md §"Hard security constraints". The previous
-    // `.per_second(3)` configured a sustained 3 req/s = 180 req/min, which
-    // violated that requirement. `tower_governor::GovernorConfigBuilder` does
-    // not expose a sub-per-second helper, so the replenishment cadence is set
-    // via `period(Duration)` directly.
-    let governor_conf = GovernorConfigBuilder::default()
-        .period(Duration::from_secs(3))
-        .burst_size(5)
-        .key_extractor(ForwardedForExtractor {
-            trust_header: state.trust_forwarded_for,
-        })
-        .finish()
-        // `finish()` only returns `None` when `burst_size` or `period` is
-        // zero — both are non-zero literals above (5 and 3s), so this
-        // always succeeds.
-        .expect("burst_size and period are both non-zero literals above");
+    // Two rate limits, each per client IP.
+    //
+    // The WebAuthn ceremonies are open to anyone and each one costs a
+    // challenge held in memory or a signature check: 20 requests per minute,
+    // in bursts of 5 (a sign-up followed by a sign-in is 4).
+    //
+    // The account routes need a session and are what the UI calls on every
+    // page (session check, lists, edits): 60 per minute, in bursts of 30.
+    // Sharing the ceremonies' quota would throttle a user who has just
+    // signed in.
+    let limit = |period: Duration, burst: u32| {
+        GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .period(period)
+                .burst_size(burst)
+                .key_extractor(ForwardedForExtractor {
+                    trust_header: state.trust_forwarded_for,
+                })
+                .finish()
+                .expect("period and burst are non-zero"),
+        )
+    };
 
-    // Protected auth routes with rate limiting.
-    let auth_routes = Router::new()
+    let ceremony_routes = Router::new()
         .route("/auth/register/begin", post(auth::register_begin))
         .route("/auth/register/finish", post(auth::register_finish))
         .route("/auth/login/begin", post(auth::login_begin))
         .route("/auth/login/finish", post(auth::login_finish))
+        // Carries no token: the pending ceremony was authorised at `begin`.
+        .route(
+            "/auth/passkeys/add/finish",
+            post(auth::add_credential_finish),
+        )
+        .layer(limit(Duration::from_secs(3), 5));
+
+    let account_routes = Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/session", get(auth::session))
         .route("/auth/session/refresh", post(auth::refresh_session))
@@ -185,10 +196,6 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             delete(auth::delete_passkey).patch(auth::rename_passkey),
         )
         .route("/auth/passkeys/add/begin", post(auth::add_credential_begin))
-        .route(
-            "/auth/passkeys/add/finish",
-            post(auth::add_credential_finish),
-        )
         .route(
             "/account/identity-templates",
             get(identities::list_templates),
@@ -205,7 +212,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}/token",
             post(identities::identity_token),
         )
-        .layer(GovernorLayer::new(governor_conf));
+        .layer(limit(Duration::from_secs(1), 30));
 
     let discovery_routes = Router::new()
         .route(
@@ -220,7 +227,8 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/ready", get(health::ready));
 
     Router::new()
-        .merge(auth_routes)
+        .merge(ceremony_routes)
+        .merge(account_routes)
         .merge(discovery_routes)
         .merge(health_routes)
         // `cors` is added before `security_headers` so that `security_headers`
