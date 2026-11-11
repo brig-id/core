@@ -53,10 +53,7 @@ pub fn validate_description(description: &str) -> Result<Option<String>> {
 }
 
 fn is_slug(s: &str, max: usize) -> bool {
-    !s.is_empty()
-        && s.len() <= max
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    s.len() <= max && helpers4::validate::is_slug(s)
 }
 
 /// Validates a logo reference. Only `icon:<style>:<name>` is accepted (an icon

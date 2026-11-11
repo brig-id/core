@@ -8,10 +8,7 @@ use sqlx::{
     Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{
-    str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::str::FromStr;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -39,6 +36,13 @@ fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
 fn oidc_seed_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
     brigid_crypto::hkdf::derive_user_key(master, b"oidc-signing-keys", b"store-fields")
         .map_err(crate::Error::from)
+}
+
+/// Unix time in seconds, as the `exp` column of `jti_blacklist` stores it. A
+/// clock set before 1970 reads as 0: nothing is pruned and every revocation
+/// still applies.
+fn now_unix() -> i64 {
+    helpers4::time::unix_now().map_or(0, |secs| secs as i64)
 }
 
 /// The key that encrypts the rows of `server_secrets`.
@@ -997,10 +1001,7 @@ impl EncryptedStore {
     /// Expired entries (exp < now) are pruned on each insert to keep the table
     /// bounded.
     pub async fn blacklist_jti(&self, jti: &str, exp: i64) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_unix();
         // Prune expired entries to keep the table bounded.
         sqlx::query("DELETE FROM jti_blacklist WHERE exp <= ?")
             .bind(now)
@@ -1017,10 +1018,7 @@ impl EncryptedStore {
     /// Returns `true` if the JTI is in the persistent blacklist and has not
     /// yet expired.
     pub async fn is_jti_blacklisted(&self, jti: &str) -> Result<bool> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = now_unix();
         let row: Option<(String,)> =
             sqlx::query_as("SELECT jti FROM jti_blacklist WHERE jti = ? AND exp > ?")
                 .bind(jti)

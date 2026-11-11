@@ -7,6 +7,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+helpers4 = { workspace = true, features = ["http"] }
 brigid-store.workspace = true
 brigid-webauthn.workspace = true
 brigid-oidc.workspace = true

@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   master key rotation no longer changes every VSID. A database that already
   holds accounts keeps the value it was using; a new one gets random bytes.
 
+### Changed
+
+- helpers4 replaces local copies of generic code: `Authorization: Bearer`
+  parsing (`brigid-api`), hostname and slug validation (`brigid-identity`),
+  the Unix clock (`brigid-oidc`, `brigid-store`). Visible differences: the
+  `Bearer` scheme is matched case-insensitively and a token with characters
+  outside RFC 6750's set is refused; the server part of a username can no
+  longer be an IP address; an icon name cannot start or end with a hyphen.
+
 ### Fixed
 
 - `brigid-api` — `POST /auth/register/begin` refuses a username on another
