@@ -101,9 +101,12 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
-            // Static CSP for the JSON API. The Qwik UI (phase 2, `brig-id/web`)
-            // is served as static files — `script-src 'self'` holds with no
-            // nonce needed because Qwik generates no inline scripts in SSG mode.
+            // Strict CSP for the routes defined here, which return JSON only:
+            // no inline sources are needed. The Qwik UI does emit inline
+            // scripts and styles; whoever serves it sets its own CSP on those
+            // responses (server-leaf builds it from the UI build's
+            // `dist/csp-hashes.json`, allowing exactly those by hash), and
+            // `if_not_present` keeps this one off them.
             //
             // img-src/connect-src additionally allow Unsplash: the login/
             // register pages fetch a daily background photo directly from
