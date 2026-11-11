@@ -8,8 +8,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use brigid_did::build_did_web;
-use brigid_identity::{RootId, compute_vsid};
+use brigid_identity::{RootId, account_subject};
 use brigid_oidc::{IssuanceParams, issue_token};
 use brigid_store::User;
 use brigid_webauthn::{load_passkeys, passkey_to_credential, update_passkey};
@@ -213,13 +212,11 @@ pub async fn register_finish(
     // Use the same user_id that was bound into the WebAuthn challenge —
     // the passkey's stored user handle must match the one in the authenticator.
     let user_id = pending.user_id;
-    let did_web = build_did_web(&pending.username, &pending.server).to_string();
 
     let user = User {
         id: user_id,
         username: pending.username,
         server: pending.server,
-        did_web,
         created_at: OffsetDateTime::now_utc(),
     };
 
@@ -230,7 +227,7 @@ pub async fn register_finish(
     // with "no credentials"). The store-level transaction commits both or
     // neither.
     let cred = passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
-    let identities = crate::routes::identities::starter_identities(&state, user_id)?;
+    let identities = crate::routes::identities::starter_identities(user_id);
     state
         .store
         .register_user_with_credential(&user, &cred, &identities)
@@ -298,9 +295,8 @@ pub async fn add_credential_begin(
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
 
-    let expected_vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
-    if expected_vsid.as_str() != claims.sub {
+    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
+    if expected_sub.as_str() != claims.sub {
         return Err(ApiError::Forbidden);
     }
 
@@ -433,9 +429,8 @@ pub async fn rename_passkey(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
-    let expected_vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
-    if expected_vsid.as_str() != claims.sub {
+    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
+    if expected_sub.as_str() != claims.sub {
         return Err(ApiError::Forbidden);
     }
     state
@@ -602,7 +597,7 @@ pub async fn login_finish(
         .await
         .map_err(|e| internal!(e))?;
     if existing.is_empty() {
-        for identity in crate::routes::identities::starter_identities(&state, user.id)? {
+        for identity in crate::routes::identities::starter_identities(user.id) {
             state
                 .store
                 .store_identity(&identity)
@@ -631,8 +626,7 @@ pub(crate) fn account_token(
 ) -> Result<String, ApiError> {
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/');
-    let vsid =
-        compute_vsid(&user.did_web, client_id, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let vsid = account_subject(user.id, client_id, &state.vsid_salt);
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let params = IssuanceParams {
         vsid: &vsid,
@@ -664,9 +658,8 @@ pub async fn delete_passkey(
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
 
-    let expected_vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
-    if expected_vsid.as_str() != claims.sub {
+    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
+    if expected_sub.as_str() != claims.sub {
         return Err(ApiError::Forbidden);
     }
 
@@ -722,9 +715,8 @@ pub async fn list_passkeys(
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
 
-    let expected_vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
-    if expected_vsid.as_str() != claims.sub {
+    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
+    if expected_sub.as_str() != claims.sub {
         return Err(ApiError::Forbidden);
     }
 
@@ -804,9 +796,8 @@ pub(crate) async fn session_account(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::Unauthorized)?;
-    let expected_vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
-    if expected_vsid.as_str() != claims.sub {
+    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
+    if expected_sub.as_str() != claims.sub {
         return Err(ApiError::Unauthorized);
     }
     Ok(user)
@@ -842,8 +833,7 @@ pub async fn refresh_session(
 
     let issuer = state.base_url.to_string();
     let issuer = issuer.trim_end_matches('/').to_string();
-    let vsid =
-        compute_vsid(&user.did_web, &claims.aud, &state.vsid_salt).map_err(|e| internal!(e))?;
+    let vsid = account_subject(user.id, &claims.aud, &state.vsid_salt);
     let params = IssuanceParams {
         vsid: &vsid,
         issuer: &issuer,

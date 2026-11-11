@@ -109,14 +109,13 @@ fn dec(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
 
 /// Encrypt and INSERT a [`User`] into the database.
 ///
-/// `username`, `server`, and `did_web` are encrypted with a per-user
+/// `username` and `server` are encrypted with a per-user
 /// HKDF-derived key before storage. A deterministic `username_index` is
 /// computed and stored to enable lookups without exposing plaintext.
 pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> Result<()> {
     let key = user_key(master, &user.id)?;
     let username_enc = enc(&key, user.username.as_bytes())?;
     let server_enc = enc(&key, user.server.as_bytes())?;
-    let did_web_enc = enc(&key, user.did_web.as_bytes())?;
     let created_at = user
         .created_at
         .format(&Rfc3339)
@@ -124,13 +123,12 @@ pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> R
     let idx = username_index(master, &user.username, &user.server)?;
 
     sqlx::query(
-        "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, username, server, created_at, username_index) \
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(user.id.to_string())
     .bind(username_enc)
     .bind(server_enc)
-    .bind(did_web_enc)
     .bind(created_at)
     .bind(idx)
     .execute(pool)
@@ -164,48 +162,9 @@ pub async fn fetch_user_by_username(
 ) -> Result<Option<User>> {
     let idx = username_index(master, username, server)?;
 
-    let row = sqlx::query(
-        "SELECT id, username, server, did_web, created_at FROM users WHERE username_index = ?",
-    )
-    .bind(&idx)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else { return Ok(None) };
-
-    let id_str: String = row.try_get("id")?;
-    let id: Uuid = id_str.parse()?;
-    let key = user_key(master, &id)?;
-
-    let username_raw: Vec<u8> = row.try_get("username")?;
-    let server_raw: Vec<u8> = row.try_get("server")?;
-    let did_web_raw: Vec<u8> = row.try_get("did_web")?;
-    let created_at_str: String = row.try_get("created_at")?;
-
-    let username = String::from_utf8(dec(&key, &username_raw)?)?;
-    let server = String::from_utf8(dec(&key, &server_raw)?)?;
-    let did_web = String::from_utf8(dec(&key, &did_web_raw)?)?;
-    let created_at =
-        OffsetDateTime::parse(&created_at_str, &Rfc3339).map_err(|e| Error::Time(e.to_string()))?;
-
-    Ok(Some(User {
-        id,
-        username,
-        server,
-        did_web,
-        created_at,
-    }))
-}
-
-/// Fetch a [`User`] by ID, decrypting sensitive fields on read.
-pub async fn fetch_user(
-    pool: &SqlitePool,
-    master: &MasterKey,
-    user_id: Uuid,
-) -> Result<Option<User>> {
     let row =
-        sqlx::query("SELECT id, username, server, did_web, created_at FROM users WHERE id = ?")
-            .bind(user_id.to_string())
+        sqlx::query("SELECT id, username, server, created_at FROM users WHERE username_index = ?")
+            .bind(&idx)
             .fetch_optional(pool)
             .await?;
 
@@ -217,12 +176,10 @@ pub async fn fetch_user(
 
     let username_raw: Vec<u8> = row.try_get("username")?;
     let server_raw: Vec<u8> = row.try_get("server")?;
-    let did_web_raw: Vec<u8> = row.try_get("did_web")?;
     let created_at_str: String = row.try_get("created_at")?;
 
     let username = String::from_utf8(dec(&key, &username_raw)?)?;
     let server = String::from_utf8(dec(&key, &server_raw)?)?;
-    let did_web = String::from_utf8(dec(&key, &did_web_raw)?)?;
     let created_at =
         OffsetDateTime::parse(&created_at_str, &Rfc3339).map_err(|e| Error::Time(e.to_string()))?;
 
@@ -230,7 +187,40 @@ pub async fn fetch_user(
         id,
         username,
         server,
-        did_web,
+        created_at,
+    }))
+}
+
+/// Fetch a [`User`] by ID, decrypting sensitive fields on read.
+pub async fn fetch_user(
+    pool: &SqlitePool,
+    master: &MasterKey,
+    user_id: Uuid,
+) -> Result<Option<User>> {
+    let row = sqlx::query("SELECT id, username, server, created_at FROM users WHERE id = ?")
+        .bind(user_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+
+    let Some(row) = row else { return Ok(None) };
+
+    let id_str: String = row.try_get("id")?;
+    let id: Uuid = id_str.parse()?;
+    let key = user_key(master, &id)?;
+
+    let username_raw: Vec<u8> = row.try_get("username")?;
+    let server_raw: Vec<u8> = row.try_get("server")?;
+    let created_at_str: String = row.try_get("created_at")?;
+
+    let username = String::from_utf8(dec(&key, &username_raw)?)?;
+    let server = String::from_utf8(dec(&key, &server_raw)?)?;
+    let created_at =
+        OffsetDateTime::parse(&created_at_str, &Rfc3339).map_err(|e| Error::Time(e.to_string()))?;
+
+    Ok(Some(User {
+        id,
+        username,
+        server,
         created_at,
     }))
 }
@@ -402,7 +392,7 @@ fn fmt_time(t: OffsetDateTime) -> Result<String> {
     t.format(&Rfc3339).map_err(|e| Error::Time(e.to_string()))
 }
 
-/// Validate and INSERT an [`Identity`]; `did`, `name` and `description` are
+/// Validate and INSERT an [`Identity`]; `name` and `description` are
 /// encrypted with the owning account's key. The account must exist.
 ///
 /// The name is trimmed and the fields validated (`brigid_identity::profile`);
@@ -429,12 +419,11 @@ where
     let key = user_key(master, &identity.account_id)?;
     sqlx::query(
         "INSERT INTO identities \
-         (id, account_id, did, name, logo, description, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, account_id, name, logo, description, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(identity.id.to_string())
     .bind(identity.account_id.to_string())
-    .bind(enc(&key, identity.did.as_bytes())?)
     .bind(enc(&key, name.as_bytes())?)
     .bind(&identity.logo)
     .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
@@ -451,7 +440,6 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
     let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
     let key = user_key(master, &account_id)?;
 
-    let did = String::from_utf8(dec(&key, &row.try_get::<Vec<u8>, _>("did")?)?)?;
     let name = String::from_utf8(dec(&key, &row.try_get::<Vec<u8>, _>("name")?)?)?;
     let description = row
         .try_get::<Option<Vec<u8>>, _>("description")?
@@ -465,7 +453,6 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
     Ok(Identity {
         id,
         account_id,
-        did,
         name,
         logo: row.try_get("logo")?,
         description,
@@ -474,8 +461,7 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
     })
 }
 
-const IDENTITY_COLUMNS: &str =
-    "id, account_id, did, name, logo, description, created_at, updated_at";
+const IDENTITY_COLUMNS: &str = "id, account_id, name, logo, description, created_at, updated_at";
 
 /// Fetch one identity, only if it belongs to `account_id`.
 pub async fn fetch_identity(
@@ -511,7 +497,7 @@ pub async fn fetch_identities(
 }
 
 /// Change an identity's display fields (name, logo, description) and bump
-/// `updated_at`. The `did` never changes. [`Error::NotFound`] when the identity
+/// `updated_at`. [`Error::NotFound`] when the identity
 /// does not exist or belongs to another account.
 pub async fn update_identity(
     pool: &SqlitePool,
@@ -811,7 +797,6 @@ impl EncryptedStore {
         let u_key = user_key(&self.master, &user.id)?;
         let username_enc = enc(&u_key, user.username.as_bytes())?;
         let server_enc = enc(&u_key, user.server.as_bytes())?;
-        let did_web_enc = enc(&u_key, user.did_web.as_bytes())?;
         let created_at = user
             .created_at
             .format(&Rfc3339)
@@ -824,13 +809,12 @@ impl EncryptedStore {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, server, created_at, username_index) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(user.id.to_string())
         .bind(username_enc)
         .bind(server_enc)
-        .bind(did_web_enc)
         .bind(created_at)
         .bind(idx)
         .execute(&mut *tx)
@@ -977,7 +961,7 @@ impl EncryptedStore {
     pub async fn rotate_master_key(&mut self, new_master: MasterKey) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        let user_rows = sqlx::query("SELECT id, username, server, did_web FROM users")
+        let user_rows = sqlx::query("SELECT id, username, server FROM users")
             .fetch_all(&mut *tx)
             .await?;
         for row in user_rows {
@@ -985,29 +969,24 @@ impl EncryptedStore {
             let id: Uuid = id_str.parse()?;
             let username_raw: Vec<u8> = row.try_get("username")?;
             let server_raw: Vec<u8> = row.try_get("server")?;
-            let did_web_raw: Vec<u8> = row.try_get("did_web")?;
 
             let old_key = user_key(&self.master, &id)?;
             let username = dec(&old_key, &username_raw)?;
             let server = dec(&old_key, &server_raw)?;
-            let did_web = dec(&old_key, &did_web_raw)?;
 
             let new_key = user_key(&new_master, &id)?;
             let username_enc = enc(&new_key, &username)?;
             let server_enc = enc(&new_key, &server)?;
-            let did_web_enc = enc(&new_key, &did_web)?;
 
             let username_str = String::from_utf8(username)?;
             let server_str = String::from_utf8(server)?;
             let new_idx = username_index(&new_master, &username_str, &server_str)?;
 
             sqlx::query(
-                "UPDATE users SET username = ?, server = ?, did_web = ?, username_index = ? \
-                 WHERE id = ?",
+                "UPDATE users SET username = ?, server = ?, username_index = ? WHERE id = ?",
             )
             .bind(username_enc)
             .bind(server_enc)
-            .bind(did_web_enc)
             .bind(new_idx)
             .bind(id.to_string())
             .execute(&mut *tx)
@@ -1041,20 +1020,15 @@ impl EncryptedStore {
                 .await?;
         }
 
-        let identity_rows =
-            sqlx::query("SELECT id, account_id, did, name, description FROM identities")
-                .fetch_all(&mut *tx)
-                .await?;
+        let identity_rows = sqlx::query("SELECT id, account_id, name, description FROM identities")
+            .fetch_all(&mut *tx)
+            .await?;
         for row in identity_rows {
             let id: String = row.try_get("id")?;
             let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
             let old_key = user_key(&self.master, &account_id)?;
             let new_key = user_key(&new_master, &account_id)?;
 
-            let did = enc(
-                &new_key,
-                &dec(&old_key, &row.try_get::<Vec<u8>, _>("did")?)?,
-            )?;
             let name = enc(
                 &new_key,
                 &dec(&old_key, &row.try_get::<Vec<u8>, _>("name")?)?,
@@ -1064,8 +1038,7 @@ impl EncryptedStore {
                 .map(|raw| dec(&old_key, &raw).and_then(|plain| enc(&new_key, &plain)))
                 .transpose()?;
 
-            sqlx::query("UPDATE identities SET did = ?, name = ?, description = ? WHERE id = ?")
-                .bind(did)
+            sqlx::query("UPDATE identities SET name = ?, description = ? WHERE id = ?")
                 .bind(name)
                 .bind(description)
                 .bind(id)
@@ -1187,7 +1160,6 @@ mod tests {
             id: Uuid::new_v4(),
             username: "alice".to_string(),
             server: "example.com".to_string(),
-            did_web: "did:web:example.com:u:alice".to_string(),
             created_at: OffsetDateTime::now_utc(),
         }
     }
@@ -1204,7 +1176,6 @@ mod tests {
         assert_eq!(fetched.id, id);
         assert_eq!(fetched.username, "alice");
         assert_eq!(fetched.server, "example.com");
-        assert_eq!(fetched.did_web, "did:web:example.com:u:alice");
         Ok(())
     }
 
@@ -1242,7 +1213,7 @@ mod tests {
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
 
-        let rows = sqlx::query("SELECT username, server, did_web FROM users")
+        let rows = sqlx::query("SELECT username, server FROM users")
             .fetch_all(&pool)
             .await?;
         assert!(!rows.is_empty());
@@ -1250,7 +1221,6 @@ mod tests {
         let row = &rows[0];
         let username_raw: Vec<u8> = row.try_get(0)?;
         let server_raw: Vec<u8> = row.try_get(1)?;
-        let did_web_raw: Vec<u8> = row.try_get(2)?;
 
         // Stored bytes must differ from the plaintext UTF-8 representation.
         assert_ne!(username_raw, b"alice", "username stored in plaintext");
@@ -1259,10 +1229,6 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&username_raw).contains("alice"),
             "username readable in dump"
-        );
-        assert!(
-            !String::from_utf8_lossy(&did_web_raw).contains("alice"),
-            "DID readable in dump"
         );
         Ok(())
     }
@@ -1273,7 +1239,6 @@ mod tests {
         Identity {
             id,
             account_id,
-            did: format!("did:web:example.com:i:{id}"),
             name: "Secret Persona".to_string(),
             logo: "icon:solid:user-astronaut".to_string(),
             description: Some("only my friends know".to_string()),
@@ -1299,7 +1264,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.name, "Secret Persona");
-        assert_eq!(got.did, a.did);
         assert_eq!(got.logo, "icon:solid:user-astronaut");
         assert_eq!(got.description.as_deref(), Some("only my friends know"));
         assert!(
@@ -1327,7 +1291,6 @@ mod tests {
         let owner = sample_user();
         let mut other = sample_user();
         other.username = "bob".to_string();
-        other.did_web = "did:web:example.com:u:bob".to_string();
         store_user(&pool, &master, &owner).await.unwrap();
         store_user(&pool, &master, &other).await.unwrap();
 
@@ -1360,7 +1323,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_changes_display_fields_but_not_the_did(pool: SqlitePool) -> sqlx::Result<()> {
+    async fn update_changes_display_fields(pool: SqlitePool) -> sqlx::Result<()> {
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -1370,7 +1333,6 @@ mod tests {
         ident.name = "  Renamed ".to_string();
         ident.logo = "icon:brands:github".to_string();
         ident.description = None;
-        ident.did = "did:web:evil.example:i:x".to_string(); // must be ignored
         update_identity(&pool, &master, &ident).await.unwrap();
 
         let got = fetch_identity(&pool, &master, user.id, ident.id)
@@ -1380,7 +1342,6 @@ mod tests {
         assert_eq!(got.name, "Renamed");
         assert_eq!(got.logo, "icon:brands:github");
         assert!(got.description.is_none());
-        assert_eq!(got.did, format!("did:web:example.com:i:{}", ident.id));
         assert!(got.updated_at >= got.created_at);
         Ok(())
     }
@@ -1420,10 +1381,10 @@ mod tests {
             .await
             .unwrap();
 
-        let row = sqlx::query("SELECT did, name, description FROM identities")
+        let row = sqlx::query("SELECT name, description FROM identities")
             .fetch_one(&pool)
             .await?;
-        for (col, needle) in [(0, "did:web"), (1, "Persona"), (2, "friends")] {
+        for (col, needle) in [(0, "Persona"), (1, "friends")] {
             let raw: Vec<u8> = row.try_get(col)?;
             assert!(
                 !String::from_utf8_lossy(&raw).contains(needle),
@@ -1534,11 +1495,10 @@ mod tests {
         // A dummy index value (64 zeros) satisfies the NOT NULL constraint.
         let dummy_index = "0".repeat(64);
         sqlx::query(
-            "INSERT INTO users (id, username, server, did_web, created_at, username_index) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, server, created_at, username_index) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
-        .bind(&garbage)
         .bind(&garbage)
         .bind(&garbage)
         .bind(created_at)
@@ -1679,7 +1639,6 @@ mod tests {
             id: Uuid::new_v4(),
             username: "alice".to_string(),
             server: "example.com".to_string(),
-            did_web: "did:web:example.com:u:alice".to_string(),
             created_at: dt,
         };
 
@@ -1984,7 +1943,6 @@ mod tests {
         let fetched = store.fetch_user(user_id).await.unwrap().unwrap();
         assert_eq!(fetched.username, "alice");
         assert_eq!(fetched.server, "example.com");
-        assert_eq!(fetched.did_web, "did:web:example.com:u:alice");
 
         let creds = store.fetch_credentials(user_id).await.unwrap();
         assert_eq!(creds.len(), 1);

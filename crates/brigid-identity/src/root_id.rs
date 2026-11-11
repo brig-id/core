@@ -30,11 +30,6 @@ impl RootId {
             server: server.to_ascii_lowercase(),
         })
     }
-
-    /// Returns `did:web:server:u:username`.
-    pub fn to_did_web(&self) -> String {
-        format!("did:web:{}:u:{}", self.server, self.username)
-    }
 }
 
 impl fmt::Display for RootId {
@@ -92,7 +87,6 @@ mod tests {
         assert_eq!(id.username, "berenger");
         assert_eq!(id.server, "brig.id");
         assert_eq!(id.to_string(), "berenger@brig.id");
-        assert_eq!(id.to_did_web(), "did:web:brig.id:u:berenger");
     }
 
     #[test]
@@ -165,7 +159,6 @@ mod tests {
     fn server_is_lowercased() {
         let id = RootId::parse("alice@Example.COM").unwrap();
         assert_eq!(id.server, "example.com");
-        assert_eq!(id.to_did_web(), "did:web:example.com:u:alice");
         // Case variants must map to the same canonical RootId.
         let other = RootId::parse("alice@EXAMPLE.com").unwrap();
         assert_eq!(id, other);

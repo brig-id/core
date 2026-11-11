@@ -1,10 +1,7 @@
-//! Display fields and DID of an **identity** (what a relying party sees).
+//! Display fields of an **identity** (what a relying party sees).
 //!
-//! An identity belongs to a private account. Its DID is built from an opaque,
-//! immutable id, never from its name, so renaming an identity never changes the
-//! VSID derived from it (see ADR-002 in the spec).
-
-use uuid::Uuid;
+//! An identity belongs to a private account and is identified by its UUID
+//! (ADR-007): renaming it never changes the VSID derived from that id.
 
 use crate::{Error, Result};
 
@@ -70,23 +67,9 @@ pub fn validate_logo(logo: &str) -> Result<()> {
     }
 }
 
-/// The `did:web` of an identity: `did:web:<host>:i:<id>`. Opaque and immutable.
-///
-/// `host` is the server's domain, without scheme, path or port.
-pub fn identity_did(host: &str, id: Uuid) -> Result<String> {
-    if host.is_empty() || host.contains(['/', ':', ' ']) {
-        return Err(Error::InvalidIdentifier(
-            "host must be a bare domain".to_string(),
-        ));
-    }
-    Ok(format!("did:web:{host}:i:{id}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{compute_vsid, derive_vsid_salt};
-    use brigid_crypto::MasterKey;
 
     #[test]
     fn name_is_trimmed_and_required() {
@@ -128,29 +111,5 @@ mod tests {
         ] {
             assert!(validate_logo(bad).is_err(), "{bad} must be rejected");
         }
-    }
-
-    #[test]
-    fn identity_did_is_built_from_the_id() {
-        let id = Uuid::new_v4();
-        assert_eq!(
-            identity_did("brig.id", id).unwrap(),
-            format!("did:web:brig.id:i:{id}")
-        );
-        assert!(identity_did("", id).is_err());
-        assert!(identity_did("brig.id/evil", id).is_err());
-        assert!(identity_did("brig.id:8443", id).is_err());
-    }
-
-    /// Two identities of one account reach the same relying party with
-    /// different, stable VSIDs.
-    #[test]
-    fn identities_of_one_account_get_different_vsids() {
-        let salt = derive_vsid_salt(&MasterKey::from_hex(&"42".repeat(32)).unwrap());
-        let a = identity_did("brig.id", Uuid::new_v4()).unwrap();
-        let b = identity_did("brig.id", Uuid::new_v4()).unwrap();
-        let va = compute_vsid(&a, "rp", &salt).unwrap();
-        assert_eq!(va, compute_vsid(&a, "rp", &salt).unwrap());
-        assert_ne!(va, compute_vsid(&b, "rp", &salt).unwrap());
     }
 }

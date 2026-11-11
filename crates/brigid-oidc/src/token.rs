@@ -167,7 +167,7 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use brigid_crypto::MasterKey;
-    use brigid_identity::{compute_vsid, derive_vsid_salt};
+    use brigid_identity::{derive_vsid_salt, identity_vsid};
 
     fn master() -> MasterKey {
         MasterKey::from_hex(&"ab".repeat(32)).unwrap()
@@ -175,7 +175,7 @@ mod tests {
 
     fn test_vsid() -> Vsid {
         let salt = derive_vsid_salt(&master());
-        compute_vsid("did:web:example.com", "test-client", &salt).unwrap()
+        identity_vsid(uuid::Uuid::from_bytes([1; 16]), "test-client", &salt)
     }
 
     fn test_key() -> OidcSigningKey {
@@ -418,11 +418,11 @@ mod tests {
 mod multi_key_tests {
     use super::*;
     use brigid_crypto::MasterKey;
-    use brigid_identity::{compute_vsid, derive_vsid_salt};
+    use brigid_identity::{derive_vsid_salt, identity_vsid};
 
     fn token_from(key: &OidcSigningKey) -> String {
         let salt = derive_vsid_salt(&MasterKey::from_hex(&"ab".repeat(32)).unwrap());
-        let vsid = compute_vsid("did:web:example.com", "c", &salt).unwrap();
+        let vsid = identity_vsid(uuid::Uuid::from_bytes([1; 16]), "c", &salt);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
