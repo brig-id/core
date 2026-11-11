@@ -27,10 +27,13 @@ impl fmt::Display for Vsid {
     }
 }
 
-/// Derives a 32-byte VSID salt from the master key.
+/// Derives a 32-byte VSID salt from the master key
+/// (HKDF-SHA3-256, `info = "brigid-vsid-salt"`).
 ///
-/// Uses HKDF-SHA3-256 with `info = "brigid-vsid-salt"`.
-/// Cannot fail for a 32-byte output (HKDF limit is 255 × HashLen = 8160 bytes).
+/// This is how the VSID secret was obtained before it was stored. It is only
+/// passed to `EncryptedStore::vsid_secret`, which keeps it for a database
+/// whose accounts already have VSIDs computed with it; a new database gets a
+/// random secret instead.
 pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
     let key = brigid_crypto::hkdf::derive_key(master, b"brigid-vsid-salt", 32)
         .expect("HKDF with 32-byte output never fails");

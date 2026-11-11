@@ -31,6 +31,10 @@ pub enum Error {
     #[error("timestamp error: {0}")]
     Time(String),
 
+    /// The operating system's random source failed.
+    #[error("no entropy available: {0}")]
+    Entropy(#[from] helpers4::random::EntropyError),
+
     /// A row with a unique key (e.g. `username_index`) already exists.
     /// This is the authoritative duplicate signal — pre-checks are advisory only.
     #[error("duplicate row (unique constraint violated)")]
