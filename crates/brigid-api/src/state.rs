@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use brigid_oidc::{JtiStore, OidcSigningKey};
+use brigid_oidc::OidcSigningKey;
 use brigid_store::EncryptedStore;
 use url::Url;
 use uuid::Uuid;
@@ -18,18 +18,14 @@ use webauthn_rs::prelude::{
 /// accepts only its own kind, so a session begun to add a passkey (or to
 /// recover an account) cannot be completed as something else.
 pub enum RegistrationPurpose {
-    /// A new account (`/auth/register/*`). With a `client_id`, `finish`
-    /// signs the new account in (audience `client_id`), so signing up takes
-    /// one passkey prompt.
-    Signup { client_id: Option<String> },
+    /// A new account (`/auth/register/*`); `finish` signs it in.
+    Signup,
     /// One more passkey for a signed-in account (`/auth/passkeys/add/*`).
     AddPasskey,
     /// A passkey enrolled with a recovery code (`/auth/recovery/*`). The
-    /// code's recovery id is consumed at `finish`; `client_id` is the audience
-    /// of the token returned then, bound here like a login's.
+    /// code's recovery id is consumed at `finish`, which signs in.
     Recovery {
         recovery_id: [u8; brigid_identity::recovery::RECOVERY_ID_LEN],
-        client_id: String,
     },
 }
 
@@ -56,12 +52,6 @@ pub enum PendingLogin {
 
 /// In-flight authentication session keyed by a temporary session UUID.
 pub struct PendingAuthentication {
-    /// Relying-party identifier sent at `/auth/login/begin`. Bound into the
-    /// pending session so the `aud` claim and VSID derived at
-    /// `/auth/login/finish` cannot be changed between the two halves of the
-    /// flow (an attacker controlling the second request must otherwise be
-    /// able to swap the audience for a token they did not initiate).
-    pub client_id: String,
     pub login: PendingLogin,
     /// Timestamp when this session was created; used for TTL eviction.
     pub created_at: Instant,
@@ -92,8 +82,12 @@ pub struct AppState {
     /// Keys retired by a rotation but still within their grace period: tokens
     /// they signed still verify and they stay in the JWKS (core#22).
     pub retired_oidc_keys: Vec<Arc<OidcSigningKey>>,
-    pub jti_store: Arc<Mutex<JtiStore>>,
     pub base_url: Url,
+    /// An account session ends after this long without use (ADR-005).
+    pub session_idle: Duration,
+    /// An account session ends this long after the passkey ceremony that
+    /// opened it, used or not (ADR-005).
+    pub session_lifetime: Duration,
     /// The keying material of every VSID: `EncryptedStore::vsid_secret`.
     pub vsid_salt: [u8; 32],
     pub pending_registrations: Arc<Mutex<HashMap<Uuid, PendingRegistration>>>,
@@ -120,8 +114,9 @@ impl AppState {
             webauthn: Arc::new(webauthn),
             oidc_key: Arc::new(oidc_key),
             retired_oidc_keys: Vec::new(),
-            jti_store: Arc::new(Mutex::new(JtiStore::new())),
             base_url,
+            session_idle: Duration::from_secs(3600),
+            session_lifetime: Duration::from_secs(12 * 3600),
             vsid_salt,
             pending_registrations: Arc::new(Mutex::new(HashMap::new())),
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
@@ -130,6 +125,26 @@ impl AppState {
             // Caddy (or another trusted proxy) terminates the public TLS edge.
             trust_forwarded_for: false,
         }
+    }
+
+    /// Session timeouts: `idle` without use, `lifetime` in any case.
+    #[must_use]
+    pub fn with_session_timeouts(mut self, idle: Duration, lifetime: Duration) -> Self {
+        self.session_idle = idle;
+        self.session_lifetime = lifetime;
+        self
+    }
+
+    /// Whether this server is reached over HTTPS: the session cookie is then
+    /// `Secure` with the `__Host-` prefix. Plain HTTP is for local development.
+    pub fn https(&self) -> bool {
+        self.base_url.scheme() == "https"
+    }
+
+    /// The origin of this server (`scheme://host[:port]`), as browsers send it
+    /// in the `Origin` header.
+    pub fn origin(&self) -> String {
+        self.base_url.origin().ascii_serialization()
     }
 
     /// Keys retired by a rotation that must keep verifying their tokens.

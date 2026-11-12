@@ -1,20 +1,13 @@
-//! Discovery endpoints: OpenID Connect configuration, JWKS, and DID.
+//! Discovery endpoints: the JWKS and the server's DID document. The OpenID
+//! configuration comes back with the relying-party flow (ADR-005 §2).
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use std::sync::Arc;
 
 use brigid_did::did_root_document_handler;
-use brigid_oidc::{build_jwks, build_openid_configuration};
+use brigid_oidc::build_jwks;
 
 use crate::{error::ApiError, state::AppState};
-
-/// `GET /.well-known/openid-configuration`
-pub async fn openid_configuration(
-    State(state): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, ApiError> {
-    let config = build_openid_configuration(&state.base_url);
-    Ok((StatusCode::OK, Json(config)))
-}
 
 /// `GET /.well-known/jwks.json`
 pub async fn jwks(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
