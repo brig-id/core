@@ -5,11 +5,10 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
 };
-use brigid_identity::{RootId, account_subject};
-use brigid_oidc::{IssuanceParams, issue_token};
+use brigid_identity::RootId;
 use brigid_store::User;
 use brigid_webauthn::{load_passkeys, passkey_to_credential, update_passkey};
 use serde::{Deserialize, Serialize};
@@ -18,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
-    middleware::AuthenticatedClaims,
+    session::{AccountSession, clear_cookie, open_session},
     state::{
         AppState, PendingAuthentication, PendingLogin, PendingRegistration, RegistrationPurpose,
     },
@@ -30,10 +29,6 @@ pub struct BeginRegisterRequest {
     /// (ADR-003: it is a hidden sign-in handle).
     #[serde(default)]
     pub username: Option<String>,
-    /// Present: `finish` signs the new account in, with this audience, as
-    /// `/auth/login/begin`'s `client_id`.
-    #[serde(default)]
-    pub client_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -54,7 +49,6 @@ pub struct FinishRegisterRequest {
 
 #[derive(Deserialize)]
 pub struct RenamePasskeyRequest {
-    pub user_id: Uuid,
     /// The new label; empty removes it.
     pub label: String,
 }
@@ -65,12 +59,6 @@ pub struct BeginLoginRequest {
     /// credential (passkey autofill), the authenticator names the user.
     #[serde(default)]
     pub username: Option<String>,
-    /// Relying-party identifier (the OIDC `client_id`) that will receive the
-    /// resulting ID Token. Required: the `aud` claim and the VSID embedded
-    /// in the token are derived from this value, so the same physical user
-    /// presents a different opaque `sub` to each RP (AGENTS.md per-RP
-    /// correlation invariant).
-    pub client_id: String,
 }
 
 #[derive(Serialize)]
@@ -86,26 +74,6 @@ pub struct FinishLoginRequest {
 }
 
 #[derive(Serialize)]
-pub struct LoginResponse {
-    pub id_token: String,
-    /// Internal user UUID, returned alongside the OIDC token so the UI can
-    /// supply it on endpoints that require explicit `user_id` authorization
-    /// (e.g. `DELETE /auth/passkeys/{id}`). Not embedded in the JWT itself to
-    /// avoid tying the opaque `sub` claim to a stable internal identifier.
-    pub user_id: Uuid,
-}
-
-#[derive(Deserialize)]
-pub struct DeletePasskeyRequest {
-    pub user_id: Uuid,
-}
-
-#[derive(Deserialize)]
-pub struct BeginAddCredentialRequest {
-    pub user_id: Uuid,
-}
-
-#[derive(Serialize)]
 pub struct PasskeySummary {
     pub id: Uuid,
     pub label: Option<String>,
@@ -116,9 +84,6 @@ pub async fn register_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if body.client_id.as_deref() == Some("") {
-        return Err(ApiError::BadRequest("client_id must not be empty".into()));
-    }
     let host = state.host()?.to_string();
     let root_id = match body.username.as_deref() {
         Some(handle) => {
@@ -167,9 +132,7 @@ pub async fn register_begin(
         map.insert(
             session_id,
             PendingRegistration {
-                purpose: RegistrationPurpose::Signup {
-                    client_id: body.client_id,
-                },
+                purpose: RegistrationPurpose::Signup,
                 user_id,
                 username: root_id.username.clone(),
                 server: root_id.server.clone(),
@@ -194,7 +157,7 @@ pub async fn register_finish(
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pending = take_pending_registration(&state, body.session_id, |p| {
-        matches!(p, RegistrationPurpose::Signup { .. })
+        matches!(p, RegistrationPurpose::Signup)
     })?;
 
     // Authoritative TTL check at finish time. `evict_expired_pending()` only
@@ -240,17 +203,10 @@ pub async fn register_finish(
         })?;
     apply_label(&state, user_id, cred.id, body.label.as_deref()).await?;
 
-    // Begun with a client_id: the new account is signed in (ADR-003).
-    let RegistrationPurpose::Signup { client_id } = pending.purpose else {
-        unreachable!("checked by take_pending_registration");
-    };
-    match client_id {
-        Some(client_id) => {
-            let id_token = account_token(&state, &user, &client_id)?;
-            Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })).into_response())
-        }
-        None => Ok(StatusCode::OK.into_response()),
-    }
+    // The new account is signed in by the same ceremony (ADR-003): a
+    // session, never a token (ADR-005).
+    let cookie = open_session(&state, &user).await?;
+    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
 
 /// A free generated username on this server (ADR-003). A clash with an
@@ -276,29 +232,13 @@ async fn generated_root_id(state: &AppState, host: &str) -> Result<RootId, ApiEr
     )))
 }
 
-/// `POST /auth/passkeys/add/begin`
-///
-/// Starts a WebAuthn registration ceremony that adds an additional
-/// credential to the *already-registered* identity behind the presented
-/// token — unlike `register_begin`, this never creates a new user/DID. The
-/// caller must supply their `user_id`; the handler cross-checks it against
-/// the token's VSID, same as `delete_passkey`/`list_passkeys`.
+/// `POST /auth/passkeys/add/begin`: start registering one more passkey for
+/// the signed-in account (never a new account).
 pub async fn add_credential_begin(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    Json(body): Json<BeginAddCredentialRequest>,
+    session: AccountSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = state
-        .store
-        .fetch_user(body.user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-
-    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    if expected_sub.as_str() != claims.sub {
-        return Err(ApiError::Forbidden);
-    }
+    let user = session.account;
 
     // Exclude the user's existing credentials so an authenticator that
     // supports it can refuse to re-enrol a key that's already registered.
@@ -416,23 +356,14 @@ pub(crate) async fn apply_label(
         })
 }
 
-/// `PATCH /auth/passkeys/{id}`: rename a passkey of the authenticated user.
+/// `PATCH /auth/passkeys/{id}`: rename a passkey of the signed-in account.
 pub async fn rename_passkey(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
+    session: AccountSession,
     Path(passkey_id): Path<Uuid>,
     Json(body): Json<RenamePasskeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = state
-        .store
-        .fetch_user(body.user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    if expected_sub.as_str() != claims.sub {
-        return Err(ApiError::Forbidden);
-    }
+    let user = session.account;
     state
         .store
         .set_credential_label(user.id, passkey_id, &body.label)
@@ -452,10 +383,6 @@ pub async fn login_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if body.client_id.is_empty() {
-        return Err(ApiError::BadRequest("client_id is required".into()));
-    }
-
     let (rcr, login) = match body.username.as_deref() {
         Some(username) => {
             let root_id =
@@ -503,7 +430,6 @@ pub async fn login_begin(
         map.insert(
             session_id,
             PendingAuthentication {
-                client_id: body.client_id,
                 login,
                 created_at: Instant::now(),
             },
@@ -606,62 +532,21 @@ pub async fn login_finish(
         }
     }
 
-    // Use the relying-party `client_id` captured at `/auth/login/begin` (and
-    // bound into the pending session so it cannot be swapped between the
-    // begin and finish requests). The `aud` claim and the VSID embedded in
-    // the token are both derived from this value so the same physical user
-    // presents a different opaque `sub` to each RP (AGENTS.md per-RP
-    // correlation invariant).
-    let id_token = account_token(&state, &user, &pending.client_id)?;
-
-    Ok((StatusCode::OK, Json(LoginResponse { id_token, user_id })))
+    // A session, never a token: brig·id's API takes no ID token as a
+    // credential, and a relying party gets one only through its own flow
+    // (ADR-005).
+    let cookie = open_session(&state, &user).await?;
+    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
 
-/// The account token returned at the end of a sign-in ceremony (login,
-/// recovery): audience `client_id`, `sub` the account's VSID for it.
-pub(crate) fn account_token(
-    state: &AppState,
-    user: &User,
-    client_id: &str,
-) -> Result<String, ApiError> {
-    let issuer = state.base_url.to_string();
-    let issuer = issuer.trim_end_matches('/');
-    let vsid = account_subject(user.id, client_id, &state.vsid_salt);
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let params = IssuanceParams {
-        vsid: &vsid,
-        issuer,
-        client_id,
-        server: state.host()?,
-        ttl_secs: 3600,
-    };
-    issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))
-}
-
-/// `DELETE /auth/passkeys/{id}`
-///
-/// Deletes a passkey belonging to the authenticated user. The body must carry
-/// the caller's `user_id` (returned by `/auth/login/finish`); the handler
-/// cross-checks it against the token's VSID to prevent one user from deleting
-/// another user's passkey even if they somehow obtain the correct passkey UUID.
+/// `DELETE /auth/passkeys/{id}`: delete a passkey of the signed-in account.
+/// Another account's passkey is `404`, like an unknown one.
 pub async fn delete_passkey(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
+    session: AccountSession,
     Path(passkey_id): Path<Uuid>,
-    Json(body): Json<DeletePasskeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Recompute the VSID for the claimed user and verify it matches the token.
-    let user = state
-        .store
-        .fetch_user(body.user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-
-    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    if expected_sub.as_str() != claims.sub {
-        return Err(ApiError::Forbidden);
-    }
+    let user_id = session.account.id;
 
     // brig·id is passkey-only — there is no password or other fallback to
     // sign in with. Deleting the last credential would permanently lock the
@@ -670,7 +555,7 @@ pub async fn delete_passkey(
     // unknown passkey_id still reports 404, not a misleading 409.
     let remaining = state
         .store
-        .fetch_credentials(body.user_id)
+        .fetch_credentials(user_id)
         .await
         .map_err(|e| internal!(e))?;
     if !remaining.iter().any(|c| c.id == passkey_id) {
@@ -682,50 +567,27 @@ pub async fn delete_passkey(
 
     state
         .store
-        .delete_credential(body.user_id, passkey_id)
+        .delete_credential(user_id, passkey_id)
         .await
         .map_err(|e| match e {
             brigid_store::Error::NotFound => ApiError::NotFound,
             other => internal!(other),
         })?;
 
-    Ok(StatusCode::OK)
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /auth/passkeys`
-///
-/// Lists the passkeys registered for the authenticated user. The caller must
-/// supply their `user_id` (returned by `/auth/login/finish`) as a query
-/// parameter; the handler cross-checks it against the token's VSID.
+/// `GET /auth/passkeys`: the signed-in account's passkeys.
 pub async fn list_passkeys(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    session: AccountSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id: Uuid = params
-        .get("user_id")
-        .ok_or_else(|| ApiError::BadRequest("user_id query param required".into()))?
-        .parse()
-        .map_err(|_| ApiError::BadRequest("user_id must be a valid UUID".into()))?;
-
-    let user = state
-        .store
-        .fetch_user(user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-
-    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    if expected_sub.as_str() != claims.sub {
-        return Err(ApiError::Forbidden);
-    }
-
+    let user_id = session.account.id;
     let creds = state
         .store
         .fetch_credentials(user_id)
         .await
         .map_err(|e| internal!(e))?;
-
     let mut labels = state
         .store
         .fetch_credential_labels(user_id)
@@ -738,130 +600,41 @@ pub async fn list_passkeys(
             label: labels.remove(&c.id),
         })
         .collect();
-
     Ok((StatusCode::OK, Json(summaries)))
 }
 
-/// `POST /auth/logout`
-///
-/// Blacklists the presented Bearer token's JTI, preventing further use
-/// before it expires naturally. The JTI is persisted in the database so
-/// it remains blacklisted across server restarts.
+/// `POST /auth/logout`: end the session and remove its cookie.
 pub async fn logout(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
+    session: AccountSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Persist FIRST. The in-memory blacklist is only the fast-path cache;
-    // writing to it before the durable store would make a transient DB error
-    // unrecoverable for this token: the response would be 500 but the JTI
-    // would already be in the in-memory blacklist, so a retried logout would
-    // be rejected by `AuthenticatedClaims` before it could persist the
-    // revocation. Persisting first means a 500 still leaves the operator
-    // free to retry, and the in-memory cache is only updated on success.
     state
         .store
-        .blacklist_jti(&claims.jti, claims.exp)
+        .delete_session(&session.token)
         .await
         .map_err(|e| internal!(e))?;
-    state
-        .jti_store
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .blacklist(&claims.jti, claims.exp);
-    Ok(StatusCode::OK)
-}
-
-#[derive(Deserialize)]
-pub struct SessionQuery {
-    pub user_id: Uuid,
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, clear_cookie(&state))],
+    ))
 }
 
 #[derive(Serialize)]
 pub struct SessionResponse {
-    pub user_id: Uuid,
-    /// Unix time at which the presented token expires.
+    /// Unix time the session ends if unused (pushed back by every request).
+    pub idle_expires_at: i64,
+    /// Unix time the session ends in any case: sign in again then.
     pub expires_at: i64,
 }
 
-/// The token's account, or `401` when it no longer exists: a session whose
-/// account was deleted must end cleanly, not linger client-side (core#47).
-pub(crate) async fn session_account(
-    state: &AppState,
-    claims: &brigid_oidc::Claims,
-    user_id: Uuid,
-) -> Result<User, ApiError> {
-    let user = state
-        .store
-        .fetch_user(user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::Unauthorized)?;
-    let expected_sub = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    if expected_sub.as_str() != claims.sub {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(user)
-}
-
-/// `GET /auth/session?user_id=`: is this session still good? `200` with its
-/// expiry, or `401` (expired, revoked, or the account is gone) so the client
-/// signs out.
-pub async fn session(
-    State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    axum::extract::Query(q): axum::extract::Query<SessionQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = session_account(&state, &claims, q.user_id).await?;
-    Ok((
+/// `GET /auth/session`: is the session still good? `200` with its deadlines,
+/// or `401` (none, expired, or the account is gone) so the client signs out.
+pub async fn session(session: AccountSession) -> impl IntoResponse {
+    (
         StatusCode::OK,
         Json(SessionResponse {
-            user_id: user.id,
-            expires_at: claims.exp,
+            idle_expires_at: session.idle_expires_at,
+            expires_at: session.expires_at,
         }),
-    ))
-}
-
-/// `POST /auth/session/refresh?user_id=`: swap a still-valid token for a fresh
-/// one (same audience, new expiry) and revoke the old one, so an active
-/// session slides while an idle one expires.
-pub async fn refresh_session(
-    State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    axum::extract::Query(q): axum::extract::Query<SessionQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let user = session_account(&state, &claims, q.user_id).await?;
-
-    let issuer = state.base_url.to_string();
-    let issuer = issuer.trim_end_matches('/').to_string();
-    let vsid = account_subject(user.id, &claims.aud, &state.vsid_salt);
-    let params = IssuanceParams {
-        vsid: &vsid,
-        issuer: &issuer,
-        client_id: &claims.aud,
-        server: state.host()?,
-        ttl_secs: 3600,
-    };
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let id_token = issue_token(&params, &state.oidc_key, now).map_err(|e| internal!(e))?;
-
-    // Revoke the old token only once the new one exists (durable first, as
-    // in logout).
-    state
-        .store
-        .blacklist_jti(&claims.jti, claims.exp)
-        .await
-        .map_err(|e| internal!(e))?;
-    state
-        .jti_store
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .blacklist(&claims.jti, claims.exp);
-
-    Ok((
-        StatusCode::OK,
-        Json(LoginResponse {
-            id_token,
-            user_id: user.id,
-        }),
-    ))
+    )
 }

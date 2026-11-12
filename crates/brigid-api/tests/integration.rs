@@ -1,3 +1,4 @@
+// -- A restart (a new router on the same database) does not revive it --
 //! Integration tests for brigid-api.
 
 use std::sync::Arc;
@@ -43,6 +44,23 @@ fn for_soft_passkey(
     ccr
 }
 
+/// This server's origin, as a browser sends it on every request that changes
+/// something (ADR-005: the API refuses those from any other origin).
+const ORIGIN: &str = "http://localhost:8080";
+
+/// The `name=value` of the session cookie a response sets.
+fn cookie_of(resp: &axum::response::Response) -> String {
+    let set = resp
+        .headers()
+        .get("set-cookie")
+        .expect("the response opens a session")
+        .to_str()
+        .unwrap();
+    assert!(set.contains("HttpOnly"), "{set}");
+    assert!(set.contains("SameSite=Strict"), "{set}");
+    set.split(';').next().unwrap().to_string()
+}
+
 fn master() -> MasterKey {
     MasterKey::from_hex(&"ab".repeat(32)).unwrap()
 }
@@ -82,6 +100,7 @@ async fn health_returns_200() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/health")
                 .body(Body::empty())
                 .unwrap(),
@@ -102,6 +121,7 @@ async fn ready_returns_200_when_db_accessible() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/ready")
                 .body(Body::empty())
                 .unwrap(),
@@ -117,13 +137,14 @@ async fn ready_returns_200_when_db_accessible() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn openid_configuration_returns_valid_json() {
+async fn no_openid_configuration_until_the_relying_party_flow_exists() {
     let state = make_state().await;
     let app = build_router(state, &[]);
 
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/.well-known/openid-configuration")
                 .body(Body::empty())
                 .unwrap(),
@@ -131,12 +152,9 @@ async fn openid_configuration_returns_valid_json() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = response_body_json(resp.into_body()).await;
-    assert!(json["issuer"].is_string(), "missing issuer");
-    // authorization_endpoint and token_endpoint are intentionally omitted —
-    // brig·id uses WebAuthn passkeys instead of the standard OAuth 2.0 code flow.
-    assert!(json["jwks_uri"].is_string());
+    // ADR-005 §3: advertising an OIDC provider no client can use is worse than
+    // none. It comes back with the Authorization Code flow.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -147,6 +165,7 @@ async fn jwks_returns_valid_json() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/.well-known/jwks.json")
                 .body(Body::empty())
                 .unwrap(),
@@ -168,6 +187,7 @@ async fn did_document_returns_valid_json() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/.well-known/did.json")
                 .body(Body::empty())
                 .unwrap(),
@@ -192,6 +212,7 @@ async fn security_headers_present() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .uri("/health")
                 .body(Body::empty())
                 .unwrap(),
@@ -219,6 +240,7 @@ async fn register_begin_rejects_invalid_username() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -240,6 +262,7 @@ async fn register_begin_rejects_a_username_on_another_server() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -270,6 +293,7 @@ async fn register_finish_rejects_malformed_credential() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
@@ -296,6 +320,7 @@ async fn login_finish_rejects_malformed_credential() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/finish")
                 .header("content-type", "application/json")
@@ -317,6 +342,7 @@ async fn login_begin_returns_404_for_unknown_user() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
@@ -350,6 +376,7 @@ async fn register_and_login_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -379,6 +406,7 @@ async fn register_and_login_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
@@ -387,7 +415,11 @@ async fn register_and_login_roundtrip() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "register/finish failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "register/finish failed"
+    );
 
     // -- Login begin --
     let body = serde_json::json!({ "username": "alice@localhost", "client_id": "test-client" });
@@ -395,6 +427,7 @@ async fn register_and_login_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
@@ -422,6 +455,7 @@ async fn register_and_login_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/finish")
                 .header("content-type", "application/json")
@@ -430,17 +464,12 @@ async fn register_and_login_roundtrip() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "login/finish failed");
-    let login_json: serde_json::Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert!(
-        login_json["id_token"].is_string(),
-        "expected id_token in response"
-    );
-    assert!(
-        login_json["user_id"].is_string(),
-        "expected user_id in login response"
-    );
+    // A session in a cookie, never a token (ADR-005).
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "login/finish failed");
+    let cookie = cookie_of(&resp);
+    assert!(cookie.starts_with("brigid_session="), "{cookie}");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "no token in the body");
 }
 
 #[tokio::test]
@@ -461,6 +490,7 @@ async fn register_begin_conflict_for_duplicate_user() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -487,6 +517,7 @@ async fn register_begin_conflict_for_duplicate_user() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
@@ -495,13 +526,14 @@ async fn register_begin_conflict_for_duplicate_user() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Second registration attempt — must return 409 Conflict.
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -525,6 +557,7 @@ async fn logout_requires_bearer_token() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/logout")
                 .body(Body::empty())
@@ -553,6 +586,7 @@ async fn logout_blacklists_token() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -576,6 +610,7 @@ async fn logout_blacklists_token() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
@@ -591,13 +626,14 @@ async fn logout_blacklists_token() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // -- Login --
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
@@ -619,6 +655,7 @@ async fn logout_blacklists_token() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/finish")
                 .header("content-type", "application/json")
@@ -634,34 +671,45 @@ async fn logout_blacklists_token() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "login/finish failed");
-    let login_json: serde_json::Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let id_token = login_json["id_token"].as_str().unwrap().to_owned();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "login/finish failed");
+    let id_token = cookie_of(&resp);
 
     // -- Logout #1 — must succeed (200 OK) --
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/logout")
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.0.1.11")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "first logout must succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "first logout must succeed"
+    );
+    assert!(
+        resp.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"),
+        "logout removes the cookie"
+    );
 
     // -- Logout #2 — token is now blacklisted, must return 401 --
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/logout")
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.0.1.11")
                 .body(Body::empty())
                 .unwrap(),
@@ -671,29 +719,19 @@ async fn logout_blacklists_token() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "second logout must fail (token blacklisted)"
+        "second logout must fail (session deleted)"
     );
 
-    // -- Simulate a service restart --
-    //
-    // The previous assertion is satisfied by the in-process `JtiStore` alone,
-    // so it does not exercise the persistent SQLite blacklist consulted by
-    // `AuthenticatedClaims` after the in-memory check. Wipe the in-memory
-    // store (equivalent to relaunching the binary with the same SQLite file)
-    // and replay the logout: only the DB-backed blacklist can produce 401
-    // now, proving revocations survive across restarts.
-    {
-        use brigid_oidc::JtiStore;
-        *state.jti_store.lock().unwrap_or_else(|e| e.into_inner()) = JtiStore::new();
-    }
+    // -- A restart (a new router on the same database) does not revive it --
     let app = build_router(Arc::clone(&state), &[]);
 
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/logout")
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.0.1.12")
                 .body(Body::empty())
                 .unwrap(),
@@ -703,7 +741,7 @@ async fn logout_blacklists_token() {
     assert_eq!(
         resp.status(),
         StatusCode::UNAUTHORIZED,
-        "logout after simulated restart must still fail (persistent JTI blacklist)"
+        "the session stays ended after a restart"
     );
 }
 
@@ -726,6 +764,7 @@ async fn rate_limit_triggers_after_burst() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header("origin", ORIGIN)
                     .method("POST")
                     .uri("/auth/login/begin")
                     .header("content-type", "application/json")
@@ -742,6 +781,7 @@ async fn rate_limit_triggers_after_burst() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
@@ -762,6 +802,7 @@ async fn account_routes_do_not_share_the_ceremony_quota() {
     let app = build_router(state, &[]);
     let get = |uri: &'static str| {
         Request::builder()
+            .header("origin", ORIGIN)
             .uri(uri)
             .header("x-forwarded-for", "10.0.0.2")
             .body(Body::empty())
@@ -769,6 +810,7 @@ async fn account_routes_do_not_share_the_ceremony_quota() {
     };
     let begin = || {
         Request::builder()
+            .header("origin", ORIGIN)
             .method("POST")
             .uri("/auth/login/begin")
             .header("content-type", "application/json")
@@ -862,7 +904,7 @@ async fn cors_allows_configured_origin() {
 // Passkey management: DELETE /auth/passkeys/{id}
 // ---------------------------------------------------------------------------
 
-/// Registers a user and completes a login, returning (id_token, user_id, passkey_id).
+/// Registers a user and signs in, returning (session cookie, user_id, passkey_id).
 ///
 /// Each of the 5 setup requests uses a distinct IP derived from `xff_base` so
 /// that no bucket exceeds the burst limit of 5. The caller is free to use any
@@ -883,6 +925,7 @@ async fn register_and_login_for_passkey_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/begin")
                 .header("content-type", "application/json")
@@ -897,6 +940,8 @@ async fn register_and_login_for_passkey_tests(
     let session_id: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
+    // The WebAuthn user handle is the account id.
+    let user_id = Uuid::from_slice(ccr.public_key.user.id.as_ref()).unwrap();
     let reg_cred = auth_client
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
@@ -907,6 +952,7 @@ async fn register_and_login_for_passkey_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/register/finish")
                 .header("content-type", "application/json")
@@ -922,7 +968,7 @@ async fn register_and_login_for_passkey_tests(
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Login begin (IP .3)
     let xff3 = format!("{xff_base}.3");
@@ -931,6 +977,7 @@ async fn register_and_login_for_passkey_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
@@ -955,6 +1002,7 @@ async fn register_and_login_for_passkey_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/login/finish")
                 .header("content-type", "application/json")
@@ -970,10 +1018,8 @@ async fn register_and_login_for_passkey_tests(
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let j: serde_json::Value = response_body_json(resp.into_body()).await;
-    let id_token = j["id_token"].as_str().unwrap().to_owned();
-    let user_id: Uuid = serde_json::from_value(j["user_id"].clone()).unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let id_token = cookie_of(&resp);
 
     // List passkeys to get the credential id (IP .5)
     let xff5 = format!("{xff_base}.5");
@@ -981,9 +1027,10 @@ async fn register_and_login_for_passkey_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={user_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", &xff5)
                 .body(Body::empty())
                 .unwrap(),
@@ -1021,9 +1068,10 @@ async fn add_credential_for_tests(
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/begin")
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", id_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", format!("{xff_base}.{xff_start}"))
                 .body(Body::from(
@@ -1047,6 +1095,7 @@ async fn add_credential_for_tests(
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/finish")
                 .header("content-type", "application/json")
@@ -1093,9 +1142,10 @@ async fn delete_passkey_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{passkey_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.20.1.8")
                 .body(Body::from(
@@ -1108,16 +1158,17 @@ async fn delete_passkey_roundtrip() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "delete passkey must return 200"
+        StatusCode::NO_CONTENT,
+        "delete passkey must succeed"
     );
 
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={user_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.20.1.9")
                 .body(Body::empty())
                 .unwrap(),
@@ -1155,9 +1206,10 @@ async fn delete_passkey_last_one_returns_409() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{passkey_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.20.5.6")
                 .body(Body::from(
@@ -1176,7 +1228,7 @@ async fn delete_passkey_last_one_returns_409() {
 }
 
 #[tokio::test]
-async fn delete_passkey_wrong_user_returns_403() {
+async fn another_accounts_passkey_is_not_found() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
@@ -1189,7 +1241,7 @@ async fn delete_passkey_wrong_user_returns_403() {
     // Each user's setup uses its own /24 so no bucket accumulates.
     // xff_base "10.20.2" → 10.20.2.1–5 for alice's setup
     // xff_base "10.20.3" → 10.20.3.1–5 for bob's setup; DELETE on 10.20.2.6
-    let (alice_token, _, alice_passkey) = register_and_login_for_passkey_tests(
+    let (_, _, alice_passkey) = register_and_login_for_passkey_tests(
         app.clone(),
         "dp_alice2@localhost",
         &rp_origin,
@@ -1197,7 +1249,7 @@ async fn delete_passkey_wrong_user_returns_403() {
         "10.20.2",
     )
     .await;
-    let (_, bob_id, _) = register_and_login_for_passkey_tests(
+    let (bob_token, bob_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "dp_bob@localhost",
         &rp_origin,
@@ -1206,15 +1258,17 @@ async fn delete_passkey_wrong_user_returns_403() {
     )
     .await;
 
-    // Alice's token but Bob's user_id — VSID mismatch → 403
+    // Bob's session, Alice's passkey (and a user_id naming Alice, ignored):
+    // the account is the session's, and Alice's passkey is not Bob's.
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{alice_passkey}"))
-                .header("authorization", format!("Bearer {alice_token}"))
+                .header("cookie", &*bob_token)
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "10.20.2.6")
+                .header("x-forwarded-for", "10.20.3.6")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({ "user_id": bob_id })).unwrap(),
                 ))
@@ -1225,8 +1279,8 @@ async fn delete_passkey_wrong_user_returns_403() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "wrong user must get 403"
+        StatusCode::NOT_FOUND,
+        "another account's passkey must be 404"
     );
 }
 
@@ -1254,9 +1308,10 @@ async fn delete_passkey_unknown_id_returns_404() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{nonexistent_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.20.4.6")
                 .body(Body::from(
@@ -1282,6 +1337,7 @@ async fn delete_passkey_requires_bearer_token() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("DELETE")
                 .uri(format!("/auth/passkeys/{}", Uuid::new_v4()))
                 .header("content-type", "application/json")
@@ -1327,9 +1383,10 @@ async fn list_passkeys_returns_registered_passkeys() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={user_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.30.1.6")
                 .body(Body::empty())
                 .unwrap(),
@@ -1349,7 +1406,7 @@ async fn list_passkeys_returns_registered_passkeys() {
 }
 
 #[tokio::test]
-async fn list_passkeys_wrong_user_returns_403() {
+async fn a_user_id_parameter_never_names_the_account() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
@@ -1359,7 +1416,7 @@ async fn list_passkeys_wrong_user_returns_403() {
     let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
-    let (alice_token, _, _) = register_and_login_for_passkey_tests(
+    let (alice_token, _, alice_passkey) = register_and_login_for_passkey_tests(
         app.clone(),
         "lp_alice2@localhost",
         &rp_origin,
@@ -1367,7 +1424,7 @@ async fn list_passkeys_wrong_user_returns_403() {
         "10.30.2",
     )
     .await;
-    let (_, bob_id, _) = register_and_login_for_passkey_tests(
+    let (_, bob_id, bob_passkey) = register_and_login_for_passkey_tests(
         app.clone(),
         "lp_bob@localhost",
         &rp_origin,
@@ -1376,13 +1433,15 @@ async fn list_passkeys_wrong_user_returns_403() {
     )
     .await;
 
-    // Alice's token + Bob's user_id — VSID mismatch → 403
+    // Alice's session naming Bob: the parameter is ignored, Alice sees her
+    // own passkeys and never Bob's (ADR-005: the account is the session's).
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={bob_id}"))
-                .header("authorization", format!("Bearer {alice_token}"))
+                .header("cookie", &*alice_token)
                 .header("x-forwarded-for", "10.30.2.6")
                 .body(Body::empty())
                 .unwrap(),
@@ -1390,21 +1449,27 @@ async fn list_passkeys_wrong_user_returns_403() {
         .await
         .unwrap();
 
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "wrong user must get 403"
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = response_body_json(resp.into_body()).await;
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [alice_passkey.to_string().as_str()]);
+    assert!(!ids.contains(&bob_passkey.to_string().as_str()));
 }
 
 #[tokio::test]
-async fn list_passkeys_requires_bearer_token() {
+async fn list_passkeys_requires_a_session() {
     let state = make_state().await;
     let app = build_router(state, &[]);
 
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={}", Uuid::new_v4()))
                 .body(Body::empty())
@@ -1449,9 +1514,10 @@ async fn add_credential_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/begin")
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.40.1.6")
                 .body(Body::from(
@@ -1477,6 +1543,7 @@ async fn add_credential_roundtrip() {
         .clone()
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/finish")
                 .header("content-type", "application/json")
@@ -1497,9 +1564,10 @@ async fn add_credential_roundtrip() {
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("GET")
                 .uri(format!("/auth/passkeys?user_id={user_id}"))
-                .header("authorization", format!("Bearer {id_token}"))
+                .header("cookie", &*id_token)
                 .header("x-forwarded-for", "10.40.1.8")
                 .body(Body::empty())
                 .unwrap(),
@@ -1517,7 +1585,7 @@ async fn add_credential_roundtrip() {
 }
 
 #[tokio::test]
-async fn add_credential_wrong_user_returns_403() {
+async fn add_credential_is_for_the_sessions_account() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
@@ -1527,7 +1595,7 @@ async fn add_credential_wrong_user_returns_403() {
     let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
-    let (alice_token, _, _) = register_and_login_for_passkey_tests(
+    let (alice_token, alice_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "ac_alice2@localhost",
         &rp_origin,
@@ -1544,14 +1612,15 @@ async fn add_credential_wrong_user_returns_403() {
     )
     .await;
 
-    // Alice's token but Bob's user_id — VSID mismatch → 403, same as
-    // delete_passkey/list_passkeys.
+    // Alice's session naming Bob: the ceremony is for Alice (her user handle,
+    // her passkey excluded), never for Bob.
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/begin")
-                .header("authorization", format!("Bearer {alice_token}"))
+                .header("cookie", &*alice_token)
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.40.2.6")
                 .body(Body::from(
@@ -1562,21 +1631,25 @@ async fn add_credential_wrong_user_returns_403() {
         .await
         .unwrap();
 
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "wrong user must get 403"
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = response_body_json(resp.into_body()).await;
+    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let handle = Uuid::from_slice(ccr.public_key.user.id.as_ref()).unwrap();
+    assert_eq!(handle, alice_id);
+    assert_ne!(handle, bob_id);
+    let _ = alice_token;
 }
 
 #[tokio::test]
-async fn add_credential_begin_requires_bearer_token() {
+async fn add_credential_begin_requires_a_session() {
     let state = make_state().await;
     let app = build_router(state, &[]);
 
     let resp = app
         .oneshot(
             Request::builder()
+                .header("origin", ORIGIN)
                 .method("POST")
                 .uri("/auth/passkeys/add/begin")
                 .header("content-type", "application/json")
@@ -1608,11 +1681,12 @@ async fn identity_request(
     body: Option<serde_json::Value>,
 ) -> (StatusCode, serde_json::Value) {
     let mut req = Request::builder()
+        .header("origin", ORIGIN)
         .method(method)
         .uri(uri)
         .header("x-forwarded-for", xff);
     if let Some(t) = token {
-        req = req.header("authorization", format!("Bearer {t}"));
+        req = req.header("cookie", t);
     }
     let body = match body {
         Some(b) => {
@@ -1626,6 +1700,39 @@ async fn identity_request(
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// Like [`identity_request`], also returning the session cookie the response
+/// sets, as `name=value`.
+async fn request_with_cookie(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    xff: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, Option<String>, serde_json::Value) {
+    let mut req = Request::builder()
+        .header("origin", ORIGIN)
+        .method(method)
+        .uri(uri)
+        .header("x-forwarded-for", xff);
+    if let Some(c) = cookie {
+        req = req.header("cookie", c);
+    }
+    let body = match body {
+        Some(b) => {
+            req = req.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(&b).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let set = resp.headers().get("set-cookie").map(|_| cookie_of(&resp));
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, set, json)
 }
 
 #[tokio::test]
@@ -1742,8 +1849,8 @@ async fn identity_crud_roundtrip_and_isolation() {
     assert_eq!(updated["logo"], "icon:solid:briefcase");
     assert!(updated["description"].is_null());
 
-    // Bob cannot act on Alice's account...
-    let (status, _) = identity_request(
+    // Bob naming Alice sees his own identities, never hers...
+    let (status, bobs) = identity_request(
         &app,
         "GET",
         &format!("/account/identities?user_id={alice_id}"),
@@ -1752,7 +1859,14 @@ async fn identity_crud_roundtrip_and_isolation() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        bobs.as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != ident_id.as_str()),
+        "Bob must not see Alice's identity"
+    );
     // ...nor reach her identity through his own account.
     let (status, _) = identity_request(
         &app,
@@ -1954,7 +2068,7 @@ async fn discoverable_login_roundtrip() {
     let mut cred: PublicKeyCredential = dev.do_authentication(rp_origin.clone(), rcr).unwrap();
     cred.response.user_handle = Some(user_id.as_bytes().to_vec().into());
 
-    let (status, j) = identity_request(
+    let (status, cookie, _) = request_with_cookie(
         &app,
         "POST",
         "/auth/login/finish",
@@ -1963,12 +2077,21 @@ async fn discoverable_login_roundtrip() {
         Some(serde_json::json!({"session_id": session, "credential": cred})),
     )
     .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let cookie = cookie.expect("a session");
+    // The session is the account the passkey named.
+    let (status, list) = identity_request(
+        &app,
+        "GET",
+        "/auth/passkeys",
+        Some(&cookie),
+        "10.44.2.4",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        serde_json::from_value::<Uuid>(j["user_id"].clone()).unwrap(),
-        user_id
-    );
-    assert!(j["id_token"].as_str().is_some());
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let _ = user_id;
 
     // An unknown user handle is refused cleanly.
     let (_, j) = begin("10.44.3.1").await;
@@ -1990,10 +2113,11 @@ async fn discoverable_login_roundtrip() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// core#47: a session can be checked and refreshed; the old token dies on
-/// refresh, and a session whose account is gone answers 401.
+/// ADR-005 §1: the session lives in a cookie; it can be checked, it ends at
+/// sign-out (and stays ended), a forged or missing cookie is 401, and a
+/// cross-origin request that changes something is refused.
 #[tokio::test]
-async fn session_check_refresh_and_deleted_account() {
+async fn cookie_session_check_sign_out_and_same_origin() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
@@ -2001,7 +2125,7 @@ async fn session_check_refresh_and_deleted_account() {
     let app = build_router(Arc::clone(&state), &[]);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let (token, user_id, _) = register_and_login_for_passkey_tests(
+    let (cookie, _, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "sess@localhost",
         &rp_origin,
@@ -2013,83 +2137,113 @@ async fn session_check_refresh_and_deleted_account() {
     let (status, j) = identity_request(
         &app,
         "GET",
-        &format!("/auth/session?user_id={user_id}"),
-        Some(&token),
+        "/auth/session",
+        Some(&cookie),
         "10.45.2.1",
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(j["expires_at"].as_i64().unwrap() > 0);
+    let idle = j["idle_expires_at"].as_i64().unwrap();
+    let end = j["expires_at"].as_i64().unwrap();
+    assert!(idle > 0 && idle <= end, "{j}");
+    assert!(
+        end - idle >= 11 * 3600,
+        "1 h idle within a 12 h lifetime: {j}"
+    );
 
-    let (status, j) = identity_request(
-        &app,
-        "POST",
-        &format!("/auth/session/refresh?user_id={user_id}"),
-        Some(&token),
-        "10.45.2.2",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let fresh = j["id_token"].as_str().unwrap().to_string();
-    assert_ne!(fresh, token);
-
-    // The old token is revoked, the new one works.
+    // No cookie, or a forged one: 401.
+    let (status, _) = identity_request(&app, "GET", "/auth/session", None, "10.45.2.2", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = identity_request(
         &app,
         "GET",
-        &format!("/auth/session?user_id={user_id}"),
-        Some(&token),
+        "/auth/session",
+        Some("brigid_session=forged"),
         "10.45.2.3",
         None,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A request that changes something must come from this origin; a GET may not.
+    for origin in [Some("https://evil.example"), None] {
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/account/recovery-code")
+            .header("cookie", &*cookie)
+            .header("x-forwarded-for", "10.45.3.1");
+        if let Some(o) = origin {
+            req = req.header("origin", o);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "origin {origin:?}");
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/auth/session")
+                .header("cookie", &*cookie)
+                .header("x-forwarded-for", "10.45.3.2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a GET needs no Origin");
+
+    // No refresh endpoint: use extends the session, the lifetime ends it.
     let (status, _) = identity_request(
         &app,
-        "GET",
-        &format!("/auth/session?user_id={user_id}"),
-        Some(&fresh),
-        "10.45.2.4",
+        "POST",
+        "/auth/session/refresh",
+        Some(&cookie),
+        "10.45.4.1",
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Another account's id: refused.
+    // Sign out ends it for good.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/logout",
+        Some(&cookie),
+        "10.45.5.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = identity_request(
         &app,
         "GET",
-        &format!("/auth/session?user_id={}", Uuid::new_v4()),
-        Some(&fresh),
-        "10.45.3.1",
+        "/auth/session",
+        Some(&cookie),
+        "10.45.5.2",
         None,
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// ADR-002: a token for an identity carries the identity's VSID; two
-/// identities of one account are different subjects at the same RP, and
-/// neither equals the account's own subject.
+/// ADR-005 §3: no endpoint issues a token for a caller-supplied client_id.
+/// Sign-in opens a session and returns no token, whatever `client_id` the
+/// caller sends, and the identity token endpoint is gone.
 #[tokio::test]
-async fn identity_tokens_have_distinct_subjects() {
+async fn no_token_for_a_caller_supplied_client_id() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-
-    fn sub(token: &str) -> String {
-        use base64ct::Encoding as _;
-        let payload = token.split('.').nth(1).unwrap();
-        let bytes = base64ct::Base64UrlUnpadded::decode_vec(payload).unwrap();
-        let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        claims["sub"].as_str().unwrap().to_string()
-    }
 
     let app = build_router(make_state().await, &[]);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let (token, user_id, _) = register_and_login_for_passkey_tests(
+    let (cookie, _, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "idtok@localhost",
         &rp_origin,
@@ -2101,51 +2255,23 @@ async fn identity_tokens_have_distinct_subjects() {
     let (_, list) = identity_request(
         &app,
         "GET",
-        &format!("/account/identities?user_id={user_id}"),
-        Some(&token),
+        "/account/identities",
+        Some(&cookie),
         "10.46.2.1",
         None,
     )
     .await;
-    let ids: Vec<String> = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap().to_string())
-        .collect();
-
-    let mut subs = Vec::new();
-    for (n, id) in ids.iter().take(2).enumerate() {
-        let (status, j) = identity_request(
-            &app,
-            "POST",
-            &format!("/account/identities/{id}/token"),
-            Some(&token),
-            &format!("10.46.3.{n}"),
-            Some(serde_json::json!({"user_id": user_id, "client_id": "rp.example"})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        subs.push(sub(j["id_token"].as_str().unwrap()));
-    }
-    assert_ne!(subs[0], subs[1], "two identities, two subjects");
-    assert_ne!(
-        subs[0],
-        sub(&token),
-        "the account's subject is never reused"
-    );
-
-    // Stable for the same identity and RP.
-    let (_, j) = identity_request(
+    let id = list[0]["id"].as_str().unwrap();
+    let (status, _) = identity_request(
         &app,
         "POST",
-        &format!("/account/identities/{}/token", ids[0]),
-        Some(&token),
-        "10.46.4.1",
-        Some(serde_json::json!({"user_id": user_id, "client_id": "rp.example"})),
+        &format!("/account/identities/{id}/token"),
+        Some(&cookie),
+        "10.46.3.1",
+        Some(serde_json::json!({ "client_id": "rp.example" })),
     )
     .await;
-    assert_eq!(sub(j["id_token"].as_str().unwrap()), subs[0]);
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -2193,7 +2319,7 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     let mut typo: Vec<char> = code.chars().collect();
     typo[0] = if typo[0] == 'A' { 'C' } else { 'A' };
     let typo: String = typo.into_iter().collect();
-    let begin = |code: &str| serde_json::json!({ "code": code, "client_id": "test-client" });
+    let begin = |code: &str| serde_json::json!({ "code": code });
     let (status, _) = identity_request(
         &app,
         "POST",
@@ -2255,7 +2381,7 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, j) = identity_request(
+    let (status, cookie, j) = request_with_cookie(
         &app,
         "POST",
         "/auth/recovery/finish",
@@ -2264,9 +2390,8 @@ async fn recovery_code_enrols_a_new_passkey_once() {
         Some(finish_body),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["user_id"].as_str().unwrap(), user_id.to_string());
-    let new_token = j["id_token"].as_str().unwrap().to_string();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{j}");
+    let new_token = cookie.expect("recovery signs in");
 
     // Signed in: two passkeys now, the new one named.
     let (status, j) = identity_request(
@@ -2354,7 +2479,7 @@ async fn registration_sessions_finish_only_as_what_they_began() {
 }
 
 /// ADR-003: signing up without a username. The server generates the handle,
-/// and with a client_id the new account is signed in by the same ceremony.
+/// and the same ceremony signs the new account in (a session cookie).
 #[tokio::test]
 async fn signup_without_username_signs_in() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
@@ -2386,7 +2511,7 @@ async fn signup_without_username_signs_in() {
     let cred = dev
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
-    let (status, j) = identity_request(
+    let (status, cookie, j) = request_with_cookie(
         &app,
         "POST",
         "/auth/register/finish",
@@ -2399,9 +2524,14 @@ async fn signup_without_username_signs_in() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{j}");
-    let token = j["id_token"].as_str().expect("signed in at signup");
-    let user_id: Uuid = serde_json::from_value(j["user_id"].clone()).unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{j}");
+    assert!(
+        j.is_null(),
+        "no token in the body: the session is the cookie (ADR-005)"
+    );
+    let cookie = cookie.expect("signed in at signup");
+    let token = cookie.as_str();
+    let user_id = Uuid::nil();
 
     // The session works, the passkey has its name, the starter identities exist.
     let (status, j) = identity_request(
@@ -2426,32 +2556,5 @@ async fn signup_without_username_signs_in() {
     .await;
     assert_eq!(j.as_array().unwrap().len(), 3);
 
-    // Without client_id, signup still only creates the account.
-    let (status, j) = identity_request(
-        &app,
-        "POST",
-        "/auth/register/begin",
-        None,
-        "10.54.3.1",
-        Some(serde_json::json!({})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
-        serde_json::from_value(j["challenge"].clone()).unwrap();
-    let mut dev2 = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let cred = dev2
-        .do_registration(rp_origin, for_soft_passkey(ccr))
-        .unwrap();
-    let (status, j) = identity_request(
-        &app,
-        "POST",
-        "/auth/register/finish",
-        None,
-        "10.54.3.2",
-        Some(serde_json::json!({ "session_id": j["session_id"], "credential": cred })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(j.is_null(), "no token without client_id: {j}");
+    let _ = (user_id, rp_origin);
 }

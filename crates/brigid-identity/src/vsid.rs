@@ -47,7 +47,7 @@ pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
 /// `HKDF-SHA3-256(ikm = secret, info = label || id (16 bytes) ||
 /// u32_be(len(client_id)) || client_id)[..32]`, unpadded base64url. The id has
 /// a fixed length and `client_id` is length-prefixed, so the input is
-/// unambiguous; `label` keeps the two kinds of subject apart.
+/// unambiguous; `label` versions the construction.
 fn derive_subject(label: &[u8], id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
     let mut info = Vec::with_capacity(label.len() + 16 + 4 + client_id.len());
     info.extend_from_slice(label);
@@ -67,13 +67,6 @@ fn derive_subject(label: &[u8], id: Uuid, client_id: &str, secret: &[u8]) -> Vsi
 /// (ADR-006).
 pub fn identity_vsid(identity_id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
     derive_subject(b"brigid-vsid-v2", identity_id, client_id, secret)
-}
-
-/// The `sub` of an account's own session token at `client_id` (label
-/// `brigid-account-sub-v1`): never equal to any identity's VSID. Only until
-/// ADR-005 replaces account tokens with a server-side session.
-pub fn account_subject(account_id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
-    derive_subject(b"brigid-account-sub-v1", account_id, client_id, secret)
 }
 
 #[cfg(test)]
@@ -115,14 +108,6 @@ mod tests {
         assert_ne!(
             identity_vsid(id(1), "app1", &SECRET),
             identity_vsid(id(1), "app1", &[8u8; 32])
-        );
-    }
-
-    #[test]
-    fn an_account_subject_is_never_an_identity_vsid() {
-        assert_ne!(
-            account_subject(id(1), "app1", &SECRET),
-            identity_vsid(id(1), "app1", &SECRET)
         );
     }
 

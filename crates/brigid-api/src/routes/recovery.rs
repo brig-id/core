@@ -16,8 +16,8 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{
     Json,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::State,
+    http::{StatusCode, header},
     response::IntoResponse,
 };
 use brigid_identity::RecoveryCode;
@@ -28,11 +28,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
-    middleware::AuthenticatedClaims,
     routes::auth::{
-        BeginRegisterResponse, FinishRegisterRequest, LoginResponse, SessionQuery, account_token,
-        apply_label, session_account, take_pending_registration,
+        BeginRegisterResponse, FinishRegisterRequest, apply_label, take_pending_registration,
     },
+    session::{AccountSession, open_session},
     state::{AppState, PendingRegistration, RegistrationPurpose},
 };
 
@@ -54,18 +53,15 @@ pub struct RecoveryStatusResponse {
 #[derive(Deserialize)]
 pub struct BeginRecoveryRequest {
     pub code: String,
-    /// Audience of the token returned at `finish`, as at `/auth/login/begin`.
-    pub client_id: String,
 }
 
-/// `POST /account/recovery-code?user_id=`: a new code for the signed-in
-/// account, replacing the previous one. Returned once.
+/// `POST /account/recovery-code`: a new code for the signed-in account,
+/// replacing the previous one. Returned once.
 pub async fn create_code(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    Query(q): Query<SessionQuery>,
+    session: AccountSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = session_account(&state, &claims, q.user_id).await?;
+    let user = session.account;
     let code = RecoveryCode::generate().map_err(|e| internal!(e))?;
     state
         .store
@@ -80,14 +76,13 @@ pub async fn create_code(
     ))
 }
 
-/// `GET /account/recovery-code?user_id=`: whether the account has a usable
-/// code, and when one was last used. Never the code itself.
+/// `GET /account/recovery-code`: whether the account has a usable code, and
+/// when one was last used. Never the code itself.
 pub async fn status(
     State(state): State<Arc<AppState>>,
-    AuthenticatedClaims(claims): AuthenticatedClaims,
-    Query(q): Query<SessionQuery>,
+    session: AccountSession,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = session_account(&state, &claims, q.user_id).await?;
+    let user = session.account;
     let status = state
         .store
         .recovery_status(user.id)
@@ -112,9 +107,6 @@ pub async fn begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginRecoveryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if body.client_id.is_empty() {
-        return Err(ApiError::BadRequest("client_id is required".into()));
-    }
     let code = RecoveryCode::parse(&body.code).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let found = state
@@ -163,7 +155,6 @@ pub async fn begin(
             PendingRegistration {
                 purpose: RegistrationPurpose::Recovery {
                     recovery_id: code.recovery_id,
-                    client_id: body.client_id,
                 },
                 user_id: user.id,
                 username: user.username,
@@ -184,7 +175,7 @@ pub async fn begin(
 }
 
 /// `POST /auth/recovery/finish`: store the new passkey, consume the code (one
-/// transaction) and sign in. `409` when the code was used or replaced since
+/// transaction) and open a session. `409` when the code was used or replaced since
 /// `begin`.
 pub async fn finish(
     State(state): State<Arc<AppState>>,
@@ -196,11 +187,7 @@ pub async fn finish(
     if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
         return Err(ApiError::BadRequest("session expired".into()));
     }
-    let RegistrationPurpose::Recovery {
-        recovery_id,
-        client_id,
-    } = pending.purpose
-    else {
+    let RegistrationPurpose::Recovery { recovery_id } = pending.purpose else {
         unreachable!("checked by take_pending_registration");
     };
 
@@ -228,13 +215,7 @@ pub async fn finish(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::Unauthorized)?;
-    let id_token = account_token(&state, &user, &client_id)?;
     tracing::info!(user_id = %user.id, "account recovered with a recovery code");
-    Ok((
-        StatusCode::OK,
-        Json(LoginResponse {
-            id_token,
-            user_id: user.id,
-        }),
-    ))
+    let cookie = open_session(&state, &user).await?;
+    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
