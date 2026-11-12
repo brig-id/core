@@ -22,6 +22,7 @@ use url::Url;
 
 use crate::{
     routes::{auth, discovery, health, identities, recovery},
+    session,
     state::AppState,
 };
 
@@ -188,12 +189,15 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         // guess: it shares this stricter limit (ADR-004: no lockout).
         .route("/auth/recovery/begin", post(recovery::begin))
         .route("/auth/recovery/finish", post(recovery::finish))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            session::require_same_origin,
+        ))
         .layer(limit(Duration::from_secs(3), 5));
 
     let account_routes = Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/session", get(auth::session))
-        .route("/auth/session/refresh", post(auth::refresh_session))
         .route("/auth/passkeys", get(auth::list_passkeys))
         .route(
             "/auth/passkeys/{id}",
@@ -216,17 +220,15 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}",
             patch(identities::update_identity).delete(identities::delete_identity),
         )
-        .route(
-            "/account/identities/{id}/token",
-            post(identities::identity_token),
-        )
+        // Account sessions live in a cookie: every request that changes
+        // something must come from this server's own pages (ADR-005 §1).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            session::require_same_origin,
+        ))
         .layer(limit(Duration::from_secs(1), 30));
 
     let discovery_routes = Router::new()
-        .route(
-            "/.well-known/openid-configuration",
-            get(discovery::openid_configuration),
-        )
         .route("/.well-known/jwks.json", get(discovery::jwks))
         .route("/.well-known/did.json", get(discovery::did_document));
 

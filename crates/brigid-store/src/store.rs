@@ -38,9 +38,8 @@ fn oidc_seed_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
         .map_err(crate::Error::from)
 }
 
-/// Unix time in seconds, as the `exp` column of `jti_blacklist` stores it. A
-/// clock set before 1970 reads as 0: nothing is pruned and every revocation
-/// still applies.
+/// Unix time in seconds, as the `sessions` table stores it. A clock set
+/// before 1970 reads as 0.
 fn now_unix() -> i64 {
     helpers4::time::unix_now().map_or(0, |secs| secs as i64)
 }
@@ -947,7 +946,7 @@ impl EncryptedStore {
     /// derived from the master key: an index computed under the old key would
     /// never match a lookup computed under the new one), `webauthn_credentials`,
     /// `identities`, `oidc_keys`, `server_secrets` and `account_recovery`
-    /// (whose index, like `username_index`, is recomputed). `jti_blacklist` holds
+    /// (whose index, like `username_index`, is recomputed). `sessions` holds
     /// nothing encrypted.
     ///
     /// One transaction: any failure rolls the whole rotation back and leaves
@@ -1106,38 +1105,97 @@ impl EncryptedStore {
         Ok(())
     }
 
-    /// Persist a revoked JTI in the database so it remains blacklisted across
-    /// server restarts for the duration of its token lifetime.
-    ///
-    /// Expired entries (exp < now) are pruned on each insert to keep the table
-    /// bounded.
-    pub async fn blacklist_jti(&self, jti: &str, exp: i64) -> Result<()> {
+    // -- Account sessions (ADR-005 §1) -----------------------------------------
+
+    /// Open a session for `account_id`: returns the token for the cookie
+    /// (base64url of 32 random bytes). Only its hash is stored. The session
+    /// ends after `idle` without use, and after `lifetime` in any case.
+    /// Expired sessions are pruned on the way.
+    pub async fn create_session(
+        &self,
+        account_id: Uuid,
+        idle: std::time::Duration,
+        lifetime: std::time::Duration,
+    ) -> Result<Zeroizing<String>> {
+        let raw = Zeroizing::new(helpers4::random::random_bytes(32)?);
+        let token = Zeroizing::new(base64_url(&raw));
         let now = now_unix();
-        // Prune expired entries to keep the table bounded.
-        sqlx::query("DELETE FROM jti_blacklist WHERE exp <= ?")
+        let expires_at = now + lifetime.as_secs() as i64;
+        let idle_expires_at = (now + idle.as_secs() as i64).min(expires_at);
+        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1 OR idle_expires_at <= ?1")
             .bind(now)
             .execute(&self.pool)
             .await?;
-        sqlx::query("INSERT OR REPLACE INTO jti_blacklist (jti, exp) VALUES (?, ?)")
-            .bind(jti)
-            .bind(exp)
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, account_id, created_at, idle_expires_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(session_hash(&token))
+        .bind(account_id.to_string())
+        .bind(now)
+        .bind(idle_expires_at)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(token)
+    }
+
+    /// The live session behind `token`, its idle deadline pushed back by
+    /// `idle` (never past its absolute end). `None` when unknown or expired.
+    pub async fn use_session(
+        &self,
+        token: &str,
+        idle: std::time::Duration,
+    ) -> Result<Option<SessionInfo>> {
+        let now = now_unix();
+        let row = sqlx::query(
+            "UPDATE sessions SET idle_expires_at = MIN(?1 + ?2, expires_at) \
+             WHERE token_hash = ?3 AND idle_expires_at > ?1 AND expires_at > ?1 \
+             RETURNING account_id, idle_expires_at, expires_at",
+        )
+        .bind(now)
+        .bind(idle.as_secs() as i64)
+        .bind(session_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(SessionInfo {
+            account_id: row.try_get::<String, _>("account_id")?.parse()?,
+            idle_expires_at: row.try_get("idle_expires_at")?,
+            expires_at: row.try_get("expires_at")?,
+        }))
+    }
+
+    /// End the session behind `token` (sign out). Unknown tokens are ignored.
+    pub async fn delete_session(&self, token: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+            .bind(session_hash(token))
             .execute(&self.pool)
             .await?;
         Ok(())
     }
+}
 
-    /// Returns `true` if the JTI is in the persistent blacklist and has not
-    /// yet expired.
-    pub async fn is_jti_blacklisted(&self, jti: &str) -> Result<bool> {
-        let now = now_unix();
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT jti FROM jti_blacklist WHERE jti = ? AND exp > ?")
-                .bind(jti)
-                .bind(now)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.is_some())
-    }
+/// A live account session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub account_id: Uuid,
+    /// Unix time the session ends if unused.
+    pub idle_expires_at: i64,
+    /// Unix time the session ends in any case.
+    pub expires_at: i64,
+}
+
+/// SHA3-256 of a session token, hex. The token has 256 random bits: a plain
+/// hash is enough, a database dump gives no usable session.
+fn session_hash(token: &str) -> String {
+    use sha3::{Digest, Sha3_256};
+    helpers4::hex::encode(&Sha3_256::digest(token.as_bytes()))
+}
+
+fn base64_url(bytes: &[u8]) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    Base64UrlUnpadded::encode_string(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,6 +1952,125 @@ mod tests {
         let status = store.recovery_status(user.id).await.unwrap();
         assert!(status.code_created_at.is_none());
         assert!(status.last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn sessions_expire_idle_and_absolute_and_end_on_sign_out() {
+        use std::time::Duration;
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+
+        let token = store
+            .create_session(
+                user.id,
+                Duration::from_secs(3600),
+                Duration::from_secs(43200),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.len(), 43, "base64url of 32 bytes");
+        let info = store
+            .use_session(&token, Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .expect("live session");
+        assert_eq!(info.account_id, user.id);
+        assert!(info.idle_expires_at <= info.expires_at);
+
+        // Only the hash is stored.
+        let stored: Vec<String> = sqlx::query_scalar("SELECT token_hash FROM sessions")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert!(stored.iter().all(|h| h.as_str() != token.as_str()));
+
+        assert!(
+            store
+                .use_session("unknown", Duration::from_secs(3600))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Idle expiry: a session whose idle deadline passed is dead.
+        sqlx::query("UPDATE sessions SET idle_expires_at = 1")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .use_session(&token, Duration::from_secs(3600))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Absolute expiry wins over use.
+        let token = store
+            .create_session(
+                user.id,
+                Duration::from_secs(3600),
+                Duration::from_secs(43200),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET expires_at = 1 WHERE idle_expires_at > 1")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .use_session(&token, Duration::from_secs(3600))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Use never extends past the absolute end.
+        let token = store
+            .create_session(user.id, Duration::from_secs(3600), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let info = store
+            .use_session(&token, Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.idle_expires_at, info.expires_at);
+
+        store.delete_session(&token).await.unwrap();
+        assert!(
+            store
+                .use_session(&token, Duration::from_secs(3600))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Deleting the account ends its sessions.
+        let token = store
+            .create_session(
+                user.id,
+                Duration::from_secs(3600),
+                Duration::from_secs(43200),
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .use_session(&token, Duration::from_secs(3600))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

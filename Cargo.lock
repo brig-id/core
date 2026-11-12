@@ -371,9 +371,11 @@ dependencies = [
 name = "brigid-store"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "brigid-crypto",
  "brigid-identity",
  "helpers4",
+ "sha3 0.11.0",
  "sqlx",
  "thiserror 2.0.21",
  "time",
