@@ -20,7 +20,7 @@ jobs:
       matrix:
         target:
           - fuzz_parse_identifier
-          - fuzz_did_web_resolve
+          - fuzz_recovery_code
           - fuzz_jwt_validate
 
     steps:

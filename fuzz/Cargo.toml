@@ -16,7 +16,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 brigid-identity = { path = "../crates/brigid-identity" }
-brigid-did = { path = "../crates/brigid-did" }
 brigid-oidc = { path = "../crates/brigid-oidc" }
 
 [[bin]]
@@ -26,8 +25,8 @@ test = false
 doc = false
 
 [[bin]]
-name = "fuzz_did_web_resolve"
-path = "fuzz_targets/fuzz_did_web_resolve.rs"
+name = "fuzz_recovery_code"
+path = "fuzz_targets/fuzz_recovery_code.rs"
 test = false
 doc = false
 
