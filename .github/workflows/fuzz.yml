@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - fuzz_parse_identifier
+          - fuzz_parse_username
           - fuzz_recovery_code
           - fuzz_pkce
 

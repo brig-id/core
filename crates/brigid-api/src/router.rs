@@ -198,6 +198,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
     let account_routes = Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/session", get(auth::session))
+        .route("/auth/server", get(auth::server_info))
         .route("/auth/passkeys", get(auth::list_passkeys))
         .route(
             "/auth/passkeys/{id}",
@@ -272,8 +273,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             get(discovery::openid_configuration),
         )
         .route("/.well-known/jwks.json", get(discovery::jwks))
-        .layer(readable_anywhere())
-        .route("/.well-known/did.json", get(discovery::did_document));
+        .layer(readable_anywhere());
 
     let health_routes = Router::new()
         .route("/health", get(health::health))

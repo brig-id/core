@@ -1476,7 +1476,7 @@ mod tests {
             id,
             account_id,
             name: "Secret Persona".to_string(),
-            logo: "icon:solid:user-astronaut".to_string(),
+            logo: "icon:ph:rocket-launch".to_string(),
             description: Some("only my friends know".to_string()),
             created_at: now,
             updated_at: now,
@@ -1500,7 +1500,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.name, "Secret Persona");
-        assert_eq!(got.logo, "icon:solid:user-astronaut");
+        assert_eq!(got.logo, "icon:ph:rocket-launch");
         assert_eq!(got.description.as_deref(), Some("only my friends know"));
         assert!(
             fetch_identity(&pool, &master, user.id, b.id)
@@ -1567,7 +1567,7 @@ mod tests {
         store_identity(&pool, &master, &ident).await.unwrap();
 
         ident.name = "  Renamed ".to_string();
-        ident.logo = "icon:brands:github".to_string();
+        ident.logo = "icon:ph:github-logo".to_string();
         ident.description = None;
         update_identity(&pool, &master, &ident).await.unwrap();
 
@@ -1576,7 +1576,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.name, "Renamed");
-        assert_eq!(got.logo, "icon:brands:github");
+        assert_eq!(got.logo, "icon:ph:github-logo");
         assert!(got.description.is_none());
         assert!(got.updated_at >= got.created_at);
         Ok(())
@@ -2507,7 +2507,7 @@ mod tests {
             id: Uuid::new_v4(),
             account_id,
             name: name.into(),
-            logo: "icon:solid:user".into(),
+            logo: "icon:ph:user".into(),
             description: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
@@ -2568,5 +2568,57 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Migration 0013 converts each of the 45 earlier logo references, sends
+    /// any other old-form value to the plain person icon, and leaves the new
+    /// form alone.
+    #[tokio::test]
+    async fn earlier_logo_references_are_converted_to_phosphor_names() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+        let cases = [
+            ("icon:solid:user-astronaut", "icon:ph:rocket-launch"),
+            ("icon:solid:briefcase", "icon:ph:briefcase"),
+            ("icon:solid:people-roof", "icon:ph:house-line"),
+            ("icon:solid:shield-halved", "icon:ph:shield-check"),
+            ("icon:brands:github", "icon:ph:github-logo"),
+            ("icon:solid:not-in-the-library", "icon:ph:user"),
+            ("icon:ph:lighthouse", "icon:ph:lighthouse"),
+        ];
+        let mut ids = Vec::new();
+        for (legacy, _) in cases {
+            let identity = Identity {
+                id: Uuid::new_v4(),
+                account_id: user.id,
+                name: "x".into(),
+                logo: "icon:ph:user".into(),
+                description: None,
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+            };
+            store.store_identity(&identity).await.unwrap();
+            // As a database written before the migration holds it.
+            sqlx::query("UPDATE identities SET logo = ? WHERE id = ?")
+                .bind(legacy)
+                .bind(identity.id.to_string())
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            ids.push(identity.id);
+        }
+
+        let migration = include_str!("../migrations/0013_phosphor_logos.sql");
+        assert_eq!(migration.matches("WHEN 'icon:").count(), 45);
+        sqlx::query(migration).execute(&store.pool).await.unwrap();
+
+        for (id, (legacy, expected)) in ids.iter().zip(cases) {
+            let got = store.fetch_identity(user.id, *id).await.unwrap().unwrap();
+            assert_eq!(got.logo, expected, "{legacy}");
+            brigid_identity::validate_logo(&got.logo).unwrap();
+        }
     }
 }

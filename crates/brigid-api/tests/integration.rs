@@ -199,27 +199,6 @@ async fn jwks_returns_valid_json() {
     assert!(!json["keys"].as_array().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn did_document_returns_valid_json() {
-    let state = make_state().await;
-    let app = build_router(state, &[]);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .uri("/.well-known/did.json")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = response_body_json(resp.into_body()).await;
-    assert!(json["id"].as_str().unwrap().starts_with("did:web:"));
-}
-
 // ---------------------------------------------------------------------------
 // Security headers
 // ---------------------------------------------------------------------------
@@ -1807,7 +1786,7 @@ async fn identity_crud_roundtrip_and_isolation() {
         Some(serde_json::json!({
             "user_id": alice_id,
             "name": "  Pro  ",
-            "logo": "icon:solid:briefcase",
+            "logo": "icon:ph:briefcase",
             "description": "work"
         })),
     )
@@ -1819,7 +1798,7 @@ async fn identity_crud_roundtrip_and_isolation() {
 
     // Validation: no name, bad logo
     for bad in [
-        serde_json::json!({"user_id": alice_id, "name": " ", "logo": "icon:solid:x"}),
+        serde_json::json!({"user_id": alice_id, "name": " ", "logo": "icon:ph:x"}),
         serde_json::json!({"user_id": alice_id, "name": "N", "logo": "https://x/y.png"}),
     ] {
         let (status, _) = identity_request(
@@ -1866,7 +1845,7 @@ async fn identity_crud_roundtrip_and_isolation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(updated["name"], "Boulot");
-    assert_eq!(updated["logo"], "icon:solid:briefcase");
+    assert_eq!(updated["logo"], "icon:ph:briefcase");
     assert!(updated["description"].is_null());
 
     // Bob naming Alice sees his own identities, never hers...
@@ -1933,7 +1912,7 @@ async fn identity_crud_roundtrip_and_isolation() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(from_template["name"], "Les Dupont");
-    assert_eq!(from_template["logo"], "icon:solid:people-roof");
+    assert_eq!(from_template["logo"], "icon:ph:house-line");
     assert_eq!(
         from_template["description"],
         "Shared within a restricted circle."
@@ -3330,4 +3309,205 @@ async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
     .await;
     assert_eq!(j["force_choice"], true);
     assert_eq!(j["chosen"], serde_json::json!(identities[0]));
+}
+
+// ---------------------------------------------------------------------------
+// Sign-up can be closed; user verification is required
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_server_with_sign_up_closed_creates_no_account() {
+    let master = master();
+    let vsid_salt = derive_vsid_salt(&master);
+    let store = EncryptedStore::new("sqlite::memory:", master)
+        .await
+        .unwrap();
+    let origin = Url::parse("http://localhost:8080").unwrap();
+    let webauthn = WebauthnService::new("localhost", &origin).unwrap();
+    let mut state = AppState::new(
+        store,
+        webauthn,
+        OidcSigningKey::generate(),
+        origin,
+        vsid_salt,
+    )
+    .with_signup_open(false);
+    state.trust_forwarded_for = true;
+    let app = build_router(Arc::new(state), &[]);
+
+    let (status, j) = identity_request(&app, "GET", "/auth/server", None, "10.70.1.1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["sign_up"], false);
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "username": "closed@localhost" }),
+    ] {
+        let (status, j) = identity_request(
+            &app,
+            "POST",
+            "/auth/register/begin",
+            None,
+            "10.70.1.2",
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(j["error"], "sign-up is closed on this server");
+    }
+
+    // Signing in is still offered.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        "10.70.1.3",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // An open server says so.
+    let app = build_router(make_state().await, &[]);
+    let (_, j) = identity_request(&app, "GET", "/auth/server", None, "10.70.1.4", None).await;
+    assert_eq!(j["sign_up"], true);
+}
+
+/// A registration response built by hand, as an authenticator that holds a
+/// P-256 key would send it with attestation "none" (which carries no
+/// signature). `flags` is the byte of the authenticator data that says whether
+/// the user was present (0x01) and verified (0x04).
+fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use sha2::{Digest, Sha256};
+
+    fn bytes(out: &mut Vec<u8>, b: &[u8]) {
+        match b.len() {
+            n if n < 24 => out.push(0x40 | n as u8),
+            n if n < 256 => out.extend([0x58, n as u8]),
+            n => out.extend([0x59, (n >> 8) as u8, n as u8]),
+        }
+        out.extend(b);
+    }
+    fn text(out: &mut Vec<u8>, t: &str) {
+        out.push(0x60 | t.len() as u8);
+        out.extend(t.as_bytes());
+    }
+
+    // The base point of P-256: a valid public key, whose private key is 1.
+    let x: [u8; 32] = [
+        0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40,
+        0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98,
+        0xC2, 0x96,
+    ];
+    let y: [u8; 32] = [
+        0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E,
+        0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF,
+        0x51, 0xF5,
+    ];
+    // COSE_Key: {1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x, -3: y}
+    let mut cose = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21];
+    bytes(&mut cose, &x);
+    cose.push(0x22);
+    bytes(&mut cose, &y);
+
+    let credential_id = [0x42u8; 16];
+    let mut auth_data = Sha256::digest(b"localhost").to_vec();
+    auth_data.push(flags | 0x40); // attested credential data follows
+    auth_data.extend([0, 0, 0, 0]); // signature counter
+    auth_data.extend([0u8; 16]); // AAGUID
+    auth_data.extend([0, credential_id.len() as u8]);
+    auth_data.extend(credential_id);
+    auth_data.extend(&cose);
+
+    // {"fmt": "none", "attStmt": {}, "authData": bytes}
+    let mut attestation = vec![0xA3];
+    text(&mut attestation, "fmt");
+    text(&mut attestation, "none");
+    text(&mut attestation, "attStmt");
+    attestation.push(0xA0);
+    text(&mut attestation, "authData");
+    bytes(&mut attestation, &auth_data);
+
+    let client_data = format!(
+        r#"{{"type":"webauthn.create","challenge":"{challenge_b64}","origin":"http://localhost:8080","crossOrigin":false}}"#
+    );
+    let id = Base64UrlUnpadded::encode_string(&credential_id);
+    serde_json::json!({
+        "id": id,
+        "rawId": id,
+        "type": "public-key",
+        "response": {
+            "attestationObject": Base64UrlUnpadded::encode_string(&attestation),
+            "clientDataJSON": Base64UrlUnpadded::encode_string(client_data.as_bytes()),
+        },
+        "extensions": {},
+    })
+}
+
+/// Every ceremony asks for user verification, and the server refuses a
+/// response whose authenticator did not verify its user: a passkey proves the
+/// device and what unlocks it, in one gesture.
+#[tokio::test]
+async fn a_passkey_that_does_not_verify_its_user_is_refused() {
+    let app = build_router(make_state().await, &[]);
+
+    // Sign-in states the requirement.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        "10.71.1.1",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["challenge"]["publicKey"]["userVerification"], "required");
+
+    // So does sign-up. The same response is then sent twice, on two
+    // ceremonies: once saying the user was present only, once present and
+    // verified. Nothing else differs.
+    let mut outcomes = Vec::new();
+    for (n, flags) in [(1, 0x01u8), (2, 0x01 | 0x04)] {
+        let (status, j) = identity_request(
+            &app,
+            "POST",
+            "/auth/register/begin",
+            None,
+            &format!("10.71.2.{n}"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let options = &j["challenge"]["publicKey"];
+        assert_eq!(
+            options["authenticatorSelection"]["userVerification"],
+            "required"
+        );
+        let credential = handmade_registration(options["challenge"].as_str().unwrap(), flags);
+        let (status, body) = identity_request(
+            &app,
+            "POST",
+            "/auth/register/finish",
+            None,
+            &format!("10.71.3.{n}"),
+            Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+        )
+        .await;
+        outcomes.push((status, body));
+    }
+    assert_eq!(
+        outcomes[0].0,
+        StatusCode::BAD_REQUEST,
+        "present but not verified must be refused: {:?}",
+        outcomes[0].1
+    );
+    assert_eq!(
+        outcomes[1].0,
+        StatusCode::NO_CONTENT,
+        "the same response, verified, is accepted: {:?}",
+        outcomes[1].1
+    );
 }

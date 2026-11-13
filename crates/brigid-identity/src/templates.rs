@@ -2,7 +2,7 @@
 //! fields. Everything stays editable afterwards; nothing remembers which
 //! template an identity came from.
 
-/// A template's defaults. `logo` is an `icon:<style>:<name>` reference.
+/// A template's defaults. `logo` is an `icon:ph:<name>` reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdentityTemplate {
     /// Stable key, used by the API (`"work"`, `"family"`, …).
@@ -17,43 +17,43 @@ pub const TEMPLATES: &[IdentityTemplate] = &[
     IdentityTemplate {
         key: "personal",
         name: "Personal",
-        logo: "icon:solid:user",
+        logo: "icon:ph:user",
         description: "Kept strictly for yourself.",
     },
     IdentityTemplate {
         key: "work",
         name: "Work",
-        logo: "icon:solid:briefcase",
+        logo: "icon:ph:briefcase",
         description: "Work accounts and tools.",
     },
     IdentityTemplate {
         key: "developer",
         name: "Developer",
-        logo: "icon:solid:code",
+        logo: "icon:ph:code",
         description: "Developer tooling.",
     },
     IdentityTemplate {
         key: "creative",
         name: "Creative",
-        logo: "icon:solid:palette",
+        logo: "icon:ph:palette",
         description: "Creative tools and communities.",
     },
     IdentityTemplate {
         key: "family",
         name: "Family",
-        logo: "icon:solid:people-roof",
+        logo: "icon:ph:house-line",
         description: "Shared within a restricted circle.",
     },
     IdentityTemplate {
         key: "public",
         name: "Public",
-        logo: "icon:solid:globe",
+        logo: "icon:ph:globe-hemisphere-west",
         description: "Visible to everyone.",
     },
     IdentityTemplate {
         key: "isolated",
         name: "Isolated",
-        logo: "icon:solid:user-secret",
+        logo: "icon:ph:detective",
         description: "Unlinked from everything else.",
     },
 ];
