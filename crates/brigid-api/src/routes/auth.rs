@@ -79,11 +79,28 @@ pub struct PasskeySummary {
     pub label: Option<String>,
 }
 
+/// What the interface needs to know about this server before anyone signs in.
+#[derive(Serialize)]
+pub struct ServerInfo {
+    /// Whether new accounts can be created here.
+    pub sign_up: bool,
+}
+
+/// `GET /auth/server`
+pub async fn server_info(State(state): State<Arc<AppState>>) -> Json<ServerInfo> {
+    Json(ServerInfo {
+        sign_up: state.signup_open,
+    })
+}
+
 /// `POST /auth/register/begin`
 pub async fn register_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if !state.signup_open {
+        return Err(ApiError::SignupClosed);
+    }
     let host = state.host()?.to_string();
     let root_id = match body.username.as_deref() {
         Some(handle) => {

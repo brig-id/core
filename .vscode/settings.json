@@ -2,7 +2,6 @@
   "conventionalCommits.gitmoji": true,
   "conventionalCommits.scopes": [
     "store",
-    "did",
     "identity",
     "webauthn",
     "oidc",

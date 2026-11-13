@@ -54,17 +54,13 @@ fn is_slug(s: &str, max: usize) -> bool {
     s.len() <= max && helpers4::validate::is_slug(s)
 }
 
-/// Validates a logo reference. Only `icon:<style>:<name>` is accepted (an icon
-/// of the predefined library, e.g. `icon:solid:user-astronaut`). The library
-/// itself lives in the app; the server only checks the shape. `upload:<id>` is
-/// reserved for a later release and rejected for now.
+/// Validates a logo reference: `icon:ph:<name>`, an icon of the Phosphor set
+/// (e.g. `icon:ph:briefcase`). The library itself lives in the app; the server
+/// checks the shape only. Any other set, and `upload:<id>`, are refused.
 pub fn validate_logo(logo: &str) -> Result<()> {
-    let Some(rest) = logo.strip_prefix("icon:") else {
-        return invalid("logo must be an icon reference (icon:<style>:<name>)");
-    };
-    match rest.split_once(':') {
-        Some((style, name)) if is_slug(style, 32) && is_slug(name, 64) => Ok(()),
-        _ => invalid("malformed icon reference (icon:<style>:<name>)"),
+    match logo.strip_prefix("icon:ph:") {
+        Some(name) if is_slug(name, 64) => Ok(()),
+        _ => invalid("logo must be an icon reference (icon:ph:<name>)"),
     }
 }
 
@@ -95,20 +91,21 @@ mod tests {
     }
 
     #[test]
-    fn logo_accepts_only_icon_references() {
-        assert!(validate_logo("icon:solid:user-astronaut").is_ok());
-        assert!(validate_logo("icon:brands:github").is_ok());
+    fn logo_accepts_only_phosphor_references() {
+        assert!(validate_logo("icon:ph:rocket-launch").is_ok());
+        assert!(validate_logo("icon:ph:github-logo").is_ok());
         for bad in [
             "",
             "icon:",
-            "icon:solid",
-            "icon:solid:",
-            "icon::name",
-            "icon:Solid:name",
-            "icon:solid:na me",
-            "icon:solid:a:b",
+            "icon:ph",
+            "icon:ph:",
+            "icon:solid:user",
+            "icon:brands:github",
+            "icon:PH:name",
+            "icon:ph:na me",
+            "icon:ph:a:b",
             "upload:123",
-            "https://example.com/x.png",
+            "https://example.com/logo.png",
         ] {
             assert!(validate_logo(bad).is_err(), "{bad} must be rejected");
         }

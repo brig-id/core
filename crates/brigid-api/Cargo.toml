@@ -13,7 +13,6 @@ brigid-store.workspace = true
 brigid-webauthn.workspace = true
 brigid-oidc.workspace = true
 brigid-identity.workspace = true
-brigid-did.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -37,6 +36,7 @@ webauthn-rs = { version = "0.5", features = [
 webauthn-rs-proto = "0.5"
 brigid-crypto.workspace = true
 ed25519-dalek = "3"
+sha2 = "0.11"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

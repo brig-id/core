@@ -148,6 +148,9 @@ pub struct AppState {
     pub pending_authorizations: Arc<Mutex<HashMap<String, PendingAuthorization>>>,
     /// Authorization codes waiting to be exchanged, by code.
     pub authorization_codes: Arc<Mutex<HashMap<String, IssuedCode>>>,
+    /// Whether new accounts can be created. Closing it leaves sign-in,
+    /// recovery and added passkeys untouched.
+    pub signup_open: bool,
     /// Whether to trust `x-forwarded-for` for rate-limit key extraction.
     ///
     /// MUST be `true` only when the API is reachable exclusively through a
@@ -178,6 +181,7 @@ impl AppState {
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
             authorization_codes: Arc::new(Mutex::new(HashMap::new())),
+            signup_open: true,
             // Default to false — safe for direct exposure and tests. The
             // production deployment binary (`server-leaf`) must opt-in when
             // Caddy (or another trusted proxy) terminates the public TLS edge.
@@ -190,6 +194,13 @@ impl AppState {
     pub fn with_session_timeouts(mut self, idle: Duration, lifetime: Duration) -> Self {
         self.session_idle = idle;
         self.session_lifetime = lifetime;
+        self
+    }
+
+    /// Open or close the creation of accounts.
+    #[must_use]
+    pub fn with_signup_open(mut self, open: bool) -> Self {
+        self.signup_open = open;
         self
     }
 

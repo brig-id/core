@@ -28,6 +28,10 @@ pub enum ApiError {
     #[error("forbidden")]
     Forbidden,
 
+    /// The server does not take new accounts (`AppState::signup_open`).
+    #[error("sign-up is closed on this server")]
+    SignupClosed,
+
     #[error("too many requests")]
     TooManyRequests,
 
@@ -42,7 +46,9 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
+            ApiError::Forbidden | ApiError::SignupClosed => {
+                (StatusCode::FORBIDDEN, self.to_string())
+            }
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::Internal(cause) => {

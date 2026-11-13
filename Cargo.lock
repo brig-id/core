@@ -276,7 +276,6 @@ dependencies = [
  "axum",
  "base64ct",
  "brigid-crypto",
- "brigid-did",
  "brigid-identity",
  "brigid-oidc",
  "brigid-store",
@@ -286,6 +285,7 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -319,16 +319,6 @@ dependencies = [
  "thiserror 2.0.21",
  "x25519-dalek",
  "zeroize",
-]
-
-[[package]]
-name = "brigid-did"
-version = "0.1.0"
-dependencies = [
- "bs58",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -405,15 +395,6 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-proto",
-]
-
-[[package]]
-name = "bs58"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
-dependencies = [
- "tinyvec",
 ]
 
 [[package]]

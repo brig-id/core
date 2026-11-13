@@ -13,8 +13,7 @@ issues, pull requests. No exceptions.
 | Crate | Purpose |
 | --- | --- |
 | `brigid-store` | Zero-trust SQLite storage (all data encrypted before INSERT) |
-| `brigid-did` | DID:web and DID:peer resolution + `.well-known/did.json` handler |
-| `brigid-identity` | `RootId`, `PrivateAlias`, `IdentifierKind`, VSID computation |
+| `brigid-identity` | `RootId` (the account's hidden username), VSID computation, recovery codes, identity labels |
 | `brigid-webauthn` | Passkey registration and authentication flows |
 | `brigid-oidc` | ID token issuance (EdDSA), PKCE, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
@@ -66,7 +65,6 @@ POST /token                            → ID token (sub = VSID), EdDSA
 
 GET /.well-known/openid-configuration
 GET /.well-known/jwks.json
-GET /.well-known/did.json
 ```
 
 ## Key crates
@@ -101,7 +99,6 @@ Format: `type(scope): <emoji> description`
 | Scope | Maps to |
 | --- | --- |
 | `store` | `crates/brigid-store` |
-| `did` | `crates/brigid-did` |
 | `identity` | `crates/brigid-identity` |
 | `webauthn` | `crates/brigid-webauthn` |
 | `oidc` | `crates/brigid-oidc` |
