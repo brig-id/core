@@ -23,10 +23,9 @@ pub struct Credential {
     pub data: Vec<u8>,
 }
 
-/// An identity: what a relying party sees. It belongs to one account (`users`).
-///
-/// never changes the VSID derived from it. `logo` is an `icon:<style>:<name>`
-/// reference.
+/// An identity of an account (`users`). Its `name` and `logo` are labels for
+/// the person, inside brig·id: no relying party receives them, only the VSID
+/// derived from `id`. `logo` is an `icon:<style>:<name>` reference.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub id: Uuid,
@@ -54,4 +53,20 @@ pub struct RecoveryStatus {
     pub code_created_at: Option<OffsetDateTime>,
     /// When a code was last used to recover the account.
     pub last_used_at: Option<OffsetDateTime>,
+}
+
+/// A registered relying party (ADR-005 §2): a site that may ask this server to
+/// sign people in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    pub client_id: String,
+    /// Shown to the person on the page that links an identity to the site.
+    pub name: String,
+    /// Where the person may be sent back, compared exactly.
+    pub redirect_uris: Vec<String>,
+    /// Whether the client authenticates with a secret at the token endpoint.
+    /// A public client has none.
+    pub confidential: bool,
+    /// Unix seconds.
+    pub created_at: i64,
 }
