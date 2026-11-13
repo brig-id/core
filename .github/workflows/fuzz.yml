@@ -21,7 +21,7 @@ jobs:
         target:
           - fuzz_parse_identifier
           - fuzz_recovery_code
-          - fuzz_jwt_validate
+          - fuzz_pkce
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
