@@ -16,7 +16,7 @@ issues, pull requests. No exceptions.
 | `brigid-did` | DID:web and DID:peer resolution + `.well-known/did.json` handler |
 | `brigid-identity` | `RootId`, `PrivateAlias`, `IdentifierKind`, VSID computation |
 | `brigid-webauthn` | Passkey registration and authentication flows |
-| `brigid-oidc` | ID Token issuance, JWKS, `.well-known/openid-configuration` |
+| `brigid-oidc` | ID token issuance (EdDSA), PKCE, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
 
 ## Roadmap & planning
@@ -42,7 +42,9 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 - **No secrets in logs** — `tracing` spans must never capture key material, credentials, or tokens.
 - **No `unwrap()` on error paths** — typed errors via `thiserror`.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
-- **OIDC** — `jti` store must have TTL = token `exp`; never grow unbounded.
+- **OIDC** — Authorization Code flow only, PKCE `S256` for every client, EdDSA only; a
+  relying party receives a VSID and nothing about the identity (name and logo never leave
+  the server). Pending requests and codes are held in memory with a TTL and a cap.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
   (`default-src 'self'`, no `unsafe-inline`).
 - **Rate limiting** — per client IP via `tower-governor`: the WebAuthn ceremonies
@@ -55,7 +57,12 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 POST /auth/register/begin  → WebAuthn CreationChallenge
 POST /auth/register/finish → store encrypted credential
 POST /auth/login/begin     → WebAuthn RequestChallenge
-POST /auth/login/finish    → ID Token (sub = VSID)
+POST /auth/login/finish    → account session (HttpOnly cookie), no token
+
+GET  /authorize                        → relying party's request, held; 303 to the UI page /continue
+GET  /auth/authorize/{request}         → what the page shows (site name, identities)
+POST /auth/authorize/{request}/approve → code for the chosen identity (also /deny, /silent)
+POST /token                            → ID token (sub = VSID), EdDSA
 
 GET /.well-known/openid-configuration
 GET /.well-known/jwks.json

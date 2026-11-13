@@ -1,4 +1,5 @@
-//! Display fields of an **identity** (what a relying party sees).
+//! Display fields of an **identity**: labels for the person, never sent to a
+//! relying party.
 //!
 //! An identity belongs to a private account and is identified by its UUID
 //! (ADR-007): renaming it never changes the VSID derived from that id.

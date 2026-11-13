@@ -137,14 +137,13 @@ async fn ready_returns_200_when_db_accessible() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn no_openid_configuration_until_the_relying_party_flow_exists() {
+async fn openid_configuration_describes_the_code_flow() {
     let state = make_state().await;
     let app = build_router(state, &[]);
 
     let resp = app
         .oneshot(
             Request::builder()
-                .header("origin", ORIGIN)
                 .uri("/.well-known/openid-configuration")
                 .body(Body::empty())
                 .unwrap(),
@@ -152,9 +151,30 @@ async fn no_openid_configuration_until_the_relying_party_flow_exists() {
         .await
         .unwrap();
 
-    // ADR-005 §3: advertising an OIDC provider no client can use is worse than
-    // none. It comes back with the Authorization Code flow.
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A public client reads it from its own origin.
+    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+    let json = response_body_json(resp.into_body()).await;
+    assert_eq!(json["issuer"], "http://localhost:8080");
+    assert_eq!(
+        json["authorization_endpoint"],
+        "http://localhost:8080/authorize"
+    );
+    assert_eq!(json["token_endpoint"], "http://localhost:8080/token");
+    assert_eq!(
+        json["response_types_supported"],
+        serde_json::json!(["code"])
+    );
+    assert_eq!(json["scopes_supported"], serde_json::json!(["openid"]));
+    assert_eq!(
+        json["id_token_signing_alg_values_supported"],
+        serde_json::json!(["EdDSA"])
+    );
+    assert_eq!(
+        json["code_challenge_methods_supported"],
+        serde_json::json!(["S256"])
+    );
+    assert!(json.get("userinfo_endpoint").is_none());
 }
 
 #[tokio::test]
@@ -2557,4 +2577,757 @@ async fn signup_without_username_signs_in() {
     assert_eq!(j.as_array().unwrap().len(), 3);
 
     let _ = (user_id, rp_origin);
+}
+
+// ---------------------------------------------------------------------------
+// Relying parties: /authorize, /auth/authorize/*, /token (ADR-005 §2, ADR-008)
+// ---------------------------------------------------------------------------
+
+/// RFC 7636 appendix B.
+const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const REDIRECT: &str = "https://shop.example/cb";
+
+/// An authorization request as a relying party sends the browser: from
+/// another site, so without `Origin` and without the session cookie.
+async fn authorize(app: &axum::Router, query: &str, xff: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/authorize?{query}"))
+                .header("x-forwarded-for", xff)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    resp.headers()["location"].to_str().unwrap().to_string()
+}
+
+/// The query of a valid authorization request for `client_id`.
+fn authorize_query(client_id: &str, extra: &str) -> String {
+    format!(
+        "response_type=code&scope=openid&client_id={client_id}\
+         &redirect_uri=https%3A%2F%2Fshop.example%2Fcb&state=xyz&nonce=n-0S6\
+         &code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256{extra}"
+    )
+}
+
+/// Starts a valid authorization request and returns its id.
+async fn begin_authorization(
+    app: &axum::Router,
+    client_id: &str,
+    extra: &str,
+    xff: &str,
+) -> String {
+    let location = authorize(app, &authorize_query(client_id, extra), xff).await;
+    location
+        .strip_prefix("/continue?request=")
+        .unwrap_or_else(|| panic!("unexpected redirect: {location}"))
+        .to_string()
+}
+
+fn query_of(uri: &str) -> std::collections::HashMap<String, String> {
+    Url::parse(uri)
+        .unwrap()
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+/// `POST /token`, as a relying party's server does: no cookie, no `Origin`.
+async fn token_request(
+    app: &axum::Router,
+    form: &[(&str, &str)],
+    basic: Option<(&str, &str)>,
+    xff: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+    use base64ct::Encoding;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form)
+        .finish();
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("x-forwarded-for", xff);
+    if let Some((id, secret)) = basic {
+        req = req.header(
+            "authorization",
+            format!(
+                "Basic {}",
+                base64ct::Base64::encode_string(format!("{id}:{secret}").as_bytes())
+            ),
+        );
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let (status, headers) = (resp.status(), resp.headers().clone());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, headers, json)
+}
+
+/// Checks an ID token the way a relying party does, without any brig·id
+/// code: the EdDSA signature against the published key, then the payload.
+fn verified_claims(state: &AppState, jwt: &str) -> serde_json::Value {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use ed25519_dalek::{Signature, Verifier};
+    let mut parts = jwt.split('.');
+    let (header, payload, signature) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    assert!(parts.next().is_none());
+    let head: serde_json::Value =
+        serde_json::from_slice(&Base64UrlUnpadded::decode_vec(header).unwrap()).unwrap();
+    assert_eq!(head["alg"], "EdDSA");
+    assert_eq!(head["kid"], state.oidc_key.kid());
+    let signature =
+        Signature::from_slice(&Base64UrlUnpadded::decode_vec(signature).unwrap()).unwrap();
+    state
+        .oidc_key
+        .verifying_key()
+        .verify(format!("{header}.{payload}").as_bytes(), &signature)
+        .expect("the ID token is signed by the server's key");
+    serde_json::from_slice(&Base64UrlUnpadded::decode_vec(payload).unwrap()).unwrap()
+}
+
+/// A signed-in account with its identities, and an authenticator to go with.
+async fn signed_in_account(
+    app: &axum::Router,
+    username: &str,
+    xff_base: &str,
+) -> (String, Uuid, Vec<Uuid>) {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (cookie, account_id, _) =
+        register_and_login_for_passkey_tests(app.clone(), username, &rp_origin, &mut dev, xff_base)
+            .await;
+    let (status, list) = identity_request(
+        app,
+        "GET",
+        "/account/identities",
+        Some(&cookie),
+        &format!("{xff_base}.9"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| serde_json::from_value(i["id"].clone()).unwrap())
+        .collect();
+    (cookie, account_id, ids)
+}
+
+/// Approves request `id` as `identity` and returns the code sent back.
+async fn approve(app: &axum::Router, id: &str, cookie: &str, identity: Uuid, xff: &str) -> String {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        &format!("/auth/authorize/{id}/approve"),
+        Some(cookie),
+        xff,
+        Some(serde_json::json!({ "identity_id": identity })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let redirect_to = j["redirect_to"].as_str().unwrap();
+    assert!(redirect_to.starts_with(REDIRECT), "{redirect_to}");
+    let q = query_of(redirect_to);
+    assert_eq!(q["state"], "xyz");
+    assert_eq!(q["iss"], "http://localhost:8080");
+    q["code"].clone()
+}
+
+#[tokio::test]
+async fn a_site_signs_a_person_in_and_learns_an_identifier_only() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (shop, secret) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], true)
+        .await
+        .unwrap();
+    let secret = secret.unwrap();
+    let (cookie, _, identities) = signed_in_account(&app, "site@localhost", "10.60.1").await;
+    assert!(
+        identities.len() >= 2,
+        "an account starts with several identities"
+    );
+
+    // The site sends the browser; the request waits for the person.
+    let id = begin_authorization(&app, &shop.client_id, "", "10.60.2.1").await;
+
+    // The page reads it. Without a session: the site's name, nothing else.
+    let uri = format!("/auth/authorize/{id}");
+    let (status, j) = identity_request(&app, "GET", &uri, None, "10.60.2.2", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["client"]["name"], "Shop");
+    assert_eq!(j["signed_in"], false);
+    assert_eq!(j["must_sign_in"], true);
+    assert_eq!(j["identities"], serde_json::json!([]));
+
+    // With the session: the account's identities, none chosen yet.
+    let (status, j) = identity_request(&app, "GET", &uri, Some(&cookie), "10.60.2.3", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["signed_in"], true);
+    assert_eq!(j["must_sign_in"], false);
+    assert_eq!(j["silent"], false);
+    assert_eq!(j["identities"].as_array().unwrap().len(), identities.len());
+    assert_eq!(j["chosen"], serde_json::Value::Null);
+
+    // Nobody answers without a session, and not with someone else's identity.
+    let approve_uri = format!("/auth/authorize/{id}/approve");
+    let body = serde_json::json!({ "identity_id": identities[0] });
+    let (status, _) =
+        identity_request(&app, "POST", &approve_uri, None, "10.60.2.4", Some(body)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        &approve_uri,
+        Some(&cookie),
+        "10.60.2.5",
+        Some(serde_json::json!({ "identity_id": Uuid::new_v4() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The person continues as their first identity.
+    let code = approve(&app, &id, &cookie, identities[0], "10.60.2.6").await;
+    // The request is answered once.
+    let (status, _) = identity_request(&app, "GET", &uri, Some(&cookie), "10.60.2.7", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The site exchanges the code.
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, headers, j) =
+        token_request(&app, &form, Some((&shop.client_id, &secret)), "10.60.3.1").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert_eq!(j["token_type"], "Bearer");
+    assert_eq!(j["expires_in"], 300);
+    assert_eq!(j["access_token"].as_str().unwrap().len(), 64);
+
+    let claims = verified_claims(&state, j["id_token"].as_str().unwrap());
+    let expected = brigid_identity::identity_vsid(identities[0], &shop.client_id, &state.vsid_salt);
+    assert_eq!(claims["sub"], expected.as_str());
+    assert_eq!(claims["iss"], "http://localhost:8080");
+    assert_eq!(claims["aud"], shop.client_id.as_str());
+    assert_eq!(claims["nonce"], "n-0S6");
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        300
+    );
+    assert!(claims["auth_time"].as_i64().unwrap() <= claims["iat"].as_i64().unwrap());
+    // The identifier and the token's own fields: no name, no logo, no account.
+    let mut names: Vec<&str> = claims
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "aud",
+            "auth_time",
+            "exp",
+            "iat",
+            "iss",
+            "jti",
+            "nonce",
+            "sub"
+        ]
+    );
+
+    // The code worked once.
+    let (status, _, j) =
+        token_request(&app, &form, Some((&shop.client_id, &secret)), "10.60.3.2").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "invalid_grant");
+
+    // Next time the choice is remembered; another identity is another person
+    // for the site.
+    let id = begin_authorization(&app, &shop.client_id, "", "10.60.4.1").await;
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{id}"),
+        Some(&cookie),
+        "10.60.4.2",
+        None,
+    )
+    .await;
+    assert_eq!(j["chosen"], serde_json::json!(identities[0]));
+    let code = approve(&app, &id, &cookie, identities[1], "10.60.4.3").await;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+        ("client_id", shop.client_id.as_str()),
+        ("client_secret", secret.as_str()),
+    ];
+    let (status, _, j) = token_request(&app, &form, None, "10.60.4.4").await;
+    assert_eq!(status, StatusCode::OK, "client_secret_post: {j}");
+    let other = verified_claims(&state, j["id_token"].as_str().unwrap());
+    assert_ne!(other["sub"], claims["sub"]);
+
+    // The same identity at another site has another identifier.
+    let (forum, _) = state
+        .store
+        .create_client("Forum", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    let id = begin_authorization(&app, &forum.client_id, "", "10.60.5.1").await;
+    let code = approve(&app, &id, &cookie, identities[0], "10.60.5.2").await;
+    // A public client: no secret, PKCE alone.
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+        ("client_id", forum.client_id.as_str()),
+    ];
+    let (status, _, j) = token_request(&app, &form, None, "10.60.5.3").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let at_forum = verified_claims(&state, j["id_token"].as_str().unwrap());
+    assert_ne!(at_forum["sub"], claims["sub"]);
+    assert_eq!(at_forum["aud"], forum.client_id.as_str());
+}
+
+#[tokio::test]
+async fn an_authorization_request_is_checked_before_anyone_is_asked() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (shop, _) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], true)
+        .await
+        .unwrap();
+    let id = &shop.client_id;
+
+    // An unknown site, or a place it did not register: nothing is sent
+    // anywhere but to this server's own page.
+    let location = authorize(&app, &authorize_query("unknown", ""), "10.61.1.1").await;
+    assert_eq!(location, "/continue?error=unknown_client");
+    for redirect in [
+        "https%3A%2F%2Fevil.example%2Fcb",
+        "https%3A%2F%2Fshop.example%2Fcb%2Fextra",
+        "https%3A%2F%2Fshop.example%2Fcb%3Fx%3D1",
+    ] {
+        let query = format!(
+            "response_type=code&scope=openid&client_id={id}&redirect_uri={redirect}\
+             &code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256"
+        );
+        let location = authorize(&app, &query, "10.61.1.2").await;
+        assert_eq!(
+            location, "/continue?error=invalid_redirect_uri",
+            "{redirect}"
+        );
+    }
+
+    // Everything else goes back to the site, as an error, with its state.
+    let base = format!("client_id={id}&redirect_uri=https%3A%2F%2Fshop.example%2Fcb&state=xyz");
+    let pkce = format!("code_challenge={PKCE_CHALLENGE}&code_challenge_method=S256");
+    let cases = [
+        (
+            format!("{base}&response_type=code&scope=openid"),
+            "invalid_request",
+        ),
+        (
+            format!(
+                "{base}&response_type=code&scope=openid&code_challenge={PKCE_CHALLENGE}&code_challenge_method=plain"
+            ),
+            "invalid_request",
+        ),
+        (
+            format!(
+                "{base}&response_type=code&scope=openid&code_challenge=short&code_challenge_method=S256"
+            ),
+            "invalid_request",
+        ),
+        (
+            format!("{base}&response_type=token&scope=openid&{pkce}"),
+            "unsupported_response_type",
+        ),
+        (
+            format!("{base}&response_type=id_token&scope=openid&{pkce}"),
+            "unsupported_response_type",
+        ),
+        (
+            format!("{base}&response_type=code&scope=profile&{pkce}"),
+            "invalid_scope",
+        ),
+        (format!("{base}&response_type=code&{pkce}"), "invalid_scope"),
+        (
+            format!("{base}&response_type=code&scope=openid&{pkce}&request=x"),
+            "request_not_supported",
+        ),
+        (
+            format!("{base}&response_type=code&scope=openid&{pkce}&request_uri=https%3A%2F%2Fx"),
+            "request_uri_not_supported",
+        ),
+        (
+            format!("{base}&response_type=code&scope=openid&{pkce}&prompt=none+login"),
+            "invalid_request",
+        ),
+        (
+            format!("{base}&response_type=code&scope=openid&{pkce}&max_age=soon"),
+            "invalid_request",
+        ),
+    ];
+    for (n, (query, error)) in cases.iter().enumerate() {
+        let location = authorize(&app, query, &format!("10.61.2.{n}")).await;
+        assert!(location.starts_with(REDIRECT), "{query}: {location}");
+        let q = query_of(&location);
+        assert_eq!(q["error"], *error, "{query}");
+        assert_eq!(q["state"], "xyz");
+        assert_eq!(q["iss"], "http://localhost:8080");
+        assert!(!q.contains_key("code"));
+    }
+
+    // Unknown parameters and extra scopes are ignored; the form works too.
+    let query = authorize_query(id, "&unknown=1&scope=openid+profile+email");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/authorize")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "https://shop.example")
+                .header("x-forwarded-for", "10.61.3.1")
+                .body(Body::from(query))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert!(location.starts_with("/continue?request="), "{location}");
+
+    // The person may decline: the site is told, and gets no code.
+    let request = location.strip_prefix("/continue?request=").unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        &format!("/auth/authorize/{request}/deny"),
+        None,
+        "10.61.3.2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let q = query_of(j["redirect_to"].as_str().unwrap());
+    assert_eq!(q["error"], "access_denied");
+    assert_eq!(q["state"], "xyz");
+
+    // The answer comes from this server's own page only.
+    let request = begin_authorization(&app, id, "", "10.61.4.1").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/auth/authorize/{request}/deny"))
+                .header("origin", "https://evil.example")
+                .header("x-forwarded-for", "10.61.4.2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_token_endpoint_gives_nothing_without_the_client_the_code_and_the_verifier() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (shop, secret) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], true)
+        .await
+        .unwrap();
+    let secret = secret.unwrap();
+    let (forum, _) = state
+        .store
+        .create_client("Forum", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    let (cookie, _, identities) = signed_in_account(&app, "tok@localhost", "10.62.1").await;
+
+    // A fresh code for the shop each time: a code is spent at its first
+    // presentation, valid or not.
+    let mut n = 0u32;
+    let mut fresh_code = async |client_id: &str| {
+        n += 1;
+        let id = begin_authorization(&app, client_id, "", &format!("10.62.2.{n}")).await;
+        approve(&app, &id, &cookie, identities[0], &format!("10.62.3.{n}")).await
+    };
+    let shop_auth = Some((shop.client_id.as_str(), secret.as_str()));
+
+    // The client does not prove who it is.
+    let code = fresh_code(&shop.client_id).await;
+    let form = |code: &'static str| {
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", PKCE_VERIFIER),
+        ]
+    };
+    let code: &'static str = Box::leak(code.into_boxed_str());
+    for (auth, extra) in [
+        (Some((shop.client_id.as_str(), "wrong")), None),
+        (None, Some(("client_id", shop.client_id.as_str()))),
+        (Some(("unknown", secret.as_str())), None),
+        (None, None),
+    ] {
+        let mut f = form(code);
+        f.extend(extra);
+        let (status, headers, j) = token_request(&app, &f, auth, "10.62.4.1").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{j}");
+        assert_eq!(j["error"], "invalid_client");
+        assert!(headers.contains_key("www-authenticate"));
+        assert!(j.get("id_token").is_none());
+    }
+    // A secret presented for a client that has none.
+    let mut f = form(code);
+    f.extend([
+        ("client_id", forum.client_id.as_str()),
+        ("client_secret", "x"),
+    ]);
+    let (status, _, j) = token_request(&app, &f, None, "10.62.4.2").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{j}");
+    // Two authentication methods at once.
+    let mut f = form(code);
+    f.push(("client_secret", secret.as_str()));
+    let (status, _, j) = token_request(&app, &f, shop_auth, "10.62.4.3").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "invalid_request");
+    // None of these touched the code: the right client can still use it.
+    let (status, _, _) = token_request(&app, &form(code), shop_auth, "10.62.4.4").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another grant type.
+    let (status, _, j) = token_request(
+        &app,
+        &[("grant_type", "client_credentials")],
+        shop_auth,
+        "10.62.5.1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "unsupported_grant_type");
+
+    // The code, with something missing or wrong: refused, and spent.
+    let wrong_verifier = "a".repeat(43);
+    let bad: [Vec<(&str, &str)>; 4] = [
+        vec![("redirect_uri", REDIRECT)],
+        vec![
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", &wrong_verifier),
+        ],
+        vec![("code_verifier", PKCE_VERIFIER)],
+        vec![
+            ("redirect_uri", "https://shop.example/other"),
+            ("code_verifier", PKCE_VERIFIER),
+        ],
+    ];
+    for (i, extra) in bad.iter().enumerate() {
+        let code = fresh_code(&shop.client_id).await;
+        let mut f = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+        ];
+        f.extend(extra.iter().copied());
+        let (status, _, j) = token_request(&app, &f, shop_auth, &format!("10.62.6.{i}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra:?}: {j}");
+        assert_eq!(j["error"], "invalid_grant", "{extra:?}");
+        // Presenting it again, correctly this time, changes nothing.
+        let ok = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", PKCE_VERIFIER),
+        ];
+        let (status, _, j) = token_request(&app, &ok, shop_auth, &format!("10.62.7.{i}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    }
+
+    // A code issued to one client is worth nothing to another.
+    let code = fresh_code(&forum.client_id).await;
+    let f = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) = token_request(&app, &f, shop_auth, "10.62.8.1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "invalid_grant");
+
+    // An identity deleted between the choice and the exchange gives no token.
+    let code = fresh_code(&shop.client_id).await;
+    let (status, _) = identity_request(
+        &app,
+        "DELETE",
+        &format!("/account/identities/{}", identities[0]),
+        Some(&cookie),
+        "10.62.9.1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let f = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) = token_request(&app, &f, shop_auth, "10.62.9.2").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (shop, _) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    let id = &shop.client_id;
+    let (cookie, account_id, identities) =
+        signed_in_account(&app, "prompt@localhost", "10.63.1").await;
+
+    let silent = async |request: &str, cookie: Option<&str>, xff: &str| {
+        let (status, j) = identity_request(
+            &app,
+            "POST",
+            &format!("/auth/authorize/{request}/silent"),
+            cookie,
+            xff,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        query_of(j["redirect_to"].as_str().unwrap())
+    };
+
+    // prompt=none, nobody signed in: the site is told so, no page.
+    let request = begin_authorization(&app, id, "&prompt=none", "10.63.2.1").await;
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{request}"),
+        None,
+        "10.63.2.2",
+        None,
+    )
+    .await;
+    assert_eq!(j["silent"], true);
+    assert_eq!(
+        silent(&request, None, "10.63.2.3").await["error"],
+        "login_required"
+    );
+
+    // Signed in, but no identity was ever chosen for this site.
+    let request = begin_authorization(&app, id, "&prompt=none", "10.63.3.1").await;
+    assert_eq!(
+        silent(&request, Some(&cookie), "10.63.3.2").await["error"],
+        "interaction_required"
+    );
+
+    // Once chosen, a silent request gets its code.
+    let request = begin_authorization(&app, id, "", "10.63.4.1").await;
+    approve(&app, &request, &cookie, identities[0], "10.63.4.2").await;
+    let request = begin_authorization(&app, id, "&prompt=none", "10.63.4.3").await;
+    let q = silent(&request, Some(&cookie), "10.63.4.4").await;
+    assert!(q.contains_key("code"), "{q:?}");
+    assert_eq!(q["state"], "xyz");
+
+    // `silent` only answers requests that asked for it.
+    let request = begin_authorization(&app, id, "", "10.63.5.1").await;
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        &format!("/auth/authorize/{request}/silent"),
+        Some(&cookie),
+        "10.63.5.2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // prompt=login and max_age need a passkey ceremony more recent than the
+    // session has. Sessions are dated to the second.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    for extra in ["&prompt=login", "&max_age=0"] {
+        let request = begin_authorization(&app, id, extra, "10.63.6.1").await;
+        let uri = format!("/auth/authorize/{request}");
+        let (_, j) = identity_request(&app, "GET", &uri, Some(&cookie), "10.63.6.2", None).await;
+        assert_eq!(j["signed_in"], true, "{extra}");
+        assert_eq!(j["must_sign_in"], true, "{extra}");
+        let (status, _) = identity_request(
+            &app,
+            "POST",
+            &format!("{uri}/approve"),
+            Some(&cookie),
+            "10.63.6.3",
+            Some(serde_json::json!({ "identity_id": identities[0] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{extra}");
+
+        // A session opened after the request (what a new sign-in gives).
+        let fresh = state
+            .store
+            .create_session(account_id, state.session_idle, state.session_lifetime)
+            .await
+            .unwrap();
+        let fresh = format!("brigid_session={}", *fresh);
+        let (_, j) = identity_request(&app, "GET", &uri, Some(&fresh), "10.63.6.4", None).await;
+        assert_eq!(j["must_sign_in"], false, "{extra}");
+        approve(&app, &request, &fresh, identities[0], "10.63.6.5").await;
+    }
+
+    // prompt=select_account asks for the choice to be shown again.
+    let request = begin_authorization(&app, id, "&prompt=select_account", "10.63.7.1").await;
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{request}"),
+        Some(&cookie),
+        "10.63.7.2",
+        None,
+    )
+    .await;
+    assert_eq!(j["force_choice"], true);
+    assert_eq!(j["chosen"], serde_json::json!(identities[0]));
 }

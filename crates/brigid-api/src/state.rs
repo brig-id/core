@@ -57,6 +57,58 @@ pub struct PendingAuthentication {
     pub created_at: Instant,
 }
 
+/// What the `prompt` parameter of an authorization request asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prompt {
+    /// Nothing in particular.
+    Default,
+    /// A new passkey ceremony, whatever the session.
+    Login,
+    /// Show the choice of identity even if one is remembered
+    /// (`consent`, `select_account`).
+    Select,
+    /// No interface at all: answer from what is already known, or fail.
+    None,
+}
+
+/// An authorization request (ADR-005 §2) that passed validation and waits
+/// for the person: sign in if needed, then choose an identity.
+#[derive(Debug, Clone)]
+pub struct PendingAuthorization {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub nonce: Option<String>,
+    /// PKCE `S256` challenge (ADR-008: every client sends one).
+    pub code_challenge: String,
+    pub prompt: Prompt,
+    /// `max_age`: the passkey ceremony must be at most this many seconds old.
+    pub max_age: Option<i64>,
+    pub created_at: Instant,
+    /// Unix time of the request: with `prompt=login`, the passkey ceremony
+    /// must be more recent.
+    pub created_unix: i64,
+}
+
+/// An authorization code waiting to be exchanged at the token endpoint.
+pub struct IssuedCode {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub nonce: Option<String>,
+    pub account_id: Uuid,
+    pub identity_id: Uuid,
+    /// Unix time of the passkey ceremony behind the session.
+    pub auth_time: i64,
+    pub created_at: Instant,
+}
+
+/// A person has ten minutes to sign in and choose an identity.
+pub(crate) const PENDING_AUTHORIZATION_TTL: Duration = Duration::from_secs(600);
+
+/// A relying party has one minute to exchange a code.
+pub(crate) const AUTHORIZATION_CODE_TTL: Duration = Duration::from_secs(60);
+
 /// Challenge sessions expire after 5 minutes of inactivity.
 pub(crate) const PENDING_SESSION_TTL: Duration = Duration::from_secs(300);
 
@@ -92,6 +144,10 @@ pub struct AppState {
     pub vsid_salt: [u8; 32],
     pub pending_registrations: Arc<Mutex<HashMap<Uuid, PendingRegistration>>>,
     pub pending_authentications: Arc<Mutex<HashMap<Uuid, PendingAuthentication>>>,
+    /// Authorization requests waiting for the person, by request id.
+    pub pending_authorizations: Arc<Mutex<HashMap<String, PendingAuthorization>>>,
+    /// Authorization codes waiting to be exchanged, by code.
+    pub authorization_codes: Arc<Mutex<HashMap<String, IssuedCode>>>,
     /// Whether to trust `x-forwarded-for` for rate-limit key extraction.
     ///
     /// MUST be `true` only when the API is reachable exclusively through a
@@ -120,6 +176,8 @@ impl AppState {
             vsid_salt,
             pending_registrations: Arc::new(Mutex::new(HashMap::new())),
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
+            pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
+            authorization_codes: Arc::new(Mutex::new(HashMap::new())),
             // Default to false — safe for direct exposure and tests. The
             // production deployment binary (`server-leaf`) must opt-in when
             // Caddy (or another trusted proxy) terminates the public TLS edge.
@@ -170,6 +228,70 @@ impl AppState {
             .collect()
     }
 
+    /// This server's issuer identifier: its base URL without a trailing slash.
+    pub fn issuer(&self) -> &str {
+        self.base_url.as_str().trim_end_matches('/')
+    }
+
+    /// Keep an authorization request for the person to answer; returns its
+    /// id. `None` when too many are waiting already.
+    pub fn hold_authorization(&self, request: PendingAuthorization) -> Option<String> {
+        let id = random_token()?;
+        let mut pending = self
+            .pending_authorizations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, v| v.created_at.elapsed() < PENDING_AUTHORIZATION_TTL);
+        if pending.len() >= PENDING_SESSION_MAX_CAPACITY {
+            return None;
+        }
+        pending.insert(id.clone(), request);
+        Some(id)
+    }
+
+    /// The authorization request `id`, if it is still waiting.
+    pub fn pending_authorization(&self, id: &str) -> Option<PendingAuthorization> {
+        self.pending_authorizations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .filter(|v| v.created_at.elapsed() < PENDING_AUTHORIZATION_TTL)
+            .cloned()
+    }
+
+    /// Take the authorization request `id` out: it is answered once.
+    pub fn take_authorization(&self, id: &str) -> Option<PendingAuthorization> {
+        self.pending_authorizations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+            .filter(|v| v.created_at.elapsed() < PENDING_AUTHORIZATION_TTL)
+    }
+
+    /// Issue an authorization code. `None` when too many are waiting already.
+    pub fn issue_code(&self, code: IssuedCode) -> Option<String> {
+        let value = random_token()?;
+        let mut codes = self
+            .authorization_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        codes.retain(|_, v| v.created_at.elapsed() < AUTHORIZATION_CODE_TTL);
+        if codes.len() >= PENDING_SESSION_MAX_CAPACITY {
+            return None;
+        }
+        codes.insert(value.clone(), code);
+        Some(value)
+    }
+
+    /// Take a code out, whatever happens next: a code is presented once.
+    pub fn redeem_code(&self, code: &str) -> Option<IssuedCode> {
+        self.authorization_codes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(code)
+            .filter(|v| v.created_at.elapsed() < AUTHORIZATION_CODE_TTL)
+    }
+
     /// Evict pending sessions older than [`PENDING_SESSION_TTL`].
     ///
     /// Call this before inserting a new pending session to bound memory growth.
@@ -184,4 +306,12 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, v| v.created_at > cutoff);
     }
+}
+
+/// 256 random bits in hexadecimal: a request id, a code, an access token.
+/// `None` when the operating system has no entropy to give.
+pub(crate) fn random_token() -> Option<String> {
+    helpers4::random::random_bytes(32)
+        .ok()
+        .map(|bytes| helpers4::hex::encode(&bytes))
 }
