@@ -28,6 +28,10 @@ pub enum Error {
     #[error("invalid passkey label")]
     InvalidLabel,
 
+    /// A relying party's name or one of its redirect URIs failed validation.
+    #[error("invalid client: {0}")]
+    InvalidClient(&'static str),
+
     #[error("timestamp error: {0}")]
     Time(String),
 

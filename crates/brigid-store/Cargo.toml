@@ -14,7 +14,9 @@ tokio.workspace = true
 uuid.workspace = true
 time.workspace = true
 zeroize.workspace = true
-helpers4 = { workspace = true, features = ["hex", "random-entropy", "time"] }
+serde_json.workspace = true
+url.workspace = true
+helpers4 = { workspace = true, features = ["bytes", "hex", "random-entropy", "time"] }
 # Session tokens: SHA3-256 hash stored, base64url in the cookie.
 sha3 = { workspace = true }
 base64ct = { version = "1", features = ["alloc"] }

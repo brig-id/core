@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Credential, Identity, RecoveryStatus, StoredOidcKey, User},
+    model::{Client, Credential, Identity, RecoveryStatus, StoredOidcKey, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -1151,7 +1151,7 @@ impl EncryptedStore {
         let row = sqlx::query(
             "UPDATE sessions SET idle_expires_at = MIN(?1 + ?2, expires_at) \
              WHERE token_hash = ?3 AND idle_expires_at > ?1 AND expires_at > ?1 \
-             RETURNING account_id, idle_expires_at, expires_at",
+             RETURNING account_id, created_at, idle_expires_at, expires_at",
         )
         .bind(now)
         .bind(idle.as_secs() as i64)
@@ -1161,6 +1161,7 @@ impl EncryptedStore {
         let Some(row) = row else { return Ok(None) };
         Ok(Some(SessionInfo {
             account_id: row.try_get::<String, _>("account_id")?.parse()?,
+            created_at: row.try_get("created_at")?,
             idle_expires_at: row.try_get("idle_expires_at")?,
             expires_at: row.try_get("expires_at")?,
         }))
@@ -1174,12 +1175,189 @@ impl EncryptedStore {
             .await?;
         Ok(())
     }
+
+    // -- Relying parties (ADR-005 §2) ------------------------------------------
+
+    /// Register a relying party. Returns it with its secret when
+    /// `confidential`: 32 random bytes in base64url, of which only the hash is
+    /// stored, so this is the one time the secret can be read.
+    pub async fn create_client(
+        &self,
+        name: &str,
+        redirect_uris: &[String],
+        confidential: bool,
+    ) -> Result<(Client, Option<Zeroizing<String>>)> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(Error::InvalidClient(
+                "the name must have 1 to 100 characters, none of them a control character",
+            ));
+        }
+        if redirect_uris.is_empty() {
+            return Err(Error::InvalidClient(
+                "at least one redirect URI is required",
+            ));
+        }
+        for uri in redirect_uris {
+            validate_redirect_uri(uri)?;
+        }
+        let secret = if confidential {
+            let raw = Zeroizing::new(helpers4::random::random_bytes(32)?);
+            Some(Zeroizing::new(base64_url(&raw)))
+        } else {
+            None
+        };
+        let client = Client {
+            client_id: Uuid::new_v4().to_string(),
+            name: name.to_owned(),
+            redirect_uris: redirect_uris.to_vec(),
+            confidential,
+            created_at: now_unix(),
+        };
+        sqlx::query(
+            "INSERT INTO clients (client_id, name, redirect_uris, secret_hash, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&client.client_id)
+        .bind(&client.name)
+        .bind(serde_json::to_string(&client.redirect_uris).map_err(|_| Error::InvalidBlob)?)
+        .bind(secret.as_ref().map(|s| session_hash(s)))
+        .bind(client.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok((client, secret))
+    }
+
+    /// The relying party registered as `client_id`, if any.
+    pub async fn fetch_client(&self, client_id: &str) -> Result<Option<Client>> {
+        let row = sqlx::query(
+            "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
+             created_at FROM clients WHERE client_id = ?",
+        )
+        .bind(client_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| client_from_row(&r)).transpose()
+    }
+
+    /// Every registered relying party, oldest first.
+    pub async fn list_clients(&self) -> Result<Vec<Client>> {
+        sqlx::query(
+            "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
+             created_at FROM clients ORDER BY created_at, client_id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(client_from_row)
+        .collect()
+    }
+
+    /// Remove a relying party and the identity choices made for it. Returns
+    /// whether it existed.
+    pub async fn delete_client(&self, client_id: &str) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM clients WHERE client_id = ?")
+            .bind(client_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Whether `secret` is the secret of confidential client `client_id`.
+    /// `false` for an unknown client and for a public one.
+    pub async fn verify_client_secret(&self, client_id: &str, secret: &str) -> Result<bool> {
+        let stored: Option<Option<String>> =
+            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = ?")
+                .bind(client_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(Some(stored)) = stored else {
+            return Ok(false);
+        };
+        Ok(helpers4::bytes::constant_time_eq(
+            stored.as_bytes(),
+            session_hash(secret).as_bytes(),
+        ))
+    }
+
+    /// The identity `account_id` last presented to `client_id`, if it still
+    /// exists.
+    pub async fn chosen_identity(&self, account_id: Uuid, client_id: &str) -> Result<Option<Uuid>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT identity_id FROM client_identities WHERE account_id = ? AND client_id = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(client_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        id.map(|s| s.parse().map_err(Error::from)).transpose()
+    }
+
+    /// Remember that `account_id` presents `identity_id` to `client_id`.
+    /// [`Error::NotFound`] when the identity is not one of this account's.
+    pub async fn set_chosen_identity(
+        &self,
+        account_id: Uuid,
+        client_id: &str,
+        identity_id: Uuid,
+    ) -> Result<()> {
+        let done = sqlx::query(
+            "INSERT INTO client_identities (account_id, client_id, identity_id, updated_at) \
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS \
+               (SELECT 1 FROM identities WHERE id = ?3 AND account_id = ?1) \
+             ON CONFLICT (account_id, client_id) DO UPDATE SET \
+               identity_id = excluded.identity_id, updated_at = excluded.updated_at",
+        )
+        .bind(account_id.to_string())
+        .bind(client_id)
+        .bind(identity_id.to_string())
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(())
+    }
+}
+
+fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Client> {
+    let uris: String = row.try_get("redirect_uris")?;
+    Ok(Client {
+        client_id: row.try_get("client_id")?,
+        name: row.try_get("name")?,
+        redirect_uris: serde_json::from_str(&uris).map_err(|_| Error::InvalidBlob)?,
+        confidential: row.try_get("confidential")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// A redirect URI is an absolute `https` URL without fragment. Plain `http`
+/// is accepted for the loopback host only, where a development site runs.
+fn validate_redirect_uri(uri: &str) -> Result<()> {
+    let url = url::Url::parse(uri)
+        .map_err(|_| Error::InvalidClient("a redirect URI must be an absolute URL"))?;
+    if url.fragment().is_some() {
+        return Err(Error::InvalidClient(
+            "a redirect URI must not have a fragment",
+        ));
+    }
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(Error::InvalidClient(
+            "a redirect URI must use https (http is accepted for localhost only)",
+        )),
+    }
 }
 
 /// A live account session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
     pub account_id: Uuid,
+    /// Unix time of the passkey ceremony that opened the session.
+    pub created_at: i64,
     /// Unix time the session ends if unused.
     pub idle_expires_at: i64,
     /// Unix time the session ends in any case.
@@ -2209,5 +2387,186 @@ mod tests {
             .unwrap();
         let stored_idx: String = row.try_get("username_index").unwrap();
         assert_eq!(stored_idx, old_idx, "username_index must not be rotated");
+    }
+
+    #[tokio::test]
+    async fn clients_are_registered_listed_authenticated_and_removed() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let uris = vec!["https://shop.example/callback".to_string()];
+
+        let (site, secret) = store.create_client(" Shop ", &uris, true).await.unwrap();
+        let secret = secret.expect("a confidential client gets a secret");
+        assert_eq!(site.name, "Shop");
+        assert!(site.confidential);
+        assert_eq!(secret.len(), 43, "32 bytes in unpadded base64url");
+
+        let (app, none) = store
+            .create_client("App", &["http://localhost:3000/cb".to_string()], false)
+            .await
+            .unwrap();
+        assert!(none.is_none() && !app.confidential);
+
+        assert_eq!(
+            store.fetch_client(&site.client_id).await.unwrap().as_ref(),
+            Some(&site)
+        );
+        assert_eq!(store.list_clients().await.unwrap().len(), 2);
+        assert!(store.fetch_client("unknown").await.unwrap().is_none());
+
+        // The secret is checked against its hash; a public client has none.
+        assert!(
+            store
+                .verify_client_secret(&site.client_id, &secret)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .verify_client_secret(&site.client_id, "wrong")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .verify_client_secret(&app.client_id, "")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .verify_client_secret("unknown", &secret)
+                .await
+                .unwrap()
+        );
+
+        // The secret itself is nowhere in the database.
+        let stored: String =
+            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = ?")
+                .bind(&site.client_id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_ne!(stored, *secret);
+
+        assert!(store.delete_client(&site.client_id).await.unwrap());
+        assert!(!store.delete_client(&site.client_id).await.unwrap());
+        assert!(store.fetch_client(&site.client_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clients_need_a_name_and_safe_redirect_uris() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let ok = vec!["https://shop.example/cb".to_string()];
+        for name in ["", "  ", "a\nb"] {
+            assert!(matches!(
+                store.create_client(name, &ok, false).await,
+                Err(Error::InvalidClient(_))
+            ));
+        }
+        for uri in [
+            "",
+            "/callback",
+            "http://shop.example/cb",
+            "https://shop.example/cb#fragment",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                matches!(
+                    store.create_client("Shop", &[uri.to_string()], false).await,
+                    Err(Error::InvalidClient(_))
+                ),
+                "{uri}"
+            );
+        }
+        assert!(matches!(
+            store.create_client("Shop", &[], false).await,
+            Err(Error::InvalidClient(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_identity_chosen_for_a_client_is_remembered_per_account() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+        let mut other = sample_user();
+        other.id = Uuid::new_v4();
+        other.username = "other".into();
+        store.store_user(&other).await.unwrap();
+        let (site, _) = store
+            .create_client("Shop", &["https://shop.example/cb".to_string()], false)
+            .await
+            .unwrap();
+        let identity = |account_id: Uuid, name: &str| Identity {
+            id: Uuid::new_v4(),
+            account_id,
+            name: name.into(),
+            logo: "icon:solid:user".into(),
+            description: None,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let (a, b, theirs) = (
+            identity(user.id, "A"),
+            identity(user.id, "B"),
+            identity(other.id, "T"),
+        );
+        for i in [&a, &b, &theirs] {
+            store.store_identity(i).await.unwrap();
+        }
+
+        assert_eq!(
+            store
+                .chosen_identity(user.id, &site.client_id)
+                .await
+                .unwrap(),
+            None
+        );
+        store
+            .set_chosen_identity(user.id, &site.client_id, a.id)
+            .await
+            .unwrap();
+        store
+            .set_chosen_identity(user.id, &site.client_id, b.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .chosen_identity(user.id, &site.client_id)
+                .await
+                .unwrap(),
+            Some(b.id)
+        );
+        assert_eq!(
+            store
+                .chosen_identity(other.id, &site.client_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Another account's identity cannot be chosen.
+        assert!(matches!(
+            store
+                .set_chosen_identity(user.id, &site.client_id, theirs.id)
+                .await,
+            Err(Error::NotFound)
+        ));
+
+        // Deleting the identity forgets the choice.
+        store.delete_identity(user.id, b.id).await.unwrap();
+        assert_eq!(
+            store
+                .chosen_identity(user.id, &site.client_id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
