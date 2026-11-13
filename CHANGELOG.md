@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `AppState::with_signup_open(false)` closes the creation of accounts
+  (`/auth/register/begin` answers 403); `GET /auth/server` tells the interface.
 - Relying parties can sign people in (ADR-005 §2, ADR-008): registered
   clients, confidential (a secret, stored hashed) or public; `/authorize`
   (Authorization Code, PKCE `S256` mandatory for every client) hands the
@@ -28,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Licence: AGPL-3.0-or-later** (was LGPL-3.0-or-later). Versions already
+  released keep the licence they were published under.
+- Identity logos are Phosphor references, `icon:ph:<name>`. Migration `0013`
+  converts the 45 references of the earlier library once; the templates use the
+  new names and any other form is refused.
+- Removed: the server's DID document (`/.well-known/did.json`, crate
+  `brigid-did`), which repeated the key the JWKS publishes, and the unused
+  `PrivateAlias`, `IdentifierKind` and `parse_identifier`.
 - `brigid-oidc` issues ID tokens and no longer validates them: `validate_token`,
   `decode_token`, `decode_token_with_keys` and `JtiStore` are removed (nothing
   called them since account sessions moved to a cookie). `Claims` loses
