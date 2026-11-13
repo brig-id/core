@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Relying parties can sign people in (ADR-005 §2, ADR-008): registered
   clients, confidential (a secret, stored hashed) or public; `/authorize`
   (Authorization Code, PKCE `S256` mandatory for every client) hands the
-  request to the interface page `/continue`; `/auth/authorize/{request}` and
+  request to the interface page `/continue/`; `/auth/authorize/{request}` and
   its `approve`, `deny` and `silent` let the person choose the identity, which
   is remembered per client; `/token` returns an ID token signed with EdDSA
   whose only statement about the person is `sub`, the VSID of the chosen
