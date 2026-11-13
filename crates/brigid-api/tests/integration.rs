@@ -2625,7 +2625,7 @@ async fn begin_authorization(
 ) -> String {
     let location = authorize(app, &authorize_query(client_id, extra), xff).await;
     location
-        .strip_prefix("/continue?request=")
+        .strip_prefix("/continue/?request=")
         .unwrap_or_else(|| panic!("unexpected redirect: {location}"))
         .to_string()
 }
@@ -2931,7 +2931,7 @@ async fn an_authorization_request_is_checked_before_anyone_is_asked() {
     // An unknown site, or a place it did not register: nothing is sent
     // anywhere but to this server's own page.
     let location = authorize(&app, &authorize_query("unknown", ""), "10.61.1.1").await;
-    assert_eq!(location, "/continue?error=unknown_client");
+    assert_eq!(location, "/continue/?error=unknown_client");
     for redirect in [
         "https%3A%2F%2Fevil.example%2Fcb",
         "https%3A%2F%2Fshop.example%2Fcb%2Fextra",
@@ -2943,7 +2943,7 @@ async fn an_authorization_request_is_checked_before_anyone_is_asked() {
         );
         let location = authorize(&app, &query, "10.61.1.2").await;
         assert_eq!(
-            location, "/continue?error=invalid_redirect_uri",
+            location, "/continue/?error=invalid_redirect_uri",
             "{redirect}"
         );
     }
@@ -3026,10 +3026,10 @@ async fn an_authorization_request_is_checked_before_anyone_is_asked() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let location = resp.headers()["location"].to_str().unwrap();
-    assert!(location.starts_with("/continue?request="), "{location}");
+    assert!(location.starts_with("/continue/?request="), "{location}");
 
     // The person may decline: the site is told, and gets no code.
-    let request = location.strip_prefix("/continue?request=").unwrap();
+    let request = location.strip_prefix("/continue/?request=").unwrap();
     let (status, j) = identity_request(
         &app,
         "POST",

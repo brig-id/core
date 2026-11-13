@@ -31,7 +31,7 @@ use crate::{
 /// The page of this server's interface that answers an authorization
 /// request: `?request=<id>` for a request to answer, `?error=<code>` for one
 /// that cannot be sent back to the relying party.
-pub const UI_PATH: &str = "/continue";
+pub const UI_PATH: &str = "/continue/";
 
 /// `GET /authorize`
 pub async fn begin_get(

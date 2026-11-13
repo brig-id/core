@@ -59,7 +59,7 @@ POST /auth/register/finish → store encrypted credential
 POST /auth/login/begin     → WebAuthn RequestChallenge
 POST /auth/login/finish    → account session (HttpOnly cookie), no token
 
-GET  /authorize                        → relying party's request, held; 303 to the UI page /continue
+GET  /authorize                        → relying party's request, held; 303 to the UI page /continue/
 GET  /auth/authorize/{request}         → what the page shows (site name, identities)
 POST /auth/authorize/{request}/approve → code for the chosen identity (also /deny, /silent)
 POST /token                            → ID token (sub = VSID), EdDSA
