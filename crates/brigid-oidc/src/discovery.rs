@@ -23,24 +23,24 @@ pub struct JwkSet {
     pub keys: Vec<Jwk>,
 }
 
-/// OpenID Connect Discovery 1.0 metadata.
-///
-/// brig·id issues OIDC ID tokens but uses WebAuthn/passkeys instead of the
-/// standard OAuth 2.0 Authorization Code flow. As a result,
-/// `authorization_endpoint` and `token_endpoint` are omitted from the
-/// discovery document. Relying parties should use the brig·id WebAuthn API
-/// (`/auth/login/begin`, `/auth/login/finish`) to obtain tokens.
+/// OpenID Connect Discovery 1.0 metadata, for the one flow this server
+/// offers: Authorization Code with PKCE (ADR-005 §2, ADR-008).
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenIDConfiguration {
     pub issuer: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authorization_endpoint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_endpoint: Option<String>,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
     pub jwks_uri: String,
-    pub response_types_supported: Vec<String>,
-    pub subject_types_supported: Vec<String>,
-    pub id_token_signing_alg_values_supported: Vec<String>,
+    pub response_types_supported: Vec<&'static str>,
+    pub grant_types_supported: Vec<&'static str>,
+    pub scopes_supported: Vec<&'static str>,
+    pub subject_types_supported: Vec<&'static str>,
+    pub id_token_signing_alg_values_supported: Vec<&'static str>,
+    pub token_endpoint_auth_methods_supported: Vec<&'static str>,
+    pub code_challenge_methods_supported: Vec<&'static str>,
+    pub claims_supported: Vec<&'static str>,
+    /// The authorization response names its issuer (RFC 9207).
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Build a JWKS from one or more signing keys.
@@ -67,14 +67,34 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
     let base = base_url.as_str().trim_end_matches('/');
     OpenIDConfiguration {
         issuer: base.to_string(),
-        authorization_endpoint: None,
-        token_endpoint: None,
+        authorization_endpoint: format!("{base}/authorize"),
+        token_endpoint: format!("{base}/token"),
         jwks_uri: format!("{base}/.well-known/jwks.json"),
-        response_types_supported: vec!["id_token".to_string()],
-        // brigid uses VSID = HKDF(did_root, client_id, salt) as `sub`, which is
-        // per-client (pairwise) by construction — never a stable public identifier.
-        subject_types_supported: vec!["pairwise".to_string()],
-        id_token_signing_alg_values_supported: vec!["EdDSA".to_string()],
+        response_types_supported: vec!["code"],
+        grant_types_supported: vec!["authorization_code"],
+        // A site receives an identifier and nothing else (ADR-008).
+        scopes_supported: vec!["openid"],
+        // `sub` is a VSID: one per identity and per client, never an
+        // identifier shared between relying parties.
+        subject_types_supported: vec!["pairwise"],
+        id_token_signing_alg_values_supported: vec!["EdDSA"],
+        token_endpoint_auth_methods_supported: vec![
+            "client_secret_basic",
+            "client_secret_post",
+            "none",
+        ],
+        code_challenge_methods_supported: vec!["S256"],
+        claims_supported: vec![
+            "sub",
+            "iss",
+            "aud",
+            "exp",
+            "iat",
+            "auth_time",
+            "nonce",
+            "jti",
+        ],
+        authorization_response_iss_parameter_supported: true,
     }
 }
 
@@ -125,7 +145,28 @@ mod tests {
             parsed["jwks_uri"],
             "https://example.com/.well-known/jwks.json"
         );
-        assert_eq!(parsed["id_token_signing_alg_values_supported"][0], "EdDSA");
+        assert_eq!(
+            parsed["authorization_endpoint"],
+            "https://example.com/authorize"
+        );
+        assert_eq!(parsed["token_endpoint"], "https://example.com/token");
+        assert_eq!(
+            parsed["response_types_supported"],
+            serde_json::json!(["code"])
+        );
+        assert_eq!(parsed["scopes_supported"], serde_json::json!(["openid"]));
+        assert_eq!(
+            parsed["subject_types_supported"],
+            serde_json::json!(["pairwise"])
+        );
+        assert_eq!(
+            parsed["id_token_signing_alg_values_supported"],
+            serde_json::json!(["EdDSA"])
+        );
+        assert_eq!(
+            parsed["code_challenge_methods_supported"],
+            serde_json::json!(["S256"])
+        );
     }
 
     #[test]

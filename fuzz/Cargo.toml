@@ -31,7 +31,7 @@ test = false
 doc = false
 
 [[bin]]
-name = "fuzz_jwt_validate"
-path = "fuzz_targets/fuzz_jwt_validate.rs"
+name = "fuzz_pkce"
+path = "fuzz_targets/fuzz_pkce.rs"
 test = false
 doc = false

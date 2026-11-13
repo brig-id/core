@@ -64,6 +64,7 @@ impl OidcSigningKey {
         jsonwebtoken::EncodingKey::from_ed_der(der.as_bytes())
     }
 
+    #[cfg(test)]
     pub(crate) fn decoding_key(&self) -> jsonwebtoken::DecodingKey {
         // ring (used internally by jsonwebtoken) expects raw 32-byte public key bytes.
         jsonwebtoken::DecodingKey::from_ed_der(self.signing_key.verifying_key().as_bytes())
