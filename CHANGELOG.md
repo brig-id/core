@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Relying parties can sign people in (ADR-005 §2, ADR-008): registered
+  clients, confidential (a secret, stored hashed) or public; `/authorize`
+  (Authorization Code, PKCE `S256` mandatory for every client) hands the
+  request to the interface page `/continue`; `/auth/authorize/{request}` and
+  its `approve`, `deny` and `silent` let the person choose the identity, which
+  is remembered per client; `/token` returns an ID token signed with EdDSA
+  whose only statement about the person is `sub`, the VSID of the chosen
+  identity for that client. `/.well-known/openid-configuration` is served
+  again.
 - `brigid-store` — `EncryptedStore::vsid_secret`: the keying material of the
   VSIDs is stored (table `server_secrets`, encrypted) instead of derived from
   the master key at each start. `rotate_master_key` re-encrypts it, so a
@@ -19,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `brigid-oidc` issues ID tokens and no longer validates them: `validate_token`,
+  `decode_token`, `decode_token_with_keys` and `JtiStore` are removed (nothing
+  called them since account sessions moved to a cookie). `Claims` loses
+  `server` and `alias_type` and gains `auth_time` and `nonce`.
 - helpers4 replaces local copies of generic code: `Authorization: Bearer`
   parsing (`brigid-api`), hostname and slug validation (`brigid-identity`),
   the Unix clock (`brigid-oidc`, `brigid-store`). Visible differences: the

@@ -1,6 +1,7 @@
 //! Identity management for an account: `/account/identities`.
 //!
-//! An identity is what a relying party sees; it belongs to a private account
+//! An identity belongs to a private account. Its name and logo are labels for
+//! the person: a relying party only ever receives an identifier derived from it
 //! (ADR-002). Every endpoint acts on the account of the session (ADR-005).
 
 use std::sync::Arc;

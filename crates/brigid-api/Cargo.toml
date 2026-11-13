@@ -7,7 +7,8 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-helpers4 = { workspace = true, features = ["http"] }
+helpers4 = { workspace = true, features = ["hex", "http", "random-entropy", "time"] }
+base64ct = { version = "1", features = ["alloc"] }
 brigid-store.workspace = true
 brigid-webauthn.workspace = true
 brigid-oidc.workspace = true
@@ -34,8 +35,8 @@ webauthn-rs = { version = "0.5", features = [
 
 [dev-dependencies]
 webauthn-rs-proto = "0.5"
-base64ct = { version = "1", features = ["alloc"] }
 brigid-crypto.workspace = true
+ed25519-dalek = "3"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

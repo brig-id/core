@@ -88,10 +88,49 @@ pub struct AccountSession {
     pub account: User,
     /// The session token (to end it at sign-out).
     pub token: String,
+    /// Unix time of the passkey ceremony that opened the session.
+    pub auth_time: i64,
     /// Unix time the session ends if unused.
     pub idle_expires_at: i64,
     /// Unix time the session ends in any case.
     pub expires_at: i64,
+}
+
+impl AccountSession {
+    /// The session of a request, from its cookie. `None` when there is no
+    /// cookie, the session is unknown or expired, or the account is gone.
+    /// Using the session pushes its idle deadline back.
+    pub async fn from_headers(
+        state: &AppState,
+        headers: &HeaderMap,
+    ) -> Result<Option<Self>, ApiError> {
+        let Some(token) = session_token(headers, cookie_name(state)) else {
+            return Ok(None);
+        };
+        let Some(info) = state
+            .store
+            .use_session(token, state.session_idle)
+            .await
+            .map_err(|e| internal!(e))?
+        else {
+            return Ok(None);
+        };
+        let Some(account) = state
+            .store
+            .fetch_user(info.account_id)
+            .await
+            .map_err(|e| internal!(e))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            account,
+            token: token.to_owned(),
+            auth_time: info.created_at,
+            idle_expires_at: info.idle_expires_at,
+            expires_at: info.expires_at,
+        }))
+    }
 }
 
 impl FromRequestParts<Arc<AppState>> for AccountSession {
@@ -101,27 +140,9 @@ impl FromRequestParts<Arc<AppState>> for AccountSession {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let token = session_token(&parts.headers, cookie_name(state))
-            .ok_or(ApiError::Unauthorized)?
-            .to_owned();
-        let info = state
-            .store
-            .use_session(&token, state.session_idle)
-            .await
-            .map_err(|e| internal!(e))?
-            .ok_or(ApiError::Unauthorized)?;
-        let account = state
-            .store
-            .fetch_user(info.account_id)
-            .await
-            .map_err(|e| internal!(e))?
-            .ok_or(ApiError::Unauthorized)?;
-        Ok(Self {
-            account,
-            token,
-            idle_expires_at: info.idle_expires_at,
-            expires_at: info.expires_at,
-        })
+        Self::from_headers(state, &parts.headers)
+            .await?
+            .ok_or(ApiError::Unauthorized)
     }
 }
 

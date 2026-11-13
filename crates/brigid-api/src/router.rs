@@ -10,7 +10,7 @@ use axum::{
     extract::ConnectInfo,
     http::{
         HeaderName, HeaderValue, Request,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONTENT_TYPE},
     },
     routing::{delete, get, patch, post},
 };
@@ -21,7 +21,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 use url::Url;
 
 use crate::{
-    routes::{auth, discovery, health, identities, recovery},
+    routes::{auth, authorize, discovery, health, identities, recovery, token},
     session,
     state::AppState,
 };
@@ -220,6 +220,15 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}",
             patch(identities::update_identity).delete(identities::delete_identity),
         )
+        // The person's answer to an authorization request (ADR-005 §2),
+        // from this server's own page.
+        .route("/auth/authorize/{request}", get(authorize::request))
+        .route(
+            "/auth/authorize/{request}/approve",
+            post(authorize::approve),
+        )
+        .route("/auth/authorize/{request}/deny", post(authorize::deny))
+        .route("/auth/authorize/{request}/silent", post(authorize::silent))
         // Account sessions live in a cookie: every request that changes
         // something must come from this server's own pages (ADR-005 §1).
         .layer(axum::middleware::from_fn_with_state(
@@ -228,8 +237,42 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         ))
         .layer(limit(Duration::from_secs(1), 30));
 
+    // What relying parties call. A public client runs in a browser, on
+    // another origin: these responses may be read from anywhere. None of them
+    // depends on a cookie: the token endpoint is protected by the code, the
+    // PKCE verifier and the client secret, the rest is public.
+    let readable_anywhere = || {
+        SetResponseHeaderLayer::overriding(
+            ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        )
+    };
+
+    // A relying party sends the browser here, from its own site: no
+    // same-origin check. Each request that passes validation is held in
+    // memory until the person answers, hence a limit of its own.
+    let authorization_routes = Router::new()
+        .route(
+            "/authorize",
+            get(authorize::begin_get).post(authorize::begin_post),
+        )
+        .layer(limit(Duration::from_secs(1), 30));
+
+    // Called by relying parties' servers, many people behind one address:
+    // 10 per second, in bursts of 100. A code has 256 random bits and is
+    // taken out at its first presentation; the limit protects resources.
+    let token_routes = Router::new()
+        .route("/token", post(token::token))
+        .layer(readable_anywhere())
+        .layer(limit(Duration::from_millis(100), 100));
+
     let discovery_routes = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(discovery::openid_configuration),
+        )
         .route("/.well-known/jwks.json", get(discovery::jwks))
+        .layer(readable_anywhere())
         .route("/.well-known/did.json", get(discovery::did_document));
 
     let health_routes = Router::new()
@@ -239,6 +282,8 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
     Router::new()
         .merge(ceremony_routes)
         .merge(account_routes)
+        .merge(authorization_routes)
+        .merge(token_routes)
         .merge(discovery_routes)
         .merge(health_routes)
         // `cors` is added before `security_headers` so that `security_headers`
