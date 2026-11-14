@@ -222,7 +222,10 @@ async fn security_headers_present() {
     assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
     assert!(headers.contains_key("strict-transport-security"));
-    assert!(headers.contains_key("content-security-policy"));
+    // An API response loads nothing and names no origin at all.
+    let csp = headers["content-security-policy"].to_str().unwrap();
+    assert!(csp.starts_with("default-src 'none'"), "{csp}");
+    assert!(!csp.contains("http"), "{csp}");
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- The Content Security Policy of API responses (JSON and redirects) is
+  `default-src 'none'`, with nothing framed, based or submitted. It still
+  allowed a photo service the interface stopped using.
+
 ### Added
 
 - `AppState::with_signup_open(false)` closes the creation of accounts
