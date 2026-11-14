@@ -3380,6 +3380,7 @@ async fn a_server_with_sign_up_closed_creates_no_account() {
 /// the user was present (0x01) and verified (0x04).
 fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
     use base64ct::{Base64UrlUnpadded, Encoding};
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use sha2::{Digest, Sha256};
 
     fn bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -3395,22 +3396,21 @@ fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
         out.extend(t.as_bytes());
     }
 
-    // The base point of P-256: a valid public key, whose private key is 1.
-    let x: [u8; 32] = [
-        0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40,
-        0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0, 0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98,
-        0xC2, 0x96,
-    ];
-    let y: [u8; 32] = [
-        0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E,
-        0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF,
-        0x51, 0xF5,
-    ];
+    // The public key of the passkey: a point of the P-256 curve, as two
+    // 32-byte coordinates. Any valid key does: with attestation "none" a
+    // registration carries no signature, so the private key (here the number
+    // 7, repeated) is never used.
+    let key = p256::SecretKey::from_slice(&[7u8; 32]).expect("a valid P-256 scalar");
+    let point = key.public_key().to_encoded_point(false);
+    let (x, y) = (
+        point.x().expect("an uncompressed point has an x"),
+        point.y().expect("an uncompressed point has a y"),
+    );
     // COSE_Key: {1: 2 (EC2), 3: -7 (ES256), -1: 1 (P-256), -2: x, -3: y}
     let mut cose = vec![0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21];
-    bytes(&mut cose, &x);
+    bytes(&mut cose, x);
     cose.push(0x22);
-    bytes(&mut cose, &y);
+    bytes(&mut cose, y);
 
     let credential_id = [0x42u8; 16];
     let mut auth_data = Sha256::digest(b"localhost").to_vec();
