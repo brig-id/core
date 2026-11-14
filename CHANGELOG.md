@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Licence: AGPL-3.0-or-later** (was LGPL-3.0-or-later). Versions already
   released keep the licence they were published under.
+- **The database schema is one script**, `0001_schema.sql`: the twelve steps
+  that led to it are folded into their result (same tables, columns, keys and
+  indexes). **A database created by an earlier version cannot be opened**: no
+  server held anything to keep, and each starts again from an empty one.
 - Identity logos are Phosphor references, `icon:ph:<name>`: the templates use
   the new names and any other form is refused when a logo is written. Nothing
   stored is converted: no server holds identities to keep yet. An identity that
