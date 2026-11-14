@@ -102,28 +102,17 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
-            // Strict CSP for the routes defined here, which return JSON only:
-            // no inline sources are needed. The Qwik UI does emit inline
-            // scripts and styles; whoever serves it sets its own CSP on those
-            // responses (server-leaf builds it from the UI build's
-            // `dist/csp-hashes.json`, allowing exactly those by hash), and
-            // `if_not_present` keeps this one off them.
-            //
-            // img-src/connect-src additionally allow Unsplash: the login/
-            // register pages fetch a daily background photo directly from
-            // the browser (`app/src/lib/unsplash.ts`) — there's no
-            // app-side server to proxy it through, this static UI is served
-            // as files by this very binary.
+            // The routes defined here answer with JSON or a redirect, never
+            // with a page: nothing may be loaded, framed or submitted from
+            // one of their responses. Whoever serves the interface sets the
+            // interface's own policy on those responses (the server builds it
+            // from the build's `dist/csp-hashes.json`), and `if_not_present`
+            // keeps this one off them.
             HeaderValue::from_static(
-                "default-src 'self'; \
-                 script-src 'self'; \
-                 style-src 'self'; \
-                 img-src 'self' data: https://images.unsplash.com; \
-                 font-src 'self'; \
-                 connect-src 'self' https://api.unsplash.com; \
+                "default-src 'none'; \
                  frame-ancestors 'none'; \
-                 object-src 'none'; \
-                 base-uri 'self'",
+                 base-uri 'none'; \
+                 form-action 'none'",
             ),
         ));
 
