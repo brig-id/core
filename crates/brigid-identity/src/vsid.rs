@@ -4,7 +4,6 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use hkdf::Hkdf;
 use sha3::Sha3_256;
 
-use brigid_crypto::MasterKey;
 use uuid::Uuid;
 
 /// A Virtual Stable Identifier (VSID): the `sub` a relying party sees for an
@@ -27,21 +26,6 @@ impl fmt::Display for Vsid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-/// Derives a 32-byte VSID salt from the master key
-/// (HKDF-SHA3-256, `info = "brigid-vsid-salt"`).
-///
-/// This is how the VSID secret was obtained before it was stored. It is only
-/// passed to `EncryptedStore::vsid_secret`, which keeps it for a database
-/// whose accounts already have VSIDs computed with it; a new database gets a
-/// random secret instead.
-pub fn derive_vsid_salt(master: &MasterKey) -> [u8; 32] {
-    let key = brigid_crypto::hkdf::derive_key(master, b"brigid-vsid-salt", 32)
-        .expect("HKDF with 32-byte output never fails");
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&key);
-    arr
 }
 
 /// `HKDF-SHA3-256(ikm = secret, info = label || id (16 bytes) ||
@@ -131,10 +115,4 @@ mod tests {
 
     // Recomputed independently (Python hmac + sha3_256, HKDF per RFC 5869).
     const KNOWN_VSID: &str = "II-Ekb91b_YeEn5OsWse5EwHrg7DMPI6daf30K1JQoE";
-
-    #[test]
-    fn derive_vsid_salt_is_stable() {
-        let m = MasterKey::from_hex(&"42".repeat(32)).unwrap();
-        assert_eq!(derive_vsid_salt(&m), derive_vsid_salt(&m));
-    }
 }
