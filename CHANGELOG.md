@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Licence: AGPL-3.0-or-later** (was LGPL-3.0-or-later). Versions already
   released keep the licence they were published under.
-- Identity logos are Phosphor references, `icon:ph:<name>`. Migration `0013`
-  converts the 45 references of the earlier library once; the templates use the
-  new names and any other form is refused.
+- Identity logos are Phosphor references, `icon:ph:<name>`: the templates use
+  the new names and any other form is refused when a logo is written. Nothing
+  stored is converted: no server holds identities to keep yet. An identity that
+  still carries an earlier reference shows the default icon until its logo is
+  chosen again.
 - Removed: the server's DID document (`/.well-known/did.json`, crate
   `brigid-did`), which repeated the key the JWKS publishes, and the unused
   `PrivateAlias`, `IdentifierKind` and `parse_identifier`.
