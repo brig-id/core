@@ -670,18 +670,13 @@ impl EncryptedStore {
         Ok(())
     }
 
-    // -- VSID secret (ADR-006) -------------------------------------------------
+    // -- VSID secret -----------------------------------------------------------
 
     /// The VSID secret: the keying material of every VSID.
     ///
-    /// It is stored, and a master key rotation re-encrypts it, so VSIDs
-    /// survive the rotation. The first call on a database stores it:
-    ///
-    /// - a database that already holds accounts keeps `derived`, the value
-    ///   those accounts' VSIDs were computed with until now (the salt derived
-    ///   from the master key), so that no VSID changes;
-    /// - an empty database gets 32 random bytes.
-    pub async fn vsid_secret(&self, derived: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+    /// 32 random bytes, drawn at the first call on a database and stored. A
+    /// master key rotation re-encrypts it, so VSIDs survive the rotation.
+    pub async fn vsid_secret(&self) -> Result<Zeroizing<[u8; 32]>> {
         let key = server_secret_key(&self.master)?;
         let mut tx = self.pool.begin().await?;
         let stored: Option<Vec<u8>> =
@@ -691,14 +686,7 @@ impl EncryptedStore {
         let secret = match stored {
             Some(raw) => Zeroizing::new(dec(&key, &raw)?),
             None => {
-                let has_accounts: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users)")
-                    .fetch_one(&mut *tx)
-                    .await?;
-                let secret = Zeroizing::new(if has_accounts {
-                    derived.to_vec()
-                } else {
-                    helpers4::random::random_bytes(32)?
-                });
+                let secret = Zeroizing::new(helpers4::random::random_bytes(32)?);
                 sqlx::query("INSERT INTO server_secrets (name, value) VALUES ('vsid', ?)")
                     .bind(enc(&key, &secret)?)
                     .execute(&mut *tx)
@@ -954,9 +942,7 @@ impl EncryptedStore {
     ///
     /// Nothing visible from outside changes: OIDC signing keys and the VSID
     /// secret are stored, so issued tokens stay valid and every VSID keeps its
-    /// value. The one exception is a database that never called
-    /// [`Self::vsid_secret`]: its VSIDs were derived from the old master key
-    /// and nothing recorded that value.
+    /// value.
     pub async fn rotate_master_key(&mut self, new_master: MasterKey) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
@@ -2005,20 +1991,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vsid_secret_is_random_on_a_new_database_and_stable() {
+    async fn vsid_secret_is_random_and_stable() {
         let store = EncryptedStore::new("sqlite::memory:", master())
             .await
             .unwrap();
-        let derived = [7u8; 32];
 
-        let first = store.vsid_secret(&derived).await.unwrap();
-        assert_ne!(
-            *first, derived,
-            "a new database does not reuse the derived salt"
-        );
+        let first = store.vsid_secret().await.unwrap();
         assert_ne!(*first, [0u8; 32]);
-        let again = store.vsid_secret(&[9u8; 32]).await.unwrap();
+        let again = store.vsid_secret().await.unwrap();
         assert_eq!(*first, *again, "stored once, then only read");
+
+        let other = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        assert_ne!(
+            *first,
+            *other.vsid_secret().await.unwrap(),
+            "two databases under one master key do not share it"
+        );
 
         // Not stored in clear.
         let raw: Vec<u8> =
@@ -2030,29 +2020,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vsid_secret_keeps_the_derived_salt_when_accounts_exist() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
-            .await
-            .unwrap();
-        store.store_user(&sample_user()).await.unwrap();
-
-        let derived = [7u8; 32];
-        assert_eq!(*store.vsid_secret(&derived).await.unwrap(), derived);
-        // A later start derives a different value (rotated master key): the
-        // stored one still wins.
-        assert_eq!(*store.vsid_secret(&[9u8; 32]).await.unwrap(), derived);
-    }
-
-    #[tokio::test]
     async fn vsid_secret_survives_a_master_key_rotation() {
         let mut store = EncryptedStore::new("sqlite::memory:", master())
             .await
             .unwrap();
-        let before = store.vsid_secret(&[7u8; 32]).await.unwrap();
+        let before = store.vsid_secret().await.unwrap();
 
         store.rotate_master_key(new_master()).await.unwrap();
 
-        let after = store.vsid_secret(&[9u8; 32]).await.unwrap();
+        let after = store.vsid_secret().await.unwrap();
         assert_eq!(*before, *after);
     }
 

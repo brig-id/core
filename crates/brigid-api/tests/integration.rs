@@ -8,7 +8,6 @@ use axum::{
     http::{Request, StatusCode},
 };
 use brigid_crypto::MasterKey;
-use brigid_identity::derive_vsid_salt;
 use brigid_oidc::OidcSigningKey;
 use brigid_store::EncryptedStore;
 use brigid_webauthn::WebauthnService;
@@ -67,7 +66,7 @@ fn master() -> MasterKey {
 
 async fn make_state() -> Arc<AppState> {
     let master = master();
-    let vsid_salt = derive_vsid_salt(&master);
+    let vsid_salt = [0x5a; 32];
     let store = EncryptedStore::new("sqlite::memory:", master)
         .await
         .unwrap();
@@ -3318,7 +3317,7 @@ async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
 #[tokio::test]
 async fn a_server_with_sign_up_closed_creates_no_account() {
     let master = master();
-    let vsid_salt = derive_vsid_salt(&master);
+    let vsid_salt = [0x5a; 32];
     let store = EncryptedStore::new("sqlite::memory:", master)
         .await
         .unwrap();

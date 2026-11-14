@@ -12,4 +12,4 @@ pub use recovery::{CodeError, RecoveryCode};
 pub use root_id::RootId;
 pub use templates::{IdentityTemplate, TEMPLATES, default_templates, template};
 pub use username::generate_username;
-pub use vsid::{Vsid, derive_vsid_salt, identity_vsid};
+pub use vsid::{Vsid, identity_vsid};
