@@ -37,6 +37,9 @@ webauthn-rs-proto = "0.5"
 brigid-crypto.workspace = true
 ed25519-dalek = "3"
 sha2 = "0.11"
+# A P-256 public key for a registration built by hand in the tests. Already
+# in the tree (through jsonwebtoken): no new crate.
+p256 = "0.13"
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
