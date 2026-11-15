@@ -1,11 +1,12 @@
 //! Shared application state passed to all Axum handlers via [`axum::extract::State`].
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use brigid_identity::{Attribute, Attributes, Need};
 use brigid_oidc::OidcSigningKey;
 use brigid_store::EncryptedStore;
 use url::Url;
@@ -82,6 +83,9 @@ pub struct PendingAuthorization {
     /// PKCE `S256` challenge (ADR-008: every client sends one).
     pub code_challenge: String,
     pub prompt: Prompt,
+    /// The attributes the request asks for, and whether the application
+    /// needs each one: what its scopes cover of the client's registration.
+    pub asked: BTreeMap<Attribute, Need>,
     /// `max_age`: the passkey ceremony must be at most this many seconds old.
     pub max_age: Option<i64>,
     pub created_at: Instant,
@@ -98,6 +102,9 @@ pub struct IssuedCode {
     pub nonce: Option<String>,
     pub account_id: Uuid,
     pub identity_id: Uuid,
+    /// The attributes the token will carry: asked by the request, and
+    /// accepted by the person with these exact values.
+    pub attributes: Attributes,
     /// Unix time of the passkey ceremony behind the session.
     pub auth_time: i64,
     pub created_at: Instant,

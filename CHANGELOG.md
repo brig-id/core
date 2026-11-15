@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Attributes (core#91). An identity carries optional attributes
+  (`given_name`, `family_name`, `preferred_username`, `email`, `locale`,
+  `zoneinfo`), set through `/account/identities`. A registered client lists
+  the ones it may ask for and which it requires
+  (`EncryptedStore::set_client_attributes`); the `profile` and `email` scopes
+  ask for them, and are refused (`invalid_scope`) to a client registered for
+  none. `/auth/authorize/{request}` tells the page what is asked and what was
+  already decided; `approve` takes the attributes the person accepts: an
+  optional one refused continues, a required one refused is a 409. Decisions
+  are recorded per identity and per client with the accepted values, so a
+  changed value is asked again, and `prompt=none` answers `consent_required`
+  until everything asked is decided. The ID token carries the accepted
+  attributes; `email_verified` is always `false`.
+  `/account/identities/{id}/applications` lists what an identity gave each
+  application and withdraws it. Schema script `0002_attributes.sql`.
 - `AppState::with_signup_open(false)` closes the creation of accounts
   (`/auth/register/begin` answers 403); `GET /auth/server` tells the interface.
 - Relying parties can sign people in (ADR-005 §2, ADR-008): registered

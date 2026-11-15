@@ -3,7 +3,10 @@
 //! Every sensitive field is encrypted with a per-user HKDF-derived key
 //! before writing to SQLite. A raw DB dump must never expose readable secrets.
 
+use std::collections::BTreeMap;
+
 use brigid_crypto::{EncryptedBlob, MasterKey};
+use brigid_identity::{Attribute, Attributes, Need};
 use sqlx::{
     Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -15,7 +18,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Client, Credential, Identity, RecoveryStatus, StoredOidcKey, User},
+    model::{Client, Credential, Decision, Grant, Identity, RecoveryStatus, StoredOidcKey, User},
 };
 
 // ---------------------------------------------------------------------------
@@ -383,9 +386,31 @@ pub async fn fetch_credential_labels(
         .collect()
 }
 
+/// `value` as JSON, encrypted under `key`.
+fn enc_json<T: serde::Serialize>(key: &[u8; 32], value: &T) -> Result<Vec<u8>> {
+    let json = Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::InvalidBlob)?);
+    enc(key, &json)
+}
+
+/// What [`enc_json`] wrote.
+fn dec_json<T: serde::de::DeserializeOwned>(key: &[u8; 32], raw: &[u8]) -> Result<T> {
+    let json = Zeroizing::new(dec(key, raw)?);
+    serde_json::from_slice(&json).map_err(|_| Error::InvalidBlob)
+}
+
 // ---------------------------------------------------------------------------
 // Identities
 // ---------------------------------------------------------------------------
+
+/// The attributes as they are stored: validated, encrypted, and nothing at
+/// all when there are none.
+fn enc_attributes(key: &[u8; 32], attributes: &Attributes) -> Result<Option<Vec<u8>>> {
+    let attributes = brigid_identity::validate_attributes(attributes)?;
+    if attributes.is_empty() {
+        return Ok(None);
+    }
+    enc_json(key, &attributes).map(Some)
+}
 
 fn fmt_time(t: OffsetDateTime) -> Result<String> {
     t.format(&Rfc3339).map_err(|e| Error::Time(e.to_string()))
@@ -418,14 +443,15 @@ where
     let key = user_key(master, &identity.account_id)?;
     sqlx::query(
         "INSERT INTO identities \
-         (id, account_id, name, logo, description, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, account_id, name, logo, description, attributes, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(identity.id.to_string())
     .bind(identity.account_id.to_string())
     .bind(enc(&key, name.as_bytes())?)
     .bind(&identity.logo)
     .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
+    .bind(enc_attributes(&key, &identity.attributes)?)
     .bind(fmt_time(identity.created_at)?)
     .bind(fmt_time(identity.updated_at)?)
     .execute(executor)
@@ -444,6 +470,11 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
         .try_get::<Option<Vec<u8>>, _>("description")?
         .map(|raw| dec(&key, &raw).and_then(|b| Ok(String::from_utf8(b)?)))
         .transpose()?;
+    let attributes = row
+        .try_get::<Option<Vec<u8>>, _>("attributes")?
+        .map(|raw| dec_json::<Attributes>(&key, &raw))
+        .transpose()?
+        .unwrap_or_default();
     let parse = |col: &str| -> Result<OffsetDateTime> {
         OffsetDateTime::parse(&row.try_get::<String, _>(col)?, &Rfc3339)
             .map_err(|e| Error::Time(e.to_string()))
@@ -455,12 +486,14 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
         name,
         logo: row.try_get("logo")?,
         description,
+        attributes,
         created_at: parse("created_at")?,
         updated_at: parse("updated_at")?,
     })
 }
 
-const IDENTITY_COLUMNS: &str = "id, account_id, name, logo, description, created_at, updated_at";
+const IDENTITY_COLUMNS: &str =
+    "id, account_id, name, logo, description, attributes, created_at, updated_at";
 
 /// Fetch one identity, only if it belongs to `account_id`.
 pub async fn fetch_identity(
@@ -495,9 +528,9 @@ pub async fn fetch_identities(
     rows.iter().map(|r| identity_from_row(master, r)).collect()
 }
 
-/// Change an identity's display fields (name, logo, description) and bump
-/// `updated_at`. [`Error::NotFound`] when the identity
-/// does not exist or belongs to another account.
+/// Change an identity's labels (name, logo, description) and its attributes,
+/// and bump `updated_at`. [`Error::NotFound`] when the identity does not
+/// exist or belongs to another account.
 pub async fn update_identity(
     pool: &SqlitePool,
     master: &MasterKey,
@@ -512,12 +545,13 @@ pub async fn update_identity(
 
     let key = user_key(master, &identity.account_id)?;
     let result = sqlx::query(
-        "UPDATE identities SET name = ?, logo = ?, description = ?, updated_at = ? \
-         WHERE id = ? AND account_id = ?",
+        "UPDATE identities SET name = ?, logo = ?, description = ?, attributes = ?, \
+         updated_at = ? WHERE id = ? AND account_id = ?",
     )
     .bind(enc(&key, name.as_bytes())?)
     .bind(&identity.logo)
     .bind(description.map(|d| enc(&key, d.as_bytes())).transpose()?)
+    .bind(enc_attributes(&key, &identity.attributes)?)
     .bind(fmt_time(OffsetDateTime::now_utc())?)
     .bind(identity.id.to_string())
     .bind(identity.account_id.to_string())
@@ -1005,9 +1039,10 @@ impl EncryptedStore {
                 .await?;
         }
 
-        let identity_rows = sqlx::query("SELECT id, account_id, name, description FROM identities")
-            .fetch_all(&mut *tx)
-            .await?;
+        let identity_rows =
+            sqlx::query("SELECT id, account_id, name, description, attributes FROM identities")
+                .fetch_all(&mut *tx)
+                .await?;
         for row in identity_rows {
             let id: String = row.try_get("id")?;
             let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
@@ -1023,10 +1058,42 @@ impl EncryptedStore {
                 .map(|raw| dec(&old_key, &raw).and_then(|plain| enc(&new_key, &plain)))
                 .transpose()?;
 
-            sqlx::query("UPDATE identities SET name = ?, description = ? WHERE id = ?")
-                .bind(name)
-                .bind(description)
-                .bind(id)
+            let attributes = row
+                .try_get::<Option<Vec<u8>>, _>("attributes")?
+                .map(|raw| {
+                    dec(&old_key, &raw).and_then(|plain| enc(&new_key, &Zeroizing::new(plain)))
+                })
+                .transpose()?;
+
+            sqlx::query(
+                "UPDATE identities SET name = ?, description = ?, attributes = ? WHERE id = ?",
+            )
+            .bind(name)
+            .bind(description)
+            .bind(attributes)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let grant_rows = sqlx::query(
+            "SELECT g.identity_id, g.client_id, g.decisions, i.account_id \
+             FROM grants g JOIN identities i ON i.id = g.identity_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for row in grant_rows {
+            let identity_id: String = row.try_get("identity_id")?;
+            let client_id: String = row.try_get("client_id")?;
+            let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
+            let old_key = user_key(&self.master, &account_id)?;
+            let new_key = user_key(&new_master, &account_id)?;
+            let decisions =
+                Zeroizing::new(dec(&old_key, &row.try_get::<Vec<u8>, _>("decisions")?)?);
+            sqlx::query("UPDATE grants SET decisions = ? WHERE identity_id = ? AND client_id = ?")
+                .bind(enc(&new_key, &decisions)?)
+                .bind(identity_id)
+                .bind(client_id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1167,6 +1234,9 @@ impl EncryptedStore {
     /// Register a relying party. Returns it with its secret when
     /// `confidential`: 32 random bytes in base64url, of which only the hash is
     /// stored, so this is the one time the secret can be read.
+    ///
+    /// It may ask for no attribute until
+    /// [`set_client_attributes`](Self::set_client_attributes) says which.
     pub async fn create_client(
         &self,
         name: &str,
@@ -1198,6 +1268,7 @@ impl EncryptedStore {
             name: name.to_owned(),
             redirect_uris: redirect_uris.to_vec(),
             confidential,
+            attributes: BTreeMap::new(),
             created_at: now_unix(),
         };
         sqlx::query(
@@ -1218,7 +1289,7 @@ impl EncryptedStore {
     pub async fn fetch_client(&self, client_id: &str) -> Result<Option<Client>> {
         let row = sqlx::query(
             "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
-             created_at FROM clients WHERE client_id = ?",
+             attributes, created_at FROM clients WHERE client_id = ?",
         )
         .bind(client_id)
         .fetch_optional(&self.pool)
@@ -1230,7 +1301,7 @@ impl EncryptedStore {
     pub async fn list_clients(&self) -> Result<Vec<Client>> {
         sqlx::query(
             "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
-             created_at FROM clients ORDER BY created_at, client_id",
+             attributes, created_at FROM clients ORDER BY created_at, client_id",
         )
         .fetch_all(&self.pool)
         .await?
@@ -1239,8 +1310,27 @@ impl EncryptedStore {
         .collect()
     }
 
-    /// Remove a relying party and the identity choices made for it. Returns
-    /// whether it existed.
+    /// Say which attributes a relying party may ask for, and which of them
+    /// it requires: this replaces what it could ask before. Returns whether
+    /// the relying party exists.
+    ///
+    /// What people already accepted to share stays recorded. An attribute
+    /// taken away here is no longer sent, because it can no longer be asked.
+    pub async fn set_client_attributes(
+        &self,
+        client_id: &str,
+        attributes: &BTreeMap<Attribute, Need>,
+    ) -> Result<bool> {
+        let done = sqlx::query("UPDATE clients SET attributes = ? WHERE client_id = ?")
+            .bind(serde_json::to_string(attributes).map_err(|_| Error::InvalidBlob)?)
+            .bind(client_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Remove a relying party, the identity choices made for it and what was
+    /// recorded as shared with it. Returns whether it existed.
     pub async fn delete_client(&self, client_id: &str) -> Result<bool> {
         let done = sqlx::query("DELETE FROM clients WHERE client_id = ?")
             .bind(client_id)
@@ -1305,6 +1395,207 @@ impl EncryptedStore {
         }
         Ok(())
     }
+
+    // -- Grants: what an identity gave a relying party --------------------------
+
+    /// What each identity of `account_id` gave `client_id`.
+    pub async fn grants_for_client(&self, account_id: Uuid, client_id: &str) -> Result<Vec<Grant>> {
+        let key = user_key(&self.master, &account_id)?;
+        sqlx::query(
+            "SELECT g.identity_id, g.client_id, g.decisions, g.created_at, g.last_used_at \
+             FROM grants g JOIN identities i ON i.id = g.identity_id \
+             WHERE i.account_id = ? AND g.client_id = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| grant_from_row(&key, row))
+        .collect()
+    }
+
+    /// What `identity_id` gave each relying party, with the name each one is
+    /// registered under, the latest first. Empty when the identity is not
+    /// one of `account_id`'s.
+    pub async fn grants_of_identity(
+        &self,
+        account_id: Uuid,
+        identity_id: Uuid,
+    ) -> Result<Vec<(Grant, String)>> {
+        let key = user_key(&self.master, &account_id)?;
+        sqlx::query(
+            "SELECT g.identity_id, g.client_id, g.decisions, g.created_at, g.last_used_at, \
+             c.name FROM grants g \
+             JOIN identities i ON i.id = g.identity_id \
+             JOIN clients c ON c.client_id = g.client_id \
+             WHERE i.account_id = ? AND g.identity_id = ? \
+             ORDER BY g.last_used_at DESC, g.client_id",
+        )
+        .bind(account_id.to_string())
+        .bind(identity_id.to_string())
+        .fetch_all(&self.pool)
+        .await?
+        .iter()
+        .map(|row| Ok((grant_from_row(&key, row)?, row.try_get("name")?)))
+        .collect()
+    }
+
+    /// Record a sign-in of `identity_id` at `client_id`, and what the person
+    /// just decided: for each attribute of `decided`, the value they accept
+    /// to share, or `None` when they refuse. Decisions about other
+    /// attributes are kept. A value accepted again keeps the date it was
+    /// first accepted at.
+    ///
+    /// Returns the grant as it now stands. [`Error::NotFound`] when the
+    /// identity is not one of `account_id`'s.
+    pub async fn record_grant(
+        &self,
+        account_id: Uuid,
+        identity_id: Uuid,
+        client_id: &str,
+        decided: &BTreeMap<Attribute, Option<String>>,
+    ) -> Result<Grant> {
+        let key = user_key(&self.master, &account_id)?;
+        let now = now_unix();
+        let mut tx = self.pool.begin().await?;
+
+        let owned: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM identities WHERE id = ? AND account_id = ?")
+                .bind(identity_id.to_string())
+                .bind(account_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if owned.is_none() {
+            return Err(Error::NotFound);
+        }
+
+        let row = sqlx::query(
+            "SELECT identity_id, client_id, decisions, created_at, last_used_at FROM grants \
+             WHERE identity_id = ? AND client_id = ?",
+        )
+        .bind(identity_id.to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut grant = match row {
+            Some(row) => grant_from_row(&key, &row)?,
+            None => Grant {
+                identity_id,
+                client_id: client_id.to_owned(),
+                decisions: BTreeMap::new(),
+                created_at: now,
+                last_used_at: now,
+            },
+        };
+        grant.last_used_at = now;
+        for (attribute, value) in decided {
+            let unchanged = value.is_some() && grant.shared(*attribute) == value.as_deref();
+            if !unchanged {
+                grant.decisions.insert(
+                    *attribute,
+                    Decision {
+                        value: value.clone(),
+                        at: now,
+                    },
+                );
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO grants (identity_id, client_id, decisions, created_at, last_used_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (identity_id, client_id) DO UPDATE SET \
+               decisions = excluded.decisions, last_used_at = excluded.last_used_at",
+        )
+        .bind(identity_id.to_string())
+        .bind(client_id)
+        .bind(enc_json(&key, &grant.decisions)?)
+        .bind(grant.created_at)
+        .bind(grant.last_used_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(grant)
+    }
+
+    /// Withdraw what `identity_id` gave `client_id`.
+    ///
+    /// With an `attribute`, the decision about that one is forgotten: it is
+    /// no longer sent, and the person is asked again the next time the
+    /// relying party asks for it. Without, everything recorded for the
+    /// relying party is removed, and the identity is no longer the one
+    /// offered first there.
+    ///
+    /// This stops what the server sends from now on. It takes nothing back
+    /// from the relying party. [`Error::NotFound`] when nothing is recorded,
+    /// or when the identity is not one of `account_id`'s.
+    pub async fn withdraw_grant(
+        &self,
+        account_id: Uuid,
+        identity_id: Uuid,
+        client_id: &str,
+        attribute: Option<Attribute>,
+    ) -> Result<()> {
+        let key = user_key(&self.master, &account_id)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT g.identity_id, g.client_id, g.decisions, g.created_at, g.last_used_at \
+             FROM grants g JOIN identities i ON i.id = g.identity_id \
+             WHERE i.account_id = ? AND g.identity_id = ? AND g.client_id = ?",
+        )
+        .bind(account_id.to_string())
+        .bind(identity_id.to_string())
+        .bind(client_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::NotFound)?;
+
+        match attribute {
+            Some(attribute) => {
+                let mut grant = grant_from_row(&key, &row)?;
+                if grant.decisions.remove(&attribute).is_none() {
+                    return Err(Error::NotFound);
+                }
+                sqlx::query(
+                    "UPDATE grants SET decisions = ? WHERE identity_id = ? AND client_id = ?",
+                )
+                .bind(enc_json(&key, &grant.decisions)?)
+                .bind(identity_id.to_string())
+                .bind(client_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM grants WHERE identity_id = ? AND client_id = ?")
+                    .bind(identity_id.to_string())
+                    .bind(client_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "DELETE FROM client_identities \
+                     WHERE account_id = ? AND client_id = ? AND identity_id = ?",
+                )
+                .bind(account_id.to_string())
+                .bind(client_id)
+                .bind(identity_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+fn grant_from_row(key: &[u8; 32], row: &sqlx::sqlite::SqliteRow) -> Result<Grant> {
+    Ok(Grant {
+        identity_id: row.try_get::<String, _>("identity_id")?.parse()?,
+        client_id: row.try_get("client_id")?,
+        decisions: dec_json(key, &row.try_get::<Vec<u8>, _>("decisions")?)?,
+        created_at: row.try_get("created_at")?,
+        last_used_at: row.try_get("last_used_at")?,
+    })
 }
 
 fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Client> {
@@ -1314,6 +1605,8 @@ fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Client> {
         name: row.try_get("name")?,
         redirect_uris: serde_json::from_str(&uris).map_err(|_| Error::InvalidBlob)?,
         confidential: row.try_get("confidential")?,
+        attributes: serde_json::from_str(&row.try_get::<String, _>("attributes")?)
+            .map_err(|_| Error::InvalidBlob)?,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -1464,6 +1757,10 @@ mod tests {
             name: "Secret Persona".to_string(),
             logo: "icon:ph:rocket-launch".to_string(),
             description: Some("only my friends know".to_string()),
+            attributes: Attributes::from([
+                (Attribute::GivenName, "Hypatia".to_string()),
+                (Attribute::Email, "hypatia@private.example".to_string()),
+            ]),
             created_at: now,
             updated_at: now,
         }
@@ -2485,6 +2782,7 @@ mod tests {
             name: name.into(),
             logo: "icon:ph:user".into(),
             description: None,
+            attributes: Attributes::new(),
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
         };
@@ -2544,5 +2842,346 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Raw bytes of every column of `table`, to look for plaintext in.
+    async fn dump(store: &EncryptedStore, table: &str, columns: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let rows = sqlx::query(&format!("SELECT {} FROM {table}", columns.join(", ")))
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        for row in rows {
+            for column in columns {
+                if let Ok(Some(blob)) = row.try_get::<Option<Vec<u8>>, _>(*column) {
+                    bytes.extend(blob);
+                }
+            }
+        }
+        bytes
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn attributes_are_stored_validated_and_unreadable_in_a_dump() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+        let mut identity = sample_identity(user.id);
+        store.store_identity(&identity).await.unwrap();
+
+        let stored = store
+            .fetch_identity(user.id, identity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attributes, identity.attributes);
+        let raw = dump(&store, "identities", &["attributes"]).await;
+        assert!(!raw.is_empty());
+        for readable in ["Hypatia", "private.example", "given_name", "email"] {
+            assert!(!contains(&raw, readable), "{readable} readable in the dump");
+        }
+
+        // A value is trimmed; an invalid one changes nothing.
+        identity
+            .attributes
+            .insert(Attribute::FamilyName, "  of Alexandria ".into());
+        store.update_identity(&identity).await.unwrap();
+        identity
+            .attributes
+            .insert(Attribute::Email, "not an address".into());
+        assert!(matches!(
+            store.update_identity(&identity).await,
+            Err(Error::InvalidIdentity(_))
+        ));
+        let stored = store
+            .fetch_identity(user.id, identity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attributes[&Attribute::FamilyName], "of Alexandria");
+        assert_eq!(
+            stored.attributes[&Attribute::Email],
+            "hypatia@private.example"
+        );
+
+        // No attribute at all is stored as nothing.
+        identity.attributes.clear();
+        store.update_identity(&identity).await.unwrap();
+        assert!(dump(&store, "identities", &["attributes"]).await.is_empty());
+        let stored = store
+            .fetch_identity(user.id, identity.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.attributes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_may_ask_for_what_its_registration_lists() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let (site, _) = store
+            .create_client("Shop", &["https://shop.example/cb".to_string()], false)
+            .await
+            .unwrap();
+        assert!(site.attributes.is_empty(), "nothing until it is said");
+
+        let asked = BTreeMap::from([
+            (Attribute::Email, Need::Required),
+            (Attribute::GivenName, Need::Optional),
+        ]);
+        assert!(
+            store
+                .set_client_attributes(&site.client_id, &asked)
+                .await
+                .unwrap()
+        );
+        let stored = store.fetch_client(&site.client_id).await.unwrap().unwrap();
+        assert_eq!(stored.attributes, asked);
+        assert_eq!(store.list_clients().await.unwrap()[0].attributes, asked);
+
+        assert!(
+            !store
+                .set_client_attributes("no-such-client", &asked)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_record_what_was_decided_and_are_withdrawn() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let user = sample_user();
+        store.store_user(&user).await.unwrap();
+        let mut other = sample_user();
+        other.id = Uuid::new_v4();
+        other.username = "other".into();
+        store.store_user(&other).await.unwrap();
+        let identity = sample_identity(user.id);
+        store.store_identity(&identity).await.unwrap();
+        let (shop, _) = store
+            .create_client("Shop", &["https://shop.example/cb".to_string()], false)
+            .await
+            .unwrap();
+        let (forum, _) = store
+            .create_client("Forum", &["https://forum.example/cb".to_string()], false)
+            .await
+            .unwrap();
+
+        // A sign-in where nothing was asked is recorded all the same.
+        let grant = store
+            .record_grant(user.id, identity.id, &forum.client_id, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(grant.decisions.is_empty());
+
+        // One attribute accepted, one refused.
+        let decided = BTreeMap::from([
+            (
+                Attribute::Email,
+                Some("hypatia@private.example".to_string()),
+            ),
+            (Attribute::GivenName, None),
+        ]);
+        let grant = store
+            .record_grant(user.id, identity.id, &shop.client_id, &decided)
+            .await
+            .unwrap();
+        assert_eq!(
+            grant.shared(Attribute::Email),
+            Some("hypatia@private.example")
+        );
+        assert!(grant.refused(Attribute::GivenName));
+        assert!(!grant.refused(Attribute::Email));
+        assert_eq!(grant.shared(Attribute::FamilyName), None);
+        assert!(!grant.refused(Attribute::FamilyName), "never asked");
+
+        // Nothing of it can be read in a dump.
+        let raw = dump(&store, "grants", &["decisions"]).await;
+        for readable in ["hypatia", "private.example", "email", "given_name"] {
+            assert!(!contains(&raw, readable), "{readable} readable in the dump");
+        }
+
+        // Another sign-in that decides nothing keeps the decisions; a value
+        // accepted again keeps its date, a new value replaces the old one.
+        sqlx::query("UPDATE grants SET created_at = 1000, last_used_at = 1000")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let grant = store
+            .record_grant(user.id, identity.id, &shop.client_id, &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(grant.created_at, 1000);
+        assert!(grant.last_used_at > 1000);
+        assert_eq!(grant.decisions.len(), 2);
+        let first_accepted_at = grant.decisions[&Attribute::Email].at;
+        let again = BTreeMap::from([(
+            Attribute::Email,
+            Some("hypatia@private.example".to_string()),
+        )]);
+        let grant = store
+            .record_grant(user.id, identity.id, &shop.client_id, &again)
+            .await
+            .unwrap();
+        assert_eq!(grant.decisions[&Attribute::Email].at, first_accepted_at);
+        let changed = BTreeMap::from([(Attribute::Email, Some("h@new.example".to_string()))]);
+        let grant = store
+            .record_grant(user.id, identity.id, &shop.client_id, &changed)
+            .await
+            .unwrap();
+        assert_eq!(grant.shared(Attribute::Email), Some("h@new.example"));
+
+        // Read back per client and per identity, for the right account only.
+        let for_shop = store
+            .grants_for_client(user.id, &shop.client_id)
+            .await
+            .unwrap();
+        assert_eq!(for_shop, vec![grant.clone()]);
+        assert!(
+            store
+                .grants_for_client(other.id, &shop.client_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let of_identity = store
+            .grants_of_identity(user.id, identity.id)
+            .await
+            .unwrap();
+        let names: Vec<&str> = of_identity.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["Shop", "Forum"], "the latest sign-in first");
+        assert!(
+            store
+                .grants_of_identity(other.id, identity.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store
+                .record_grant(other.id, identity.id, &shop.client_id, &BTreeMap::new())
+                .await,
+            Err(Error::NotFound)
+        ));
+
+        // A rotation of the master key keeps attributes and grants readable.
+        store
+            .rotate_master_key(MasterKey::from_hex(&"cd".repeat(32)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .grants_for_client(user.id, &shop.client_id)
+                .await
+                .unwrap(),
+            vec![grant]
+        );
+        assert_eq!(
+            store
+                .fetch_identity(user.id, identity.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attributes,
+            identity.attributes
+        );
+
+        // Withdrawing one attribute forgets that decision only.
+        assert!(matches!(
+            store
+                .withdraw_grant(other.id, identity.id, &shop.client_id, None)
+                .await,
+            Err(Error::NotFound)
+        ));
+        store
+            .withdraw_grant(
+                user.id,
+                identity.id,
+                &shop.client_id,
+                Some(Attribute::Email),
+            )
+            .await
+            .unwrap();
+        let grant = &store
+            .grants_for_client(user.id, &shop.client_id)
+            .await
+            .unwrap()[0];
+        assert_eq!(grant.shared(Attribute::Email), None);
+        assert!(grant.refused(Attribute::GivenName));
+        assert!(matches!(
+            store
+                .withdraw_grant(
+                    user.id,
+                    identity.id,
+                    &shop.client_id,
+                    Some(Attribute::Email)
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+
+        // Withdrawing everything removes the record and the remembered choice.
+        store
+            .set_chosen_identity(user.id, &shop.client_id, identity.id)
+            .await
+            .unwrap();
+        store
+            .withdraw_grant(user.id, identity.id, &shop.client_id, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .grants_for_client(user.id, &shop.client_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .chosen_identity(user.id, &shop.client_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // What is left goes with its application, or with its identity.
+        assert_eq!(
+            store
+                .grants_of_identity(user.id, identity.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store.delete_client(&forum.client_id).await.unwrap();
+        assert!(
+            store
+                .grants_of_identity(user.id, identity.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .record_grant(user.id, identity.id, &shop.client_id, &BTreeMap::new())
+            .await
+            .unwrap();
+        store.delete_identity(user.id, identity.id).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grants")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }

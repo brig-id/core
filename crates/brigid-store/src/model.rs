@@ -1,5 +1,9 @@
 //! Data models for brigid-store.
 
+use std::collections::BTreeMap;
+
+use brigid_identity::{Attribute, Attributes, Need};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -23,9 +27,11 @@ pub struct Credential {
     pub data: Vec<u8>,
 }
 
-/// An identity of an account (`users`). Its `name` and `logo` are labels for
-/// the person, inside brig·id: no relying party receives them, only the VSID
-/// derived from `id`. `logo` is an `icon:<style>:<name>` reference.
+/// An identity of an account (`users`). Its `name`, `logo` and `description`
+/// are labels for the person, inside brig·id: no relying party receives
+/// them. `logo` is an `icon:<style>:<name>` reference. A relying party
+/// receives the VSID derived from `id`, and the `attributes` the person
+/// accepted to share with it ([`Grant`]).
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub id: Uuid,
@@ -33,6 +39,8 @@ pub struct Identity {
     pub name: String,
     pub logo: String,
     pub description: Option<String>,
+    /// What the identity can share. An absent attribute has no value.
+    pub attributes: Attributes,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -67,6 +75,48 @@ pub struct Client {
     /// Whether the client authenticates with a secret at the token endpoint.
     /// A public client has none.
     pub confidential: bool,
+    /// The attributes it may ask for, and whether it needs each one. A
+    /// request for anything else is refused.
+    pub attributes: BTreeMap<Attribute, Need>,
     /// Unix seconds.
     pub created_at: i64,
+}
+
+/// What a person decided about one attribute for one relying party.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decision {
+    /// The value they accepted to share; `None` when they refused. A person
+    /// accepts a value, not a field name: once the identity's value differs
+    /// from this one, nothing is accepted any more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// When they decided (Unix seconds).
+    pub at: i64,
+}
+
+/// What an identity gave a relying party: it exists from the first sign-in
+/// there, with no decision when nothing was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub identity_id: Uuid,
+    pub client_id: String,
+    pub decisions: BTreeMap<Attribute, Decision>,
+    /// The first sign-in (Unix seconds).
+    pub created_at: i64,
+    /// The latest sign-in (Unix seconds).
+    pub last_used_at: i64,
+}
+
+impl Grant {
+    /// The value of `attribute` the person accepted to share, if they did.
+    pub fn shared(&self, attribute: Attribute) -> Option<&str> {
+        self.decisions.get(&attribute)?.value.as_deref()
+    }
+
+    /// Whether the person refused to share `attribute`.
+    pub fn refused(&self, attribute: Attribute) -> bool {
+        self.decisions
+            .get(&attribute)
+            .is_some_and(|decision| decision.value.is_none())
+    }
 }
