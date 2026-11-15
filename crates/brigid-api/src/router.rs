@@ -21,7 +21,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 use url::Url;
 
 use crate::{
-    routes::{auth, authorize, discovery, health, identities, recovery, token},
+    routes::{account, auth, authorize, discovery, health, identities, recovery, token},
     session,
     state::AppState,
 };
@@ -198,6 +198,9 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/recovery-code",
             get(recovery::status).post(recovery::create_code),
         )
+        // Leaving: a passkey ceremony of its own, then nothing is left.
+        .route("/account/delete/begin", post(account::delete_begin))
+        .route("/account/delete/finish", post(account::delete_finish))
         .route(
             "/account/identity-templates",
             get(identities::list_templates),

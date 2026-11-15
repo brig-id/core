@@ -28,6 +28,10 @@ pub enum ApiError {
     #[error("forbidden")]
     Forbidden,
 
+    /// The account has no recovery code yet: it can do nothing else first.
+    #[error("a recovery code is required first")]
+    RecoveryCodeRequired,
+
     /// The server does not take new accounts (`AppState::signup_open`).
     #[error("sign-up is closed on this server")]
     SignupClosed,
@@ -46,7 +50,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            ApiError::Forbidden | ApiError::SignupClosed => {
+            ApiError::Forbidden | ApiError::SignupClosed | ApiError::RecoveryCodeRequired => {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),

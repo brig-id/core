@@ -51,8 +51,20 @@ pub enum PendingLogin {
     Discoverable(DiscoverableAuthentication),
 }
 
+/// What an authentication ceremony was started for. Each `finish` endpoint
+/// accepts only its own kind: a ceremony begun to sign in cannot delete an
+/// account, and the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationPurpose {
+    /// Opening a session (`/auth/login/*`).
+    SignIn,
+    /// Deleting the signed-in account (`/account/delete/*`).
+    DeleteAccount,
+}
+
 /// In-flight authentication session keyed by a temporary session UUID.
 pub struct PendingAuthentication {
+    pub purpose: AuthenticationPurpose,
     pub login: PendingLogin,
     /// Timestamp when this session was created; used for TTL eviction.
     pub created_at: Instant,

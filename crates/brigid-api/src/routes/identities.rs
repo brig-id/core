@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
-    session::AccountSession,
+    session::Onboarded,
     state::AppState,
 };
 
@@ -77,6 +77,9 @@ pub struct TemplateView {
     pub name: &'static str,
     pub logo: &'static str,
     pub description: &'static str,
+    /// One of the identities the onboarding proposes to a new account. The
+    /// browser creates the ones the person keeps; the server creates none.
+    pub starter: bool,
 }
 
 /// A new identity of `account_id` with a fresh id (ADR-007: the id is what
@@ -101,31 +104,24 @@ pub(crate) fn new_identity(
     }
 }
 
-/// The starter identities of a new account (ADR-002, core#48).
-pub(crate) fn starter_identities(account_id: Uuid) -> Vec<Identity> {
-    brigid_identity::default_templates()
-        .map(|t| {
-            new_identity(
-                account_id,
-                t.name.to_string(),
-                t.logo.to_string(),
-                Some(t.description.to_string()),
-                Attributes::new(),
-            )
-        })
-        .collect()
-}
-
-/// `GET /account/identity-templates`: the templates offered at creation.
+/// `GET /account/identity-templates`: the templates offered at creation,
+/// the starters first, in the order the onboarding proposes them.
 pub async fn list_templates() -> impl IntoResponse {
-    let views: Vec<TemplateView> = brigid_identity::TEMPLATES
-        .iter()
-        .map(|t| TemplateView {
-            key: t.key,
-            name: t.name,
-            logo: t.logo,
-            description: t.description,
-        })
+    let starters = brigid_identity::templates::DEFAULT_TEMPLATE_KEYS;
+    let view = |t: &'static brigid_identity::IdentityTemplate| TemplateView {
+        key: t.key,
+        name: t.name,
+        logo: t.logo,
+        description: t.description,
+        starter: starters.contains(&t.key),
+    };
+    let views: Vec<TemplateView> = brigid_identity::default_templates()
+        .chain(
+            brigid_identity::TEMPLATES
+                .iter()
+                .filter(|t| !starters.contains(&t.key)),
+        )
+        .map(view)
         .collect();
     Json(views)
 }
@@ -174,7 +170,7 @@ fn map_store(e: StoreError) -> ApiError {
 /// `GET /account/identities`
 pub async fn list_identities(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
 ) -> Result<impl IntoResponse, ApiError> {
     let identities = state
         .store
@@ -188,7 +184,7 @@ pub async fn list_identities(
 /// `POST /account/identities`
 pub async fn create_identity(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Json(body): Json<CreateIdentityRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let account_id = session.account.id;
@@ -233,7 +229,7 @@ pub async fn create_identity(
 /// `PATCH /account/identities/{id}`
 pub async fn update_identity(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateIdentityRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -273,7 +269,7 @@ pub async fn update_identity(
 /// `DELETE /account/identities/{id}`
 pub async fn delete_identity(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     state
@@ -339,7 +335,7 @@ impl ApplicationView {
 /// identity signed in to and what each one was given, the latest first.
 pub async fn list_applications(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let account_id = session.account.id;
@@ -365,7 +361,7 @@ pub async fn list_applications(
 /// starts from nothing; what the application already received stays with it.
 pub async fn withdraw_application(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Path((id, client_id)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
     state
@@ -381,7 +377,7 @@ pub async fn withdraw_application(
 /// the person is asked again the next time the application asks for it.
 pub async fn withdraw_attribute(
     State(state): State<Arc<AppState>>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Path((id, client_id, name)): Path<(Uuid, String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let attribute = attribute_named(&name)?;

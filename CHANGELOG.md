@@ -15,8 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `default-src 'none'`, with nothing framed, based or submitted. It still
   allowed a photo service the interface stopped using.
 
+### Changed
+
+- **Registration creates no identity** (core#98). `GET
+  /account/identity-templates` lists the starters first and marks them
+  (`starter`); the onboarding proposes them and the browser creates the ones
+  the person keeps. An account that signs in with no identity is no longer
+  given three.
+- **An account without a recovery code is still in its onboarding** (core#98):
+  identities, their applications and the answer to an authorization request
+  are refused (`403`, "a recovery code is required first") until `POST
+  /account/recovery-code` has run. `GET /auth/session` says so
+  (`recovery_code`), and so does `GET /auth/authorize/{request}`
+  (`needs_recovery_code`). A code can be replaced, not removed.
+
 ### Added
 
+- **A person can delete their account** (core#98): `POST
+  /account/delete/begin` and `/finish`, a passkey ceremony begun for that
+  purpose and for the session's account. A ceremony begun to sign in cannot
+  delete, and the other way round. `EncryptedStore::delete_account` removes
+  the account, its passkeys, recovery code, sessions, identities, and what
+  was recorded about the applications they signed in to.
 - Attributes (core#91). An identity carries optional attributes
   (`given_name`, `family_name`, `preferred_username`, `email`, `locale`,
   `zoneinfo`), set through `/account/identities`. A registered client lists
