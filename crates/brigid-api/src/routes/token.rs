@@ -184,6 +184,9 @@ async fn exchange(
             nonce: code.nonce.as_deref(),
             auth_time: code.auth_time,
             ttl_secs: ID_TOKEN_TTL_SECS,
+            // What the person accepted when the code was issued, with the
+            // values they saw.
+            attributes: &code.attributes,
         },
         &state.oidc_key,
         helpers4::time::unix_now().map_or(0, |secs| secs as i64),

@@ -164,7 +164,10 @@ async fn openid_configuration_describes_the_code_flow() {
         json["response_types_supported"],
         serde_json::json!(["code"])
     );
-    assert_eq!(json["scopes_supported"], serde_json::json!(["openid"]));
+    assert_eq!(
+        json["scopes_supported"],
+        serde_json::json!(["openid", "profile", "email"])
+    );
     assert_eq!(
         json["id_token_signing_alg_values_supported"],
         serde_json::json!(["EdDSA"])
@@ -2989,8 +2992,18 @@ async fn an_authorization_request_is_checked_before_anyone_is_asked() {
         assert!(!q.contains_key("code"));
     }
 
-    // Unknown parameters and extra scopes are ignored; the form works too.
-    let query = authorize_query(id, "&unknown=1&scope=openid+profile+email");
+    // A scope that carries attributes is refused to an application that is
+    // not registered to ask for any of them: it asks for more than it may.
+    for scope in ["profile", "email"] {
+        let query = authorize_query(id, &format!("&scope=openid+{scope}"));
+        let q = query_of(&authorize(&app, &query, "10.61.2.9").await);
+        assert_eq!(q["error"], "invalid_scope", "{scope}");
+        assert!(q["error_description"].contains(scope), "{q:?}");
+    }
+
+    // Unknown parameters and scopes this server does not know are ignored;
+    // the form works too.
+    let query = authorize_query(id, "&unknown=1&scope=openid+offline_access+phone");
     let resp = app
         .clone()
         .oneshot(
@@ -3512,4 +3525,730 @@ async fn a_passkey_that_does_not_verify_its_user_is_refused() {
         "the same response, verified, is accepted: {:?}",
         outcomes[1].1
     );
+}
+
+// ---------------------------------------------------------------------------
+// Attributes: what an identity shares, and with whom
+// ---------------------------------------------------------------------------
+
+/// A different client address for every call, so that no test meets the
+/// rate limit.
+struct Addresses(&'static str, std::cell::Cell<u32>);
+
+impl Addresses {
+    fn new(prefix: &'static str) -> Self {
+        Self(prefix, std::cell::Cell::new(0))
+    }
+
+    fn next(&self) -> String {
+        let n = self.1.get() + 1;
+        self.1.set(n);
+        format!("{}.{}.{}", self.0, n / 200, n % 200 + 1)
+    }
+}
+
+/// Registers a public client that may ask for `attributes`.
+async fn client_asking(
+    state: &AppState,
+    name: &str,
+    attributes: &[(brigid_identity::Attribute, brigid_identity::Need)],
+) -> String {
+    let (client, _) = state
+        .store
+        .create_client(name, &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .store
+            .set_client_attributes(&client.client_id, &attributes.iter().copied().collect())
+            .await
+            .unwrap()
+    );
+    client.client_id
+}
+
+/// Changes attributes of an identity and returns the answer.
+async fn set_attributes(
+    app: &axum::Router,
+    cookie: &str,
+    identity: Uuid,
+    attributes: serde_json::Value,
+    xff: &str,
+) -> (StatusCode, serde_json::Value) {
+    identity_request(
+        app,
+        "PATCH",
+        &format!("/account/identities/{identity}"),
+        Some(cookie),
+        xff,
+        Some(serde_json::json!({ "attributes": attributes })),
+    )
+    .await
+}
+
+/// The person's answer to request `id`: continue as `identity`, accepting
+/// to share `attributes`.
+async fn answer(
+    app: &axum::Router,
+    id: &str,
+    cookie: &str,
+    identity: Uuid,
+    attributes: &[&str],
+    xff: &str,
+) -> (StatusCode, serde_json::Value) {
+    identity_request(
+        app,
+        "POST",
+        &format!("/auth/authorize/{id}/approve"),
+        Some(cookie),
+        xff,
+        Some(serde_json::json!({ "identity_id": identity, "attributes": attributes })),
+    )
+    .await
+}
+
+/// The verified claims of the ID token a public client gets for the code
+/// carried by `redirect_to`.
+async fn claims_from(
+    app: &axum::Router,
+    state: &AppState,
+    client_id: &str,
+    redirect_to: &serde_json::Value,
+    xff: &str,
+) -> serde_json::Value {
+    let q = query_of(redirect_to.as_str().unwrap());
+    let code = q
+        .get("code")
+        .unwrap_or_else(|| panic!("no code: {redirect_to}"));
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) = token_request(app, &form, None, xff).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    verified_claims(state, j["id_token"].as_str().unwrap())
+}
+
+/// The names of the claims that are attributes, sorted.
+fn attribute_claims(claims: &serde_json::Value) -> Vec<String> {
+    const TOKEN_FIELDS: [&str; 8] = [
+        "sub",
+        "iss",
+        "aud",
+        "exp",
+        "iat",
+        "auth_time",
+        "nonce",
+        "jti",
+    ];
+    let mut names: Vec<String> = claims
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| !TOKEN_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+const ASK_ALL: &str = "&scope=openid+profile+email";
+
+#[tokio::test]
+async fn attributes_are_set_changed_and_removed_on_an_identity() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (cookie, _, identities) = signed_in_account(&app, "attrs@localhost", "10.70.1").await;
+    let xff = Addresses::new("10.71");
+    let me = identities[0];
+
+    // Created with attributes.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&cookie),
+        &xff.next(),
+        Some(serde_json::json!({
+            "name": "Club",
+            "logo": "icon:ph:users",
+            "attributes": { "preferred_username": "ada_l", "locale": "" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    assert_eq!(
+        j["attributes"],
+        serde_json::json!({ "preferred_username": "ada_l" })
+    );
+
+    // Set: values are trimmed, the others stay.
+    let (status, j) = set_attributes(
+        &app,
+        &cookie,
+        me,
+        serde_json::json!({ "given_name": "  Ada ", "email": "ada@example.org" }),
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(
+        j["attributes"],
+        serde_json::json!({ "given_name": "Ada", "email": "ada@example.org" })
+    );
+    let (_, j) = set_attributes(
+        &app,
+        &cookie,
+        me,
+        serde_json::json!({ "zoneinfo": "Europe/Paris", "given_name": "" }),
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(
+        j["attributes"],
+        serde_json::json!({ "email": "ada@example.org", "zoneinfo": "Europe/Paris" })
+    );
+
+    // A change of label leaves them alone.
+    let (_, j) = identity_request(
+        &app,
+        "PATCH",
+        &format!("/account/identities/{me}"),
+        Some(&cookie),
+        &xff.next(),
+        Some(serde_json::json!({ "name": "Renamed" })),
+    )
+    .await;
+    assert_eq!(j["name"], "Renamed");
+    assert_eq!(j["attributes"]["email"], "ada@example.org");
+
+    // An unknown attribute, a label passed off as one, a malformed value:
+    // refused, and nothing changes.
+    for bad in [
+        serde_json::json!({ "phone_number": "+33 1 23 45 67 89" }),
+        serde_json::json!({ "name": "Ada" }),
+        serde_json::json!({ "email": "not an address" }),
+        serde_json::json!({ "zoneinfo": "Europe/Paris", "locale": "français" }),
+    ] {
+        let (status, j) = set_attributes(&app, &cookie, me, bad.clone(), &xff.next()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {j}");
+    }
+    let (_, list) = identity_request(
+        &app,
+        "GET",
+        "/account/identities",
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    let mine = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == serde_json::json!(me))
+        .unwrap();
+    assert_eq!(
+        mine["attributes"],
+        serde_json::json!({ "email": "ada@example.org", "zoneinfo": "Europe/Paris" })
+    );
+}
+
+/// core#91: an application receives an attribute only after a recorded
+/// grant for that exact value.
+#[tokio::test]
+async fn an_application_receives_an_attribute_only_once_its_exact_value_was_accepted() {
+    use brigid_identity::{Attribute, Need};
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let shop = client_asking(
+        &state,
+        "Shop",
+        &[
+            (Attribute::Email, Need::Required),
+            (Attribute::GivenName, Need::Optional),
+            (Attribute::Locale, Need::Optional),
+        ],
+    )
+    .await;
+    let (cookie, _, identities) = signed_in_account(&app, "grant@localhost", "10.72.1").await;
+    let xff = Addresses::new("10.73");
+    let me = identities[0];
+    let (status, _) = set_attributes(
+        &app,
+        &cookie,
+        me,
+        serde_json::json!({
+            "email": "ada@example.org",
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+        }),
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let view = async |request: &str| {
+        let uri = format!("/auth/authorize/{request}");
+        let (status, j) =
+            identity_request(&app, "GET", &uri, Some(&cookie), &xff.next(), None).await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        j
+    };
+    let silent = async |extra: &str| {
+        let request =
+            begin_authorization(&app, &shop, &format!("{extra}&prompt=none"), &xff.next()).await;
+        let (status, j) = identity_request(
+            &app,
+            "POST",
+            &format!("/auth/authorize/{request}/silent"),
+            Some(&cookie),
+            &xff.next(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        j["redirect_to"].clone()
+    };
+    let applications = async || {
+        let (status, j) = identity_request(
+            &app,
+            "GET",
+            &format!("/account/identities/{me}/applications"),
+            Some(&cookie),
+            &xff.next(),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        j
+    };
+
+    // The identity has attributes, and the application may ask for some: a
+    // request that does not ask gets the identifier and nothing else.
+    let request = begin_authorization(&app, &shop, "", &xff.next()).await;
+    let j = view(&request).await;
+    assert_eq!(j["asked"], serde_json::json!([]));
+    let (status, j) = answer(&app, &request, &cookie, me, &[], &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert!(attribute_claims(&claims).is_empty(), "{claims}");
+    let apps = applications().await;
+    assert_eq!(apps[0]["name"], "Shop");
+    assert_eq!(apps[0]["shared"], serde_json::json!([]));
+
+    // It asks. The page learns what is asked, in the order it is shown, and
+    // that nothing is decided. Nothing was accepted: nothing passes silently.
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    let j = view(&request).await;
+    assert_eq!(
+        j["asked"],
+        serde_json::json!([
+            { "name": "given_name", "required": false },
+            { "name": "email", "required": true },
+            { "name": "locale", "required": false },
+        ])
+    );
+    assert_eq!(j["decisions"][me.to_string()], serde_json::json!({}));
+    assert_eq!(j["identities"][0]["attributes"]["email"], "ada@example.org");
+    assert_eq!(
+        query_of(silent(ASK_ALL).await.as_str().unwrap())["error"],
+        "consent_required"
+    );
+
+    // The person accepts both. The token carries them with the values
+    // accepted, an address that is not said to be verified, and nothing
+    // that was not asked: `family_name` is on the identity, the application
+    // may not ask for it.
+    let (status, j) = answer(
+        &app,
+        &request,
+        &cookie,
+        me,
+        &["email", "given_name"],
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert_eq!(
+        attribute_claims(&claims),
+        ["email", "email_verified", "given_name"]
+    );
+    assert_eq!(claims["email"], "ada@example.org");
+    assert_eq!(claims["email_verified"], false);
+    assert_eq!(claims["given_name"], "Ada");
+
+    // It is recorded, with the values, and shown on the identity's page.
+    let apps = applications().await;
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    let shared = apps[0]["shared"].as_array().unwrap();
+    assert_eq!(shared.len(), 2);
+    assert_eq!(shared[0]["name"], "given_name");
+    assert_eq!(shared[0]["value"], "Ada");
+    assert_eq!(shared[1]["name"], "email");
+    assert_eq!(shared[1]["value"], "ada@example.org");
+    assert!(shared[1]["since"].as_i64().unwrap() > 0);
+
+    // The same request again passes without a page, with the same values.
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    assert_eq!(
+        view(&request).await["decisions"][me.to_string()],
+        serde_json::json!({ "given_name": true, "email": true })
+    );
+    let claims = claims_from(&app, &state, &shop, &silent(ASK_ALL).await, &xff.next()).await;
+    assert_eq!(claims["email"], "ada@example.org");
+    assert_eq!(claims["given_name"], "Ada");
+    // Asking for less gives less.
+    let claims = claims_from(
+        &app,
+        &state,
+        &shop,
+        &silent("&scope=openid+email").await,
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(attribute_claims(&claims), ["email", "email_verified"]);
+
+    // The value changes: what was accepted was the old one. Nothing passes
+    // silently, and the new address is not sent until it is accepted.
+    let (status, _) = set_attributes(
+        &app,
+        &cookie,
+        me,
+        serde_json::json!({ "email": "ada@new.example" }),
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        query_of(silent(ASK_ALL).await.as_str().unwrap())["error"],
+        "consent_required"
+    );
+    assert_eq!(
+        view(&request).await["decisions"][me.to_string()],
+        serde_json::json!({ "given_name": true })
+    );
+    let (status, j) = answer(
+        &app,
+        &request,
+        &cookie,
+        me,
+        &["email", "given_name"],
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert_eq!(claims["email"], "ada@new.example");
+
+    // One attribute withdrawn: it is asked again.
+    let withdraw = async |path: &str| {
+        let (status, _) = identity_request(
+            &app,
+            "DELETE",
+            &format!("/account/identities/{me}/applications/{path}"),
+            Some(&cookie),
+            &xff.next(),
+            None,
+        )
+        .await;
+        status
+    };
+    assert_eq!(
+        withdraw(&format!("{shop}/attributes/given_name")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        withdraw(&format!("{shop}/attributes/given_name")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        withdraw(&format!("{shop}/attributes/label")).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        query_of(silent(ASK_ALL).await.as_str().unwrap())["error"],
+        "consent_required"
+    );
+    // The address is still accepted: asked alone, it still passes.
+    let claims = claims_from(
+        &app,
+        &state,
+        &shop,
+        &silent("&scope=openid+email").await,
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(claims["email"], "ada@new.example");
+
+    // Everything withdrawn: nothing is recorded, and the identity is no
+    // longer the one remembered for this application.
+    assert_eq!(withdraw(&shop).await, StatusCode::NO_CONTENT);
+    assert_eq!(withdraw(&shop).await, StatusCode::NOT_FOUND);
+    assert_eq!(applications().await, serde_json::json!([]));
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    let j = view(&request).await;
+    assert_eq!(j["chosen"], serde_json::Value::Null);
+    assert_eq!(j["decisions"], serde_json::json!({}));
+    assert_eq!(
+        query_of(silent("&scope=openid+email").await.as_str().unwrap())["error"],
+        "interaction_required"
+    );
+
+    // Someone else cannot read or withdraw what this identity gave.
+    let (other, _, _) = signed_in_account(&app, "other-grant@localhost", "10.72.2").await;
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities/{me}/applications"),
+        Some(&other),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// core#91: refusing an optional attribute continues; refusing a required
+/// one stops.
+#[tokio::test]
+async fn refusing_an_optional_attribute_continues_and_a_required_one_stops() {
+    use brigid_identity::{Attribute, Need};
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let shop = client_asking(
+        &state,
+        "Shop",
+        &[
+            (Attribute::Email, Need::Required),
+            (Attribute::GivenName, Need::Optional),
+            (Attribute::Zoneinfo, Need::Optional),
+        ],
+    )
+    .await;
+    let (cookie, _, identities) = signed_in_account(&app, "refuse@localhost", "10.74.1").await;
+    let xff = Addresses::new("10.75");
+    let (me, bare) = (identities[0], identities[1]);
+    set_attributes(
+        &app,
+        &cookie,
+        me,
+        serde_json::json!({ "email": "ada@example.org", "given_name": "Ada" }),
+        &xff.next(),
+    )
+    .await;
+
+    // The required one refused, alone or with the optional one accepted:
+    // the sign-in does not go on. The request is still there to be answered.
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    for accepted in [&[][..], &["given_name"][..]] {
+        let (status, j) = answer(&app, &request, &cookie, me, accepted, &xff.next()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{j}");
+        assert!(j["error"].as_str().unwrap().contains("email"), "{j}");
+    }
+    // An attribute that was not asked, or that does not exist, is not an
+    // answer either.
+    for accepted in [&["email", "family_name"][..], &["email", "name"][..]] {
+        let (status, j) = answer(&app, &request, &cookie, me, accepted, &xff.next()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    }
+    // An identity that lacks the required attribute cannot continue, and
+    // cannot accept to share what it does not have.
+    let (status, _) = answer(&app, &request, &cookie, bare, &[], &xff.next()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = answer(&app, &request, &cookie, bare, &["email"], &xff.next()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // None of this recorded anything.
+    let (_, apps) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities/{me}/applications"),
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(apps, serde_json::json!([]));
+
+    // The person gives up: the application is told, and gets no code.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        &format!("/auth/authorize/{request}/deny"),
+        None,
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let q = query_of(j["redirect_to"].as_str().unwrap());
+    assert_eq!(q["error"], "access_denied");
+    assert!(!q.contains_key("code"));
+
+    // The optional one refused: the sign-in goes on without it.
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    let (status, j) = answer(&app, &request, &cookie, me, &["email"], &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert_eq!(attribute_claims(&claims), ["email", "email_verified"]);
+
+    // The refusal is remembered: the next request passes without a page,
+    // still without the first name. The time zone was never refused: the
+    // identity has none, there was nothing to decide.
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{request}"),
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        j["decisions"][me.to_string()],
+        serde_json::json!({ "given_name": false, "email": true })
+    );
+    let silent =
+        begin_authorization(&app, &shop, &format!("{ASK_ALL}&prompt=none"), &xff.next()).await;
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        &format!("/auth/authorize/{silent}/silent"),
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert_eq!(attribute_claims(&claims), ["email", "email_verified"]);
+    let (_, apps) = identity_request(
+        &app,
+        "GET",
+        &format!("/account/identities/{me}/applications"),
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(apps[0]["refused"], serde_json::json!(["given_name"]));
+
+    // The person may change their mind on the page.
+    let (status, j) = answer(
+        &app,
+        &request,
+        &cookie,
+        me,
+        &["email", "given_name"],
+        &xff.next(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = claims_from(&app, &state, &shop, &j["redirect_to"], &xff.next()).await;
+    assert_eq!(claims["given_name"], "Ada");
+}
+
+/// core#91: the label of an identity appears in no token.
+#[tokio::test]
+async fn the_label_of_an_identity_appears_in_no_token() {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use brigid_identity::{Attribute, Need};
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    // The application may ask for everything there is, and requires it.
+    let everything: Vec<_> = Attribute::ALL
+        .into_iter()
+        .map(|a| (a, Need::Required))
+        .collect();
+    let shop = client_asking(&state, "Shop", &everything).await;
+    let (cookie, _, _) = signed_in_account(&app, "label@localhost", "10.76.1").await;
+    let xff = Addresses::new("10.77");
+
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&cookie),
+        &xff.next(),
+        Some(serde_json::json!({
+            "name": "Zanzibar Nightshift",
+            "logo": "icon:ph:rocket-launch",
+            "description": "Quetzalcoatl only my friends know",
+            "attributes": {
+                "given_name": "Ada",
+                "family_name": "Lovelace",
+                "preferred_username": "ada_l",
+                "email": "ada@example.org",
+                "locale": "en-GB",
+                "zoneinfo": "Europe/London",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
+
+    let request = begin_authorization(&app, &shop, ASK_ALL, &xff.next()).await;
+    let all: Vec<&str> = Attribute::ALL.into_iter().map(Attribute::claim).collect();
+    let (status, j) = answer(&app, &request, &cookie, identity, &all, &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    // The address that goes back to the application carries no label.
+    let redirect_to = j["redirect_to"].as_str().unwrap().to_owned();
+
+    let q = query_of(&redirect_to);
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", shop.as_str()),
+        ("code", q["code"].as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, response) = token_request(&app, &form, None, &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let jwt = response["id_token"].as_str().unwrap();
+    let header = Base64UrlUnpadded::decode_vec(jwt.split('.').next().unwrap()).unwrap();
+    let payload = Base64UrlUnpadded::decode_vec(jwt.split('.').nth(1).unwrap()).unwrap();
+    let everything_sent = format!(
+        "{redirect_to} {response} {} {}",
+        String::from_utf8(header).unwrap(),
+        String::from_utf8(payload).unwrap()
+    )
+    .to_lowercase();
+    for label in [
+        "zanzibar",
+        "nightshift",
+        "quetzalcoatl",
+        "friends",
+        "rocket",
+        "icon:ph",
+        &identity.to_string(),
+    ] {
+        assert!(
+            !everything_sent.contains(label),
+            "{label} reached the application"
+        );
+    }
+
+    // With every attribute shared, the token holds the attributes and its
+    // own fields: there is no claim a label could travel in.
+    let claims = verified_claims(&state, jwt);
+    assert_eq!(
+        attribute_claims(&claims),
+        [
+            "email",
+            "email_verified",
+            "family_name",
+            "given_name",
+            "locale",
+            "preferred_username",
+            "zoneinfo",
+        ]
+    );
+    assert_eq!(claims["preferred_username"], "ada_l");
 }

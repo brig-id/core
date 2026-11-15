@@ -1,3 +1,4 @@
+pub mod attributes;
 pub mod error;
 pub mod profile;
 pub mod recovery;
@@ -6,6 +7,7 @@ pub mod templates;
 pub mod username;
 pub mod vsid;
 
+pub use attributes::{Attribute, Attributes, Need, Scope, validate_attributes};
 pub use error::{Error, Result};
 pub use profile::{validate_description, validate_logo, validate_name};
 pub use recovery::{CodeError, RecoveryCode};

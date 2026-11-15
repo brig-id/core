@@ -210,6 +210,19 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}",
             patch(identities::update_identity).delete(identities::delete_identity),
         )
+        // What an identity gave each application, and its withdrawal.
+        .route(
+            "/account/identities/{id}/applications",
+            get(identities::list_applications),
+        )
+        .route(
+            "/account/identities/{id}/applications/{client_id}",
+            delete(identities::withdraw_application),
+        )
+        .route(
+            "/account/identities/{id}/applications/{client_id}/attributes/{name}",
+            delete(identities::withdraw_attribute),
+        )
         // The person's answer to an authorization request (ADR-005 §2),
         // from this server's own page.
         .route("/auth/authorize/{request}", get(authorize::request))

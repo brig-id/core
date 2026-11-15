@@ -8,7 +8,9 @@ pub mod model;
 pub mod store;
 
 pub use error::{Error, Result};
-pub use model::{Client, Credential, Identity, RecoveryStatus, StoredOidcKey, User};
+pub use model::{
+    Client, Credential, Decision, Grant, Identity, RecoveryStatus, StoredOidcKey, User,
+};
 pub use store::{EncryptedStore, SessionInfo, fetch_user, fetch_user_by_username, store_user};
 
 /// SQLx migrator — embeds all `migrations/` SQL files at compile time.

@@ -1,4 +1,4 @@
-use brigid_identity::Vsid;
+use brigid_identity::{Attribute, Attributes, Vsid};
 use jsonwebtoken::{Algorithm, Header};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,13 +20,20 @@ pub struct IssuanceParams<'a> {
     pub auth_time: i64,
     /// Token lifetime in seconds (added to `now_unix`).
     pub ttl_secs: u64,
+    /// The attributes of the identity that the person accepted to share with
+    /// this relying party, with the values they accepted. Whoever calls
+    /// decides that; this function writes what it is given.
+    pub attributes: &'a Attributes,
 }
 
 /// The claims of an ID token.
 ///
-/// Nothing here describes the person or the identity: `sub` is a VSID, an
-/// identifier that exists for one identity at one relying party. A claim
-/// that is the same at two relying parties would let them link their users.
+/// `sub` is a VSID, an identifier that exists for one identity at one
+/// relying party: by itself the token tells two relying parties nothing they
+/// could match. The claims after `jti` are attributes of the identity,
+/// present only when the person accepted to share them with this relying
+/// party. The labels of an identity (its name, its icon, its description)
+/// have no claim: they cannot be put in a token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
     /// Subject: the VSID.
@@ -46,6 +53,22 @@ pub struct Claims {
     pub nonce: Option<String>,
     /// Unique per token.
     pub jti: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub given_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Present with `email`, and `false`: this server sends no confirmation
+    /// message, so it does not say that the address is the person's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoneinfo: Option<String>,
 }
 
 /// Issue an ID token signed with `key` (EdDSA). `now_unix` is the current
@@ -59,6 +82,7 @@ pub fn issue_token(
     // a token that is already expired; the addition could overflow too.
     let ttl = i64::try_from(params.ttl_secs).map_err(|_| Error::InvalidTtl)?;
     let exp = now_unix.checked_add(ttl).ok_or(Error::InvalidTtl)?;
+    let attribute = |a: Attribute| params.attributes.get(&a).cloned();
     let claims = Claims {
         sub: params.vsid.to_string(),
         iss: params.issuer.to_string(),
@@ -68,6 +92,13 @@ pub fn issue_token(
         auth_time: params.auth_time,
         nonce: params.nonce.map(str::to_owned),
         jti: Uuid::new_v4().to_string(),
+        given_name: attribute(Attribute::GivenName),
+        family_name: attribute(Attribute::FamilyName),
+        preferred_username: attribute(Attribute::PreferredUsername),
+        email: attribute(Attribute::Email),
+        email_verified: attribute(Attribute::Email).map(|_| false),
+        locale: attribute(Attribute::Locale),
+        zoneinfo: attribute(Attribute::Zoneinfo),
     };
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(key.kid().to_string());
@@ -84,8 +115,11 @@ mod tests {
         identity_vsid(uuid::Uuid::from_bytes([1; 16]), "test-client", &[7u8; 32])
     }
 
+    static NO_ATTRIBUTES: Attributes = Attributes::new();
+
     fn params<'a>(vsid: &'a Vsid, nonce: Option<&'a str>) -> IssuanceParams<'a> {
         IssuanceParams {
+            attributes: &NO_ATTRIBUTES,
             vsid,
             issuer: "https://example.com",
             client_id: "test-client",
@@ -166,6 +200,44 @@ mod tests {
         let payload = Base64UrlUnpadded::decode_vec(jwt.split('.').nth(1).unwrap()).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert!(json.get("nonce").is_none(), "no nonce asked, none returned");
+    }
+
+    /// Each attribute handed over becomes the claim of its name, and nothing
+    /// else appears. An address is never said to be verified.
+    #[test]
+    fn attributes_become_their_claims() {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let key = OidcSigningKey::generate();
+        let vsid = test_vsid();
+        let payload = |attributes: &Attributes| -> serde_json::Value {
+            let mut p = params(&vsid, None);
+            p.attributes = attributes;
+            let jwt = issue_token(&p, &key, now()).unwrap();
+            let bytes = Base64UrlUnpadded::decode_vec(jwt.split('.').nth(1).unwrap()).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        };
+
+        let every: Attributes = Attribute::ALL
+            .into_iter()
+            .map(|a| (a, format!("value of {a}")))
+            .collect();
+        let json = payload(&every);
+        for a in Attribute::ALL {
+            assert_eq!(json[a.claim()], format!("value of {a}"), "{a}");
+        }
+        assert_eq!(json["email_verified"], false);
+        assert_eq!(
+            json.as_object().unwrap().len(),
+            7 + Attribute::ALL.len() + 1,
+            "the seven claims of every token, the attributes, email_verified"
+        );
+
+        let one = Attributes::from([(Attribute::Locale, "fr".to_string())]);
+        let json = payload(&one);
+        assert_eq!(json["locale"], "fr");
+        assert!(json.get("email").is_none());
+        assert!(json.get("email_verified").is_none());
+        assert_eq!(json.as_object().unwrap().len(), 8);
     }
 
     #[test]

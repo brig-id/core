@@ -72,8 +72,10 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
         jwks_uri: format!("{base}/.well-known/jwks.json"),
         response_types_supported: vec!["code"],
         grant_types_supported: vec!["authorization_code"],
-        // A site receives an identifier and nothing else (ADR-008).
-        scopes_supported: vec!["openid"],
+        // `openid` gives an identifier and nothing else. `profile` and
+        // `email` ask for attributes of the identity, within what the
+        // application's registration allows and what the person accepts.
+        scopes_supported: vec!["openid", "profile", "email"],
         // `sub` is a VSID: one per identity and per client, never an
         // identifier shared between relying parties.
         subject_types_supported: vec!["pairwise"],
@@ -93,6 +95,13 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
             "auth_time",
             "nonce",
             "jti",
+            "given_name",
+            "family_name",
+            "preferred_username",
+            "email",
+            "email_verified",
+            "locale",
+            "zoneinfo",
         ],
         authorization_response_iss_parameter_supported: true,
     }
@@ -154,7 +163,20 @@ mod tests {
             parsed["response_types_supported"],
             serde_json::json!(["code"])
         );
-        assert_eq!(parsed["scopes_supported"], serde_json::json!(["openid"]));
+        assert_eq!(
+            parsed["scopes_supported"],
+            serde_json::json!(["openid", "profile", "email"])
+        );
+        // Every attribute has its claim in the list.
+        for attribute in brigid_identity::Attribute::ALL {
+            assert!(
+                parsed["claims_supported"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(attribute.claim())),
+                "{attribute}"
+            );
+        }
         assert_eq!(
             parsed["subject_types_supported"],
             serde_json::json!(["pairwise"])

@@ -42,8 +42,11 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 - **No `unwrap()` on error paths** — typed errors via `thiserror`.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
 - **OIDC** — Authorization Code flow only, PKCE `S256` for every client, EdDSA only; a
-  relying party receives a VSID and nothing about the identity (name and logo never leave
-  the server). Pending requests and codes are held in memory with a TTL and a cap.
+  relying party receives a VSID. The labels of an identity (name, logo, description) never
+  leave the server. An attribute (`brigid-identity/src/attributes.rs`) reaches a relying
+  party only if its registration lets it ask, the request asks, and the person accepted the
+  value the identity has now (`standing` in `brigid-api/src/routes/authorize.rs`). Pending
+  requests and codes are held in memory with a TTL and a cap.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
   (`default-src 'self'`, no `unsafe-inline`).
 - **Rate limiting** — per client IP via `tower-governor`: the WebAuthn ceremonies
@@ -59,9 +62,12 @@ POST /auth/login/begin     → WebAuthn RequestChallenge
 POST /auth/login/finish    → account session (HttpOnly cookie), no token
 
 GET  /authorize                        → relying party's request, held; 303 to the UI page /continue/
-GET  /auth/authorize/{request}         → what the page shows (site name, identities)
-POST /auth/authorize/{request}/approve → code for the chosen identity (also /deny, /silent)
-POST /token                            → ID token (sub = VSID), EdDSA
+GET  /auth/authorize/{request}         → what the page shows (site name, identities, attributes asked)
+POST /auth/authorize/{request}/approve → code for the chosen identity and the attributes accepted (also /deny, /silent)
+POST /token                            → ID token (sub = VSID, accepted attributes), EdDSA
+
+GET    /account/identities/{id}/applications                               → what the identity gave each application
+DELETE /account/identities/{id}/applications/{client}[/attributes/{name}]  → withdraw it
 
 GET /.well-known/openid-configuration
 GET /.well-known/jwks.json
