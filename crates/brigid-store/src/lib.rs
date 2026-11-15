@@ -3,13 +3,15 @@
 //! All sensitive fields are encrypted with AES-256-GCM before INSERT.
 //! A raw SQLite dump must never reveal readable secrets.
 
+pub mod admin;
 pub mod error;
 pub mod model;
 pub mod store;
 
 pub use error::{Error, Result};
 pub use model::{
-    Client, Credential, Decision, Grant, Identity, RecoveryStatus, StoredOidcKey, User,
+    AccountStanding, AccountSummary, AdminAction, AdminLogEntry, Client, Credential, Decision,
+    Grant, Identity, Link, LinkKind, RecoveryStatus, SignupPolicy, StoredOidcKey, User,
 };
 pub use store::{EncryptedStore, SessionInfo, fetch_user, fetch_user_by_username, store_user};
 

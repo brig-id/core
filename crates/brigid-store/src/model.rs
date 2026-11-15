@@ -120,3 +120,136 @@ impl Grant {
             .is_some_and(|decision| decision.value.is_none())
     }
 }
+
+/// What a link handed out by the server is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkKind {
+    /// Creates the first account, as administrator.
+    Setup,
+    /// Grants the role to the signed-in account that opens it.
+    Admin,
+    /// Creates an ordinary account.
+    Invitation,
+}
+
+impl LinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Admin => "admin",
+            Self::Invitation => "invitation",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "setup" => Some(Self::Setup),
+            "admin" => Some(Self::Admin),
+            "invitation" => Some(Self::Invitation),
+            _ => None,
+        }
+    }
+}
+
+/// A link as its maker sees it afterwards: never the link itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub id: Uuid,
+    pub kind: LinkKind,
+    /// How many more times it can be used.
+    pub uses_left: i64,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+/// Who may create an account on this server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignupPolicy {
+    /// Anyone.
+    Open,
+    /// Whoever holds an invitation. The default: a server is not open to
+    /// strangers until its administrator says so.
+    Invitation,
+    /// Nobody.
+    Closed,
+}
+
+impl SignupPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Invitation => "invitation",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "invitation" => Some(Self::Invitation),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// What an administrator sees of an account: enough to run the server,
+/// nothing of what the person does with it. No identity, no label, no
+/// attribute, no application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub id: Uuid,
+    /// The generated username: what the person's passkey manager shows.
+    pub username: String,
+    pub created_at: OffsetDateTime,
+    pub admin: bool,
+    /// Unix seconds since when it is suspended.
+    pub suspended_at: Option<i64>,
+    /// Unix seconds of the last passkey ceremony that opened a session.
+    pub last_sign_in_at: Option<i64>,
+    pub passkeys: i64,
+    /// Whether it has a usable recovery code.
+    pub recovery_code: bool,
+}
+
+/// Where an account stands for the server: its role, and whether it may
+/// sign in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccountStanding {
+    pub admin: bool,
+    pub suspended: bool,
+}
+
+/// One administrative action, as it is logged.
+///
+/// Accounts are named by their identifier, never by a name: the name is
+/// looked up when the log is read, and an entry about an account that was
+/// deleted since names nobody. Nothing an account's identities are or do is
+/// ever written here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminAction {
+    /// What was done, e.g. `account.suspend`.
+    pub action: String,
+    /// The account that did it; `None` for the machine's command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<Uuid>,
+    /// The account it was done to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// The application it was done to, by its registered name, or a value
+    /// that was set (a sign-up policy). Never personal data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// An entry of the log of administrative actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminLogEntry {
+    /// Unix seconds.
+    pub at: i64,
+    pub action: AdminAction,
+}

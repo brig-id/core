@@ -167,6 +167,16 @@ async fn exchange(
     if !verified {
         return Err(TokenError::invalid_grant());
     }
+    // The account may have been suspended since the code was issued.
+    let suspended = state
+        .store
+        .account_standing(code.account_id)
+        .await
+        .map_err(TokenError::internal)?
+        .is_none_or(|standing| standing.suspended);
+    if suspended {
+        return Err(TokenError::invalid_grant());
+    }
     // The identity may have been deleted since the person chose it.
     state
         .store

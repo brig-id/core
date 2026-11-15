@@ -18,7 +18,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     error::{Error, Result},
-    model::{Client, Credential, Decision, Grant, Identity, RecoveryStatus, StoredOidcKey, User},
+    model::{
+        Client, Credential, Decision, Grant, Identity, LinkKind, RecoveryStatus, StoredOidcKey,
+        User,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -29,7 +32,7 @@ use crate::{
 ///
 /// HKDF-SHA3-256 with a 32-byte output is unconditionally infallible; the
 /// `Result` is an artefact of the RustCrypto API surface.
-fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
+pub(crate) fn user_key(master: &MasterKey, user_id: &Uuid) -> Result<Zeroizing<[u8; 32]>> {
     brigid_crypto::hkdf::derive_user_key(master, user_id.as_bytes(), b"store-fields")
         .map_err(crate::Error::from)
 }
@@ -43,12 +46,12 @@ fn oidc_seed_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
 
 /// Unix time in seconds, as the `sessions` table stores it. A clock set
 /// before 1970 reads as 0.
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     helpers4::time::unix_now().map_or(0, |secs| secs as i64)
 }
 
 /// The key that encrypts the rows of `server_secrets`.
-fn server_secret_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
+pub(crate) fn server_secret_key(master: &MasterKey) -> Result<Zeroizing<[u8; 32]>> {
     brigid_crypto::hkdf::derive_user_key(master, b"server-secrets", b"store-fields")
         .map_err(crate::Error::from)
 }
@@ -91,14 +94,14 @@ fn recovery_index(master: &MasterKey, recovery_id: &[u8]) -> Result<String> {
 /// AES-256-GCM encryption with a valid 32-byte key is unconditionally
 /// infallible; `map_err` propagates the (unreachable) error without creating a
 /// dead closure region.
-fn enc(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn enc(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     brigid_crypto::aes::encrypt(key, plaintext)
         .map(|blob| blob.to_bytes())
         .map_err(crate::Error::from)
 }
 
 /// Decrypt a raw blob (nonce+ciphertext) with `key`; returns plaintext bytes.
-fn dec(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn dec(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
     let blob = EncryptedBlob::from_bytes(raw).map_err(|_| Error::InvalidBlob)?;
     let plaintext = brigid_crypto::aes::decrypt(key, &blob)?;
     let bytes: &[u8] = &plaintext;
@@ -387,13 +390,13 @@ pub async fn fetch_credential_labels(
 }
 
 /// `value` as JSON, encrypted under `key`.
-fn enc_json<T: serde::Serialize>(key: &[u8; 32], value: &T) -> Result<Vec<u8>> {
+pub(crate) fn enc_json<T: serde::Serialize>(key: &[u8; 32], value: &T) -> Result<Vec<u8>> {
     let json = Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::InvalidBlob)?);
     enc(key, &json)
 }
 
 /// What [`enc_json`] wrote.
-fn dec_json<T: serde::de::DeserializeOwned>(key: &[u8; 32], raw: &[u8]) -> Result<T> {
+pub(crate) fn dec_json<T: serde::de::DeserializeOwned>(key: &[u8; 32], raw: &[u8]) -> Result<T> {
     let json = Zeroizing::new(dec(key, raw)?);
     serde_json::from_slice(&json).map_err(|_| Error::InvalidBlob)
 }
@@ -583,8 +586,8 @@ pub async fn delete_identity(pool: &SqlitePool, account_id: Uuid, identity_id: U
 /// Owns a connection pool and a master key; enforces zero-trust storage on all
 /// operations.
 pub struct EncryptedStore {
-    pool: SqlitePool,
-    master: MasterKey,
+    pub(crate) pool: SqlitePool,
+    pub(crate) master: MasterKey,
 }
 
 impl EncryptedStore {
@@ -792,17 +795,16 @@ impl EncryptedStore {
     /// username index). The transaction guarantees the two rows either both
     /// commit or both roll back.
     ///
-    /// `identities` (the account's starter identities) are inserted in the
-    /// same transaction; each must belong to `user`.
+    /// `link` is the link that allows this account to exist (a setup link, an
+    /// invitation), when one is needed: it is spent in the same transaction,
+    /// and [`Error::LinkSpent`] creates nothing. A setup link makes the
+    /// account an administrator.
     pub async fn register_user_with_credential(
         &self,
         user: &User,
         cred: &Credential,
-        identities: &[Identity],
+        link: Option<&str>,
     ) -> Result<()> {
-        if identities.iter().any(|i| i.account_id != user.id) {
-            return Err(Error::CredentialUserMismatch);
-        }
         // Defend against a mismatched credential reaching the transaction:
         // the credential's `data` is encrypted under `cred.user_id`'s per-user
         // key, so committing a `Credential` whose `user_id` differs from the
@@ -849,8 +851,22 @@ impl EncryptedStore {
             .execute(&mut *tx)
             .await?;
 
-        for identity in identities {
-            insert_identity(&mut *tx, &self.master, identity).await?;
+        // The link that allowed this account is spent with it, or neither
+        // happens.
+        if let Some(token) = link {
+            match crate::admin::spend_link(&mut tx, token).await? {
+                Some(LinkKind::Setup) => {
+                    sqlx::query("UPDATE users SET admin = 1 WHERE id = ?")
+                        .bind(user.id.to_string())
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                Some(LinkKind::Invitation) => {}
+                // A link that grants the role to an existing account does
+                // not create one; a link that is unknown, expired or used
+                // up creates nothing.
+                Some(LinkKind::Admin) | None => return Err(Error::LinkSpent),
+            }
         }
 
         tx.commit().await?;
@@ -1142,6 +1158,19 @@ impl EncryptedStore {
                 .await?;
         }
 
+        let log_rows = sqlx::query("SELECT id, entry FROM admin_log")
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in log_rows {
+            let id: i64 = row.try_get("id")?;
+            let entry = Zeroizing::new(dec(&old_secrets, &row.try_get::<Vec<u8>, _>("entry")?)?);
+            sqlx::query("UPDATE admin_log SET entry = ? WHERE id = ?")
+                .bind(enc(&new_secrets, &entry)?)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let recovery_rows = sqlx::query(
             "SELECT user_id, recovery_id, verifier FROM account_recovery \
              WHERE recovery_index IS NOT NULL",
@@ -1194,16 +1223,24 @@ impl EncryptedStore {
             .execute(&self.pool)
             .await?;
         sqlx::query(
-            "INSERT INTO sessions (token_hash, account_id, created_at, idle_expires_at, expires_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sessions \
+             (token_hash, account_id, created_at, idle_expires_at, expires_at, confirmed_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(session_hash(&token))
         .bind(account_id.to_string())
         .bind(now)
         .bind(idle_expires_at)
         .bind(expires_at)
+        .bind(now)
         .execute(&self.pool)
         .await?;
+        // A passkey just opened a session: that is the account's last sign-in.
+        sqlx::query("UPDATE users SET last_sign_in_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(account_id.to_string())
+            .execute(&self.pool)
+            .await?;
         Ok(token)
     }
 
@@ -1218,7 +1255,7 @@ impl EncryptedStore {
         let row = sqlx::query(
             "UPDATE sessions SET idle_expires_at = MIN(?1 + ?2, expires_at) \
              WHERE token_hash = ?3 AND idle_expires_at > ?1 AND expires_at > ?1 \
-             RETURNING account_id, created_at, idle_expires_at, expires_at",
+             RETURNING account_id, created_at, idle_expires_at, expires_at, confirmed_at",
         )
         .bind(now)
         .bind(idle.as_secs() as i64)
@@ -1231,7 +1268,21 @@ impl EncryptedStore {
             created_at: row.try_get("created_at")?,
             idle_expires_at: row.try_get("idle_expires_at")?,
             expires_at: row.try_get("expires_at")?,
+            confirmed_at: row
+                .try_get::<Option<i64>, _>("confirmed_at")?
+                .unwrap_or(row.try_get("created_at")?),
         }))
+    }
+
+    /// Record that a passkey ceremony was just done in the session behind
+    /// `token`. Returns whether the session exists.
+    pub async fn confirm_session(&self, token: &str) -> Result<bool> {
+        let done = sqlx::query("UPDATE sessions SET confirmed_at = ? WHERE token_hash = ?")
+            .bind(now_unix())
+            .bind(session_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// End the session behind `token` (sign out). Unknown tokens are ignored.
@@ -1655,16 +1706,19 @@ pub struct SessionInfo {
     pub idle_expires_at: i64,
     /// Unix time the session ends in any case.
     pub expires_at: i64,
+    /// Unix time of the latest passkey ceremony done in this session: the
+    /// one that opened it, or a confirmation since.
+    pub confirmed_at: i64,
 }
 
 /// SHA3-256 of a session token, hex. The token has 256 random bits: a plain
 /// hash is enough, a database dump gives no usable session.
-fn session_hash(token: &str) -> String {
+pub(crate) fn session_hash(token: &str) -> String {
     use sha3::{Digest, Sha3_256};
     helpers4::hex::encode(&Sha3_256::digest(token.as_bytes()))
 }
 
-fn base64_url(bytes: &[u8]) -> String {
+pub(crate) fn base64_url(bytes: &[u8]) -> String {
     use base64ct::{Base64UrlUnpadded, Encoding};
     Base64UrlUnpadded::encode_string(bytes)
 }

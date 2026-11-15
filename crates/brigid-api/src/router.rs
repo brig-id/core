@@ -12,7 +12,7 @@ use axum::{
         HeaderName, HeaderValue, Request,
         header::{ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONTENT_TYPE},
     },
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
@@ -21,7 +21,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 use url::Url;
 
 use crate::{
-    routes::{account, auth, authorize, discovery, health, identities, recovery, token},
+    routes::{account, admin, auth, authorize, discovery, health, identities, recovery, token},
     session,
     state::AppState,
 };
@@ -135,6 +135,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
                 axum::http::Method::GET,
                 axum::http::Method::POST,
                 axum::http::Method::PATCH,
+                axum::http::Method::PUT,
                 axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])
@@ -198,6 +199,33 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/recovery-code",
             get(recovery::status).post(recovery::create_code),
         )
+        // Confirming, in the open session, that the person is there.
+        .route("/auth/confirm/begin", post(account::confirm_begin))
+        .route("/auth/confirm/finish", post(account::confirm_finish))
+        // Administration. Reading needs an administrator; every change also
+        // needs a passkey ceremony a few minutes old at most.
+        .route("/admin/claim", post(admin::claim))
+        .route("/admin/accounts", get(admin::list_accounts))
+        .route("/admin/accounts/{id}", delete(admin::delete_account))
+        .route("/admin/accounts/{id}/suspend", post(admin::suspend))
+        .route("/admin/accounts/{id}/unsuspend", post(admin::unsuspend))
+        .route("/admin/accounts/{id}/administrator", put(admin::set_role))
+        .route(
+            "/admin/applications",
+            get(admin::list_applications).post(admin::register_application),
+        )
+        .route(
+            "/admin/applications/{client_id}",
+            delete(admin::remove_application),
+        )
+        .route(
+            "/admin/applications/{client_id}/attributes",
+            put(admin::set_application_attributes),
+        )
+        .route("/admin/sign-up", get(admin::signup).put(admin::set_signup))
+        .route("/admin/invitations", post(admin::invite))
+        .route("/admin/invitations/{id}", delete(admin::revoke_invitation))
+        .route("/admin/log", get(admin::read_log))
         // Leaving: a passkey ceremony of its own, then nothing is left.
         .route("/account/delete/begin", post(account::delete_begin))
         .route("/account/delete/finish", post(account::delete_finish))

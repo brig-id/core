@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
 };
 use brigid_identity::RootId;
-use brigid_store::User;
+use brigid_store::{LinkKind, SignupPolicy, User};
 use brigid_webauthn::{load_passkeys, passkey_to_credential, update_passkey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -30,6 +30,9 @@ pub struct BeginRegisterRequest {
     /// (ADR-003: it is a hidden sign-in handle).
     #[serde(default)]
     pub username: Option<String>,
+    /// A setup link or an invitation, when the server asks for one.
+    #[serde(default)]
+    pub link: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,15 +86,54 @@ pub struct PasskeySummary {
 /// What the interface needs to know about this server before anyone signs in.
 #[derive(Serialize)]
 pub struct ServerInfo {
-    /// Whether new accounts can be created here.
+    /// Whether anyone can create an account here, without a link.
     pub sign_up: bool,
+    /// Who may create an account: `open`, `invitation` or `closed`.
+    pub policy: SignupPolicy,
 }
 
 /// `GET /auth/server`
-pub async fn server_info(State(state): State<Arc<AppState>>) -> Json<ServerInfo> {
-    Json(ServerInfo {
-        sign_up: state.signup_open,
-    })
+pub async fn server_info(State(state): State<Arc<AppState>>) -> Result<Json<ServerInfo>, ApiError> {
+    let policy = state
+        .store
+        .signup_policy()
+        .await
+        .map_err(|e| internal!(e))?;
+    Ok(Json(ServerInfo {
+        sign_up: policy == SignupPolicy::Open,
+        policy,
+    }))
+}
+
+/// Whether an account may be created now: the server is open, or the
+/// request carries a link that allows it. A setup link works whatever the
+/// policy: it is how a server gets its first administrator. An invitation
+/// does not open a server that is closed.
+async fn may_sign_up(state: &AppState, link: Option<&str>) -> Result<(), ApiError> {
+    let policy = state
+        .store
+        .signup_policy()
+        .await
+        .map_err(|e| internal!(e))?;
+    let Some(link) = link else {
+        return match policy {
+            SignupPolicy::Open => Ok(()),
+            SignupPolicy::Invitation => Err(ApiError::InvitationRequired),
+            SignupPolicy::Closed => Err(ApiError::SignupClosed),
+        };
+    };
+    match state
+        .store
+        .link_kind(link)
+        .await
+        .map_err(|e| internal!(e))?
+    {
+        Some(LinkKind::Setup) => Ok(()),
+        Some(LinkKind::Invitation) if policy != SignupPolicy::Closed => Ok(()),
+        Some(LinkKind::Invitation) => Err(ApiError::SignupClosed),
+        // A link that grants the role to an account creates none.
+        Some(LinkKind::Admin) | None => Err(ApiError::LinkInvalid),
+    }
 }
 
 /// `POST /auth/register/begin`
@@ -99,9 +141,7 @@ pub async fn register_begin(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BeginRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !state.signup_open {
-        return Err(ApiError::SignupClosed);
-    }
+    may_sign_up(&state, body.link.as_deref()).await?;
     let host = state.host()?.to_string();
     let root_id = match body.username.as_deref() {
         Some(handle) => {
@@ -151,6 +191,7 @@ pub async fn register_begin(
             session_id,
             PendingRegistration {
                 purpose: RegistrationPurpose::Signup,
+                link: body.link.clone(),
                 user_id,
                 username: root_id.username.clone(),
                 server: root_id.server.clone(),
@@ -209,17 +250,28 @@ pub async fn register_finish(
     // neither.
     let cred = passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
     // No identity is created here: the onboarding proposes some, and the
-    // browser creates the ones the person keeps.
+    // browser creates the ones the person keeps. The link that allowed the
+    // sign-up is spent with it: used up in the meantime, nothing is created.
     state
         .store
-        .register_user_with_credential(&user, &cred, &[])
+        .register_user_with_credential(&user, &cred, pending.link.as_deref())
         .await
         .map_err(|e| match e {
             brigid_store::Error::Duplicate => {
                 ApiError::Conflict(format!("user {} already exists", user.username))
             }
+            brigid_store::Error::LinkSpent => ApiError::LinkInvalid,
             other => internal!(other),
         })?;
+    if state
+        .store
+        .account_standing(user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .is_some_and(|standing| standing.admin)
+    {
+        crate::routes::admin::log(&state, "setup.redeemed", None, Some(user_id), None).await;
+    }
     apply_label(&state, user_id, cred.id, body.label.as_deref()).await?;
 
     // The new account is signed in by the same ceremony (ADR-003): a
@@ -285,6 +337,7 @@ pub async fn add_credential_begin(
             session_id,
             PendingRegistration {
                 purpose: RegistrationPurpose::AddPasskey,
+                link: None,
                 user_id: user.id,
                 username: user.username,
                 server: user.server,
@@ -477,12 +530,28 @@ pub async fn login_finish(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::NotFound)?;
+    // The passkey is the right one, and the account is suspended: said
+    // plainly, to the person who just proved it is theirs.
+    refuse_suspended(&state, user_id).await?;
 
     // A session, never a token: brig·id's API takes no ID token as a
     // credential, and a relying party gets one only through its own flow
     // (ADR-005).
     let cookie = open_session(&state, &user).await?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
+}
+
+/// `403` when `account_id` is suspended.
+pub(crate) async fn refuse_suspended(state: &AppState, account_id: Uuid) -> Result<(), ApiError> {
+    let standing = state
+        .store
+        .account_standing(account_id)
+        .await
+        .map_err(|e| internal!(e))?;
+    if standing.is_some_and(|s| s.suspended) {
+        return Err(ApiError::Suspended);
+    }
+    Ok(())
 }
 
 /// Finishes an authentication ceremony begun for `purpose` and returns the
@@ -648,6 +717,11 @@ pub struct SessionResponse {
     /// Whether the account has a recovery code. Without one it is still in
     /// its onboarding: identities and applications are closed to it.
     pub recovery_code: bool,
+    /// Whether the account is an administrator of this server.
+    pub admin: bool,
+    /// Unix time of the latest passkey ceremony done in this session. An
+    /// administrative change needs one a few minutes old at most.
+    pub confirmed_at: i64,
 }
 
 /// `GET /auth/session`: is the session still good? `200` with its deadlines,
@@ -662,6 +736,8 @@ pub async fn session(
             idle_expires_at: session.idle_expires_at,
             expires_at: session.expires_at,
             recovery_code: Onboarded::check(&state, &session).await?,
+            admin: session.admin,
+            confirmed_at: session.confirmed_at,
         }),
     ))
 }

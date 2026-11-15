@@ -131,6 +131,9 @@ pub async fn begin(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::Unauthorized)?;
+    // The code is the right one, and the account is suspended: no new
+    // passkey, and the code is not spent.
+    crate::routes::auth::refuse_suspended(&state, user.id).await?;
     let existing = load_passkeys(&state.store, user.id)
         .await
         .map_err(|e| internal!(e))?;
@@ -156,6 +159,7 @@ pub async fn begin(
                 purpose: RegistrationPurpose::Recovery {
                     recovery_id: code.recovery_id,
                 },
+                link: None,
                 user_id: user.id,
                 username: user.username,
                 server: user.server,
@@ -215,7 +219,9 @@ pub async fn finish(
         .await
         .map_err(|e| internal!(e))?
         .ok_or(ApiError::Unauthorized)?;
-    tracing::info!(user_id = %user.id, "account recovered with a recovery code");
+    // No identifier in the operator's log: the use of the code is recorded
+    // on the account itself, for its owner.
+    tracing::info!("an account was recovered with its recovery code");
     let cookie = open_session(&state, &user).await?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
