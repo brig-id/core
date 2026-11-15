@@ -8,5 +8,6 @@ pub mod state;
 pub mod routes;
 
 pub use router::build_router;
+pub use routes::admin::{administrator_link, setup_link};
 pub use session::AccountSession;
 pub use state::AppState;

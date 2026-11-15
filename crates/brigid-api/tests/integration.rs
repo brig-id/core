@@ -64,7 +64,8 @@ fn master() -> MasterKey {
     MasterKey::from_hex(&"ab".repeat(32)).unwrap()
 }
 
-async fn make_state() -> Arc<AppState> {
+/// A server as it starts: nobody opened sign-up, nobody administers it.
+async fn fresh_app_state() -> AppState {
     let master = master();
     let vsid_salt = [0x5a; 32];
     let store = EncryptedStore::new("sqlite::memory:", master)
@@ -79,6 +80,18 @@ async fn make_state() -> Arc<AppState> {
     // Integration tests use `x-forwarded-for` to give each test its own
     // rate-limit bucket (oneshot requests carry no real peer address).
     state.trust_forwarded_for = true;
+    state
+}
+
+/// A server where anyone can create an account: what most tests need.
+/// Who may sign up is tested on its own, from [`fresh_app_state`].
+async fn make_state() -> Arc<AppState> {
+    let state = fresh_app_state().await;
+    state
+        .store
+        .set_signup_policy(brigid_store::SignupPolicy::Open)
+        .await
+        .unwrap();
     Arc::new(state)
 }
 
@@ -3465,65 +3478,6 @@ async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
 // Sign-up can be closed; user verification is required
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn a_server_with_sign_up_closed_creates_no_account() {
-    let master = master();
-    let vsid_salt = [0x5a; 32];
-    let store = EncryptedStore::new("sqlite::memory:", master)
-        .await
-        .unwrap();
-    let origin = Url::parse("http://localhost:8080").unwrap();
-    let webauthn = WebauthnService::new("localhost", &origin).unwrap();
-    let mut state = AppState::new(
-        store,
-        webauthn,
-        OidcSigningKey::generate(),
-        origin,
-        vsid_salt,
-    )
-    .with_signup_open(false);
-    state.trust_forwarded_for = true;
-    let app = build_router(Arc::new(state), &[]);
-
-    let (status, j) = identity_request(&app, "GET", "/auth/server", None, "10.70.1.1", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(j["sign_up"], false);
-
-    for body in [
-        serde_json::json!({}),
-        serde_json::json!({ "username": "closed@localhost" }),
-    ] {
-        let (status, j) = identity_request(
-            &app,
-            "POST",
-            "/auth/register/begin",
-            None,
-            "10.70.1.2",
-            Some(body),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(j["error"], "sign-up is closed on this server");
-    }
-
-    // Signing in is still offered.
-    let (status, _) = identity_request(
-        &app,
-        "POST",
-        "/auth/login/begin",
-        None,
-        "10.70.1.3",
-        Some(serde_json::json!({})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // An open server says so.
-    let app = build_router(make_state().await, &[]);
-    let (_, j) = identity_request(&app, "GET", "/auth/server", None, "10.70.1.4", None).await;
-    assert_eq!(j["sign_up"], true);
-}
-
 /// A registration response built by hand, as an authenticator that holds a
 /// P-256 key would send it with attestation "none" (which carries no
 /// signature). `flags` is the byte of the authenticator data that says whether
@@ -4559,4 +4513,1047 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
     let (status, _) =
         identity_request(&app, "GET", "/auth/session", Some(&bob), &xff.next(), None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Administration: /admin, the links, who may sign up
+// ---------------------------------------------------------------------------
+
+type Key = webauthn_authenticator_rs::WebauthnAuthenticator<
+    webauthn_authenticator_rs::softpasskey::SoftPasskey,
+>;
+
+fn new_key() -> Key {
+    webauthn_authenticator_rs::WebauthnAuthenticator::new(
+        webauthn_authenticator_rs::softpasskey::SoftPasskey::new(true),
+    )
+}
+
+/// Creates an account, with the link a server may ask for. The session
+/// cookie, or the refusal.
+async fn sign_up_with(
+    app: &axum::Router,
+    username: &str,
+    link: Option<&str>,
+    key: &mut Key,
+    xff: &Addresses,
+) -> Result<String, (StatusCode, serde_json::Value)> {
+    let mut body = serde_json::json!({ "username": username });
+    if let Some(link) = link {
+        body["link"] = serde_json::json!(link);
+    }
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/auth/register/begin",
+        None,
+        &xff.next(),
+        Some(body),
+    )
+    .await;
+    if status != StatusCode::OK {
+        return Err((status, j));
+    }
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = key
+        .do_registration(
+            url::Url::parse(ORIGIN).unwrap(),
+            for_soft_passkey(challenge),
+        )
+        .unwrap();
+    let (status, cookie, j) = request_with_cookie(
+        app,
+        "POST",
+        "/auth/register/finish",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+    )
+    .await;
+    if status != StatusCode::NO_CONTENT {
+        return Err((status, j));
+    }
+    Ok(cookie.expect("signed in at sign-up"))
+}
+
+/// The account's recovery code, without which it is still in its onboarding.
+async fn take_recovery_code(app: &axum::Router, cookie: &str, xff: &Addresses) -> String {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/account/recovery-code",
+        Some(cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    j["code"].as_str().unwrap().to_owned()
+}
+
+/// A server with its first administrator, made as an operator makes one:
+/// with the setup link. Sign-up is left as a server starts: by invitation.
+async fn administered(state: AppState) -> (Arc<AppState>, axum::Router, String, Key) {
+    let state = Arc::new(state);
+    let app = build_router(Arc::clone(&state), &[]);
+    let xff = Addresses::new("10.89");
+    let link = brigid_api::setup_link(&state.store)
+        .await
+        .unwrap()
+        .expect("a server without account has a setup link");
+    let mut key = new_key();
+    let cookie = sign_up_with(&app, "admin@localhost", Some(&link), &mut key, &xff)
+        .await
+        .unwrap();
+    take_recovery_code(&app, &cookie, &xff).await;
+    (state, app, cookie, key)
+}
+
+/// core#88: a fresh database refuses sign-up until the setup link is used.
+#[tokio::test]
+async fn a_fresh_server_takes_no_account_until_its_setup_link_is_used() {
+    let state = Arc::new(fresh_app_state().await);
+    let app = build_router(Arc::clone(&state), &[]);
+    let xff = Addresses::new("10.90");
+
+    // Nobody opened it: by invitation, and there is nobody to invite.
+    let (_, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
+    assert_eq!(j["sign_up"], false);
+    assert_eq!(j["policy"], "invitation");
+    let refused = sign_up_with(&app, "early@localhost", None, &mut new_key(), &xff)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.0, StatusCode::FORBIDDEN);
+    assert_eq!(refused.1["code"], "invitation_required");
+    let refused = sign_up_with(&app, "early@localhost", Some("guess"), &mut new_key(), &xff)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.1["code"], "link_invalid");
+    assert_eq!(state.store.count_accounts().await.unwrap(), 0);
+    // Signing in is still offered.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The operator reads the setup link on the machine. A restart renews
+    // it: the earlier one opens nothing.
+    let stale = brigid_api::setup_link(&state.store).await.unwrap().unwrap();
+    let link = brigid_api::setup_link(&state.store).await.unwrap().unwrap();
+    assert_ne!(stale, link);
+    let refused = sign_up_with(&app, "first@localhost", Some(&stale), &mut new_key(), &xff)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.1["code"], "link_invalid");
+
+    // Used, it makes the first account, and that account administers.
+    let cookie = sign_up_with(&app, "first@localhost", Some(&link), &mut new_key(), &xff)
+        .await
+        .unwrap();
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j["admin"], true);
+    assert_eq!(state.store.count_administrators().await.unwrap(), 1);
+
+    // Once. And a server that has an account hands out no setup link.
+    let refused = sign_up_with(&app, "second@localhost", Some(&link), &mut new_key(), &xff)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.1["code"], "link_invalid");
+    assert_eq!(brigid_api::setup_link(&state.store).await.unwrap(), None);
+    assert_eq!(state.store.count_accounts().await.unwrap(), 1);
+    // It is in the log, with no name in it.
+    let log = state.store.admin_log(10).await.unwrap();
+    assert_eq!(log[0].action.action, "setup.redeemed");
+    assert!(log[0].action.account.is_some());
+}
+
+/// Every endpoint of the administration, as (method, address, body).
+fn administration(
+    account: Uuid,
+    application: &str,
+) -> Vec<(&'static str, String, Option<serde_json::Value>)> {
+    vec![
+        ("GET", "/admin/accounts".into(), None),
+        ("POST", format!("/admin/accounts/{account}/suspend"), None),
+        ("POST", format!("/admin/accounts/{account}/unsuspend"), None),
+        (
+            "PUT",
+            format!("/admin/accounts/{account}/administrator"),
+            Some(serde_json::json!({ "admin": true })),
+        ),
+        ("DELETE", format!("/admin/accounts/{account}"), None),
+        ("GET", "/admin/applications".into(), None),
+        (
+            "POST",
+            "/admin/applications".into(),
+            Some(serde_json::json!({ "name": "Shop", "redirect_uris": [REDIRECT] })),
+        ),
+        (
+            "PUT",
+            format!("/admin/applications/{application}/attributes"),
+            Some(serde_json::json!({ "email": "required" })),
+        ),
+        ("DELETE", format!("/admin/applications/{application}"), None),
+        ("GET", "/admin/sign-up".into(), None),
+        (
+            "PUT",
+            "/admin/sign-up".into(),
+            Some(serde_json::json!({ "policy": "open" })),
+        ),
+        (
+            "POST",
+            "/admin/invitations".into(),
+            Some(serde_json::json!({ "uses": 3 })),
+        ),
+        (
+            "DELETE",
+            format!("/admin/invitations/{}", Uuid::new_v4()),
+            None,
+        ),
+        ("GET", "/admin/log".into(), None),
+    ]
+}
+
+/// core#88: a non-administrator session gets 403 on every administration
+/// endpoint; nobody gets anything without a session.
+#[tokio::test]
+async fn only_an_administrator_reaches_the_administration() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let xff = Addresses::new("10.91");
+    let (person, person_id, _) = signed_in_account(&app, "person@localhost", "10.91.200").await;
+    let (victim, victim_id, _) = signed_in_account(&app, "victim@localhost", "10.91.201").await;
+    let (shop, _) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+
+    for (method, uri, body) in administration(victim_id, &shop.client_id) {
+        let (status, j) =
+            identity_request(&app, method, &uri, Some(&person), &xff.next(), body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {j}");
+        assert_eq!(j["error"], "forbidden", "{method} {uri}");
+        let (status, _) = identity_request(&app, method, &uri, None, &xff.next(), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+    // Nothing happened: the other account is as it was, the application is
+    // there, sign-up is as it was, the log is empty.
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&victim),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let standing = state
+        .store
+        .account_standing(victim_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!standing.admin && !standing.suspended);
+    assert!(
+        state
+            .store
+            .fetch_client(&shop.client_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        state.store.signup_policy().await.unwrap(),
+        brigid_store::SignupPolicy::Open
+    );
+    assert!(state.store.admin_log(10).await.unwrap().is_empty());
+    // A link that is not an administrator link grants nothing.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/admin/claim",
+        Some(&person),
+        &xff.next(),
+        Some(serde_json::json!({ "link": "guess" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(j["code"], "link_invalid");
+    assert!(
+        !state
+            .store
+            .account_standing(person_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .admin
+    );
+}
+
+/// core#88: no administration response contains identity data.
+#[tokio::test]
+async fn no_administration_response_holds_anything_of_an_identity() {
+    use brigid_identity::{Attribute, Need};
+    let (state, app, admin, _) = administered(fresh_app_state().await).await;
+    let xff = Addresses::new("10.92");
+    state
+        .store
+        .set_signup_policy(brigid_store::SignupPolicy::Open)
+        .await
+        .unwrap();
+
+    // A person with a life: identities with labels and attributes, and an
+    // application one of them signed in to and shared an address with.
+    let mut key = new_key();
+    let person = sign_up_with(&app, "private@localhost", None, &mut key, &xff)
+        .await
+        .unwrap();
+    take_recovery_code(&app, &person, &xff).await;
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&person),
+        &xff.next(),
+        Some(serde_json::json!({
+            "name": "Zanzibar Nightshift",
+            "logo": "icon:ph:rocket-launch",
+            "description": "Quetzalcoatl only my friends know",
+            "attributes": {
+                "given_name": "Hypatia",
+                "family_name": "Alexandrina",
+                "email": "hypatia@private.example",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
+    let shop = client_asking(&state, "Shop", &[(Attribute::Email, Need::Required)]).await;
+    let request = begin_authorization(&app, &shop, "&scope=openid+email", &xff.next()).await;
+    let (status, j) = answer(&app, &request, &person, identity, &["email"], &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let vsid = brigid_identity::identity_vsid(identity, &shop, &state.vsid_salt);
+    let person_id = state
+        .store
+        .list_accounts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| !a.admin)
+        .unwrap()
+        .id;
+
+    // Everything the administration answers, readings and changes alike
+    // (the session is a moment old: changes are accepted).
+    let mut said = String::new();
+    for (method, uri, body) in administration(person_id, &shop) {
+        // Keep the account and the application for the readings that follow.
+        if method == "DELETE" && !uri.contains("/invitations/") {
+            continue;
+        }
+        let (status, j) =
+            identity_request(&app, method, &uri, Some(&admin), &xff.next(), body).await;
+        assert!(
+            status.is_success() || status == StatusCode::NOT_FOUND,
+            "{method} {uri}: {status} {j}"
+        );
+        said.push_str(&j.to_string());
+    }
+    for (method, uri) in [("GET", "/admin/accounts"), ("GET", "/admin/log")] {
+        let (_, j) = identity_request(&app, method, uri, Some(&admin), &xff.next(), None).await;
+        said.push_str(&j.to_string());
+    }
+    // The account is there, by its generated handle.
+    assert!(said.contains("private"), "{said}");
+    let said = said.to_lowercase();
+    for theirs in [
+        "zanzibar",
+        "nightshift",
+        "quetzalcoatl",
+        "rocket",
+        "hypatia",
+        "alexandrina",
+        "private.example",
+        &identity.to_string(),
+        &vsid.as_str().to_lowercase(),
+        "identit",
+    ] {
+        assert!(
+            !said.contains(theirs),
+            "{theirs} is in an answer of the administration"
+        );
+    }
+    // And there is no way from the administration to an account's content:
+    // the account's own endpoints answer for the session's account only.
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/account/identities",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j, serde_json::json!([]), "the administrator's own, empty");
+}
+
+#[tokio::test]
+async fn an_administrative_change_needs_a_passkey_ceremony_done_a_moment_ago() {
+    // A server where no ceremony is ever recent enough.
+    let (state, app, admin, mut key) = administered(
+        fresh_app_state()
+            .await
+            .with_confirmation_ttl(std::time::Duration::ZERO),
+    )
+    .await;
+    let xff = Addresses::new("10.93");
+    let (shop, _) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    let other = Uuid::new_v4();
+
+    for (method, uri, body) in administration(other, &shop.client_id) {
+        let (status, j) =
+            identity_request(&app, method, &uri, Some(&admin), &xff.next(), body).await;
+        if method == "GET" {
+            // Reading asks for the role only.
+            assert_eq!(status, StatusCode::OK, "{method} {uri}: {j}");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {j}");
+            assert_eq!(j["code"], "confirmation_required", "{method} {uri}");
+        }
+    }
+    assert!(
+        state
+            .store
+            .fetch_client(&shop.client_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The ceremony: for the session's account, with its passkey. The
+    // session then says when it was done.
+    let (_, before) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/confirm/begin",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let challenge: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = key
+        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
+        .unwrap();
+    let answer_body =
+        serde_json::json!({ "session_id": j["session_id"], "credential": credential });
+    // It is not a sign-in, and a sign-in is not a confirmation.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/finish",
+        None,
+        &xff.next(),
+        Some(answer_body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/confirm/finish",
+        Some(&admin),
+        &xff.next(),
+        Some(answer_body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Once.
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/confirm/finish",
+        Some(&admin),
+        &xff.next(),
+        Some(answer_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, after) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert!(after["confirmed_at"].as_i64() >= before["confirmed_at"].as_i64());
+    assert_eq!(
+        after["expires_at"], before["expires_at"],
+        "the session is not extended"
+    );
+    // Not without a session.
+    let (status, _) =
+        identity_request(&app, "POST", "/auth/confirm/begin", None, &xff.next(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_suspended_account_is_closed_and_keeps_everything() {
+    use brigid_identity::{Attribute, Need};
+    let (state, app, admin, _) = administered(fresh_app_state().await).await;
+    let xff = Addresses::new("10.94");
+    state
+        .store
+        .set_signup_policy(brigid_store::SignupPolicy::Open)
+        .await
+        .unwrap();
+    let mut key = new_key();
+    let person = sign_up_with(&app, "paused@localhost", None, &mut key, &xff)
+        .await
+        .unwrap();
+    let code = take_recovery_code(&app, &person, &xff).await;
+    let (_, j) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&person),
+        &xff.next(),
+        Some(serde_json::json!({ "template": "personal" })),
+    )
+    .await;
+    let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
+    let (_, accounts) = identity_request(
+        &app,
+        "GET",
+        "/admin/accounts",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    let listed = accounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["own"] == false)
+        .unwrap()
+        .clone();
+    assert_eq!(listed["username"], "paused");
+    assert_eq!(listed["passkeys"], 1);
+    assert_eq!(listed["recovery_code"], true);
+    assert!(listed["last_sign_in_at"].as_i64().is_some());
+    let person_id = listed["id"].as_str().unwrap().to_owned();
+    let admin_id = accounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["own"] == true)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A code issued to an application just before the suspension.
+    let shop = client_asking(&state, "Shop", &[(Attribute::Email, Need::Optional)]).await;
+    let request = begin_authorization(&app, &shop, "", &xff.next()).await;
+    let (_, j) = answer(&app, &request, &person, identity, &[], &xff.next()).await;
+    let pending = query_of(j["redirect_to"].as_str().unwrap())["code"].clone();
+
+    let act = async |method: &str, uri: String, body: Option<serde_json::Value>| {
+        identity_request(&app, method, &uri, Some(&admin), &xff.next(), body).await
+    };
+    let (status, _) = act("POST", format!("/admin/accounts/{person_id}/suspend"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Its session is over, whatever cookie it holds.
+    let (status, _) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&person),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Its passkey is right, and the person is told why it opens nothing.
+    let (_, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "username": "paused@localhost" })),
+    )
+    .await;
+    let challenge: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = key
+        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
+        .unwrap();
+    let (status, cookie, j) = request_with_cookie(
+        &app,
+        "POST",
+        "/auth/login/finish",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(j["code"], "suspended");
+    assert!(cookie.is_none(), "no session is opened");
+    // Its recovery code adds no passkey, and is not spent.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(j["code"], "suspended");
+    // The application gets nothing for the code it was given.
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", shop.as_str()),
+        ("code", pending.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) = token_request(&app, &form, None, &xff.next()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(j["error"], "invalid_grant");
+
+    // Nothing was deleted, and the suspension is lifted by an administrator.
+    let account = Uuid::parse_str(&person_id).unwrap();
+    assert_eq!(
+        state.store.fetch_identities(account).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        state.store.fetch_credentials(account).await.unwrap().len(),
+        1
+    );
+    let (status, _) = act(
+        "POST",
+        format!("/admin/accounts/{person_id}/unsuspend"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the code was not spent");
+
+    // An administrator does not suspend or delete their own account from
+    // here, and the last one keeps the role.
+    for (method, uri) in [
+        ("POST", format!("/admin/accounts/{admin_id}/suspend")),
+        ("DELETE", format!("/admin/accounts/{admin_id}")),
+    ] {
+        let (status, _) = act(method, uri, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+    let (status, _) = act(
+        "PUT",
+        format!("/admin/accounts/{admin_id}/administrator"),
+        Some(serde_json::json!({ "admin": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(state.store.count_administrators().await.unwrap(), 1);
+    // With a second administrator, the first may give the role up.
+    let (status, _) = act(
+        "PUT",
+        format!("/admin/accounts/{person_id}/administrator"),
+        Some(serde_json::json!({ "admin": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = act(
+        "PUT",
+        format!("/admin/accounts/{admin_id}/administrator"),
+        Some(serde_json::json!({ "admin": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // It no longer administers anything.
+    let (status, _) = act("GET", "/admin/accounts".to_owned(), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // An unknown account is not found.
+    let (_, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "username": "paused@localhost" })),
+    )
+    .await;
+    let challenge: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = key
+        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
+        .unwrap();
+    let (status, new_admin, _) = request_with_cookie(
+        &app,
+        "POST",
+        "/auth/login/finish",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = identity_request(
+        &app,
+        "POST",
+        &format!("/admin/accounts/{}/suspend", Uuid::new_v4()),
+        new_admin.as_deref(),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
+    let (state, app, admin, _) = administered(fresh_app_state().await).await;
+    let xff = Addresses::new("10.95");
+    let act = async |method: &str, uri: &str, body: Option<serde_json::Value>| {
+        identity_request(&app, method, uri, Some(&admin), &xff.next(), body).await
+    };
+
+    // By invitation, as a server starts.
+    let (_, j) = act("GET", "/admin/sign-up", None).await;
+    assert_eq!(
+        j,
+        serde_json::json!({ "policy": "invitation", "invitations": [] })
+    );
+    for bad in [
+        serde_json::json!({ "uses": 0 }),
+        serde_json::json!({ "uses": 101 }),
+        serde_json::json!({ "uses": 1, "days": 0 }),
+        serde_json::json!({ "uses": 1, "days": 91 }),
+    ] {
+        let (status, _) = act("POST", "/admin/invitations", Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, j) = act(
+        "POST",
+        "/admin/invitations",
+        Some(serde_json::json!({ "uses": 2 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    let link = j["link"].as_str().unwrap().to_owned();
+    assert_eq!(j["uses_left"], 2);
+    assert_eq!(
+        j["expires_at"].as_i64().unwrap() - j["created_at"].as_i64().unwrap(),
+        7 * 24 * 3600
+    );
+    // The list shows it, never the link.
+    let (_, j) = act("GET", "/admin/sign-up", None).await;
+    assert_eq!(j["invitations"].as_array().unwrap().len(), 1);
+    assert!(!j.to_string().contains(&link));
+
+    // Two accounts, ordinary ones; not a third.
+    for name in ["guest-one@localhost", "guest-two@localhost"] {
+        let cookie = sign_up_with(&app, name, Some(&link), &mut new_key(), &xff)
+            .await
+            .unwrap();
+        let (_, j) = identity_request(
+            &app,
+            "GET",
+            "/auth/session",
+            Some(&cookie),
+            &xff.next(),
+            None,
+        )
+        .await;
+        assert_eq!(j["admin"], false);
+    }
+    let refused = sign_up_with(
+        &app,
+        "guest-three@localhost",
+        Some(&link),
+        &mut new_key(),
+        &xff,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.1["code"], "link_invalid");
+    let (_, j) = act("GET", "/admin/sign-up", None).await;
+    assert_eq!(
+        j["invitations"],
+        serde_json::json!([]),
+        "used up, it is gone"
+    );
+
+    // Revoked, an invitation opens nothing.
+    let (_, j) = act("POST", "/admin/invitations", Some(serde_json::json!({}))).await;
+    let (revoked, id) = (j["link"].as_str().unwrap().to_owned(), j["id"].clone());
+    let uri = format!("/admin/invitations/{}", id.as_str().unwrap());
+    let (status, _) = act("DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = act("DELETE", &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let refused = sign_up_with(&app, "late@localhost", Some(&revoked), &mut new_key(), &xff)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.1["code"], "link_invalid");
+
+    // Closed, the server takes nobody, invited or not; open, it takes anyone.
+    let (_, j) = act("POST", "/admin/invitations", Some(serde_json::json!({}))).await;
+    let invitation = j["link"].as_str().unwrap().to_owned();
+    let (status, _) = act(
+        "PUT",
+        "/admin/sign-up",
+        Some(serde_json::json!({ "policy": "closed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for link in [None, Some(invitation.as_str())] {
+        let refused = sign_up_with(&app, "nobody@localhost", link, &mut new_key(), &xff)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.1["code"], "signup_closed", "{link:?}");
+    }
+    let (status, _) = act(
+        "PUT",
+        "/admin/sign-up",
+        Some(serde_json::json!({ "policy": "open" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
+    assert_eq!(j["sign_up"], true);
+    sign_up_with(&app, "anyone@localhost", None, &mut new_key(), &xff)
+        .await
+        .unwrap();
+    let (status, _) = act(
+        "PUT",
+        "/admin/sign-up",
+        Some(serde_json::json!({ "policy": "whenever" })),
+    )
+    .await;
+    assert!(status.is_client_error());
+    assert_eq!(state.store.count_accounts().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_nobody_who_left() {
+    // A server that has accounts and no administrator: as one upgraded from
+    // a version without administration.
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let xff = Addresses::new("10.96");
+    let owner = sign_up_with(&app, "owner@localhost", None, &mut new_key(), &xff)
+        .await
+        .unwrap();
+    let guest = sign_up_with(&app, "guest@localhost", None, &mut new_key(), &xff)
+        .await
+        .unwrap();
+    assert_eq!(brigid_api::setup_link(&state.store).await.unwrap(), None);
+    let link = brigid_api::administrator_link(&state.store).await.unwrap();
+
+    // The account that claims the role has finished its onboarding.
+    let claim = async |cookie: &str| {
+        identity_request(
+            &app,
+            "POST",
+            "/admin/claim",
+            Some(cookie),
+            &xff.next(),
+            Some(serde_json::json!({ "link": link })),
+        )
+        .await
+    };
+    let (status, j) = claim(&owner).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(j["code"], "recovery_code_required");
+    take_recovery_code(&app, &owner, &xff).await;
+    take_recovery_code(&app, &guest, &xff).await;
+    let (status, _) = claim(&owner).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/auth/session",
+        Some(&owner),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j["admin"], true);
+    // Once.
+    let (status, j) = claim(&guest).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(j["code"], "link_invalid");
+
+    // The administrator registers an application, with what it may ask;
+    // its secret is shown once.
+    let act = async |method: &str, uri: String, body: Option<serde_json::Value>| {
+        identity_request(&app, method, &uri, Some(&owner), &xff.next(), body).await
+    };
+    let (status, j) = act(
+        "POST",
+        "/admin/applications".into(),
+        Some(serde_json::json!({
+            "name": "Shop",
+            "redirect_uris": [REDIRECT],
+            "attributes": { "email": "required", "given_name": "optional" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{j}");
+    let (client_id, secret) = (
+        j["client_id"].as_str().unwrap().to_owned(),
+        j["client_secret"].as_str().unwrap().to_owned(),
+    );
+    assert_eq!(j["attributes"]["email"], "required");
+    let (_, listed) = act("GET", "/admin/applications".into(), None).await;
+    assert_eq!(listed[0]["name"], "Shop");
+    assert!(!listed.to_string().contains(&secret), "never shown again");
+    let (status, j) = act(
+        "POST",
+        "/admin/applications".into(),
+        Some(serde_json::json!({ "name": "Bad", "redirect_uris": ["http://shop.example/cb"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+    // An application registered here signs a person in.
+    let (_, j) = identity_request(
+        &app,
+        "POST",
+        "/account/identities",
+        Some(&guest),
+        &xff.next(),
+        Some(serde_json::json!({ "template": "personal" })),
+    )
+    .await;
+    let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
+    let request = begin_authorization(&app, &client_id, "", &xff.next()).await;
+    let (_, j) = answer(&app, &request, &guest, identity, &[], &xff.next()).await;
+    let code = query_of(j["redirect_to"].as_str().unwrap())["code"].clone();
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) = token_request(&app, &form, Some((&client_id, &secret)), &xff.next()).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, _) = act(
+        "PUT",
+        format!("/admin/applications/{client_id}/attributes"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = act(
+        "PUT",
+        "/admin/applications/no-such-application/attributes".into(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The guest is suspended, then deleted.
+    let (_, accounts) = act("GET", "/admin/accounts".into(), None).await;
+    let guest_id = accounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["username"] == "guest")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _) = act("POST", format!("/admin/accounts/{guest_id}/suspend"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, log) = act("GET", "/admin/log".into(), None).await;
+    let entry = |log: &serde_json::Value, action: &str| {
+        log.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == action)
+            .unwrap_or_else(|| panic!("no {action} in {log}"))
+            .clone()
+    };
+    // While the account exists, the log can name it.
+    let suspended = entry(&log, "account.suspend");
+    assert_eq!(suspended["by"], "administrator");
+    assert_eq!(suspended["by_username"], "owner");
+    assert_eq!(suspended["account_username"], "guest");
+    let (status, _) = act("DELETE", format!("/admin/accounts/{guest_id}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = act("DELETE", format!("/admin/accounts/{guest_id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Deleted, it is named nowhere: the log knows an account was concerned,
+    // and no longer which.
+    let (_, log) = act("GET", "/admin/log".into(), None).await;
+    assert!(!log.to_string().contains("guest"), "{log}");
+    assert!(!log.to_string().contains(&guest_id), "{log}");
+    for action in ["account.suspend", "account.delete"] {
+        let e = entry(&log, action);
+        assert_eq!(e["about_account"], true, "{action}");
+        assert_eq!(e["account_username"], serde_json::Value::Null, "{action}");
+    }
+    // What was done on the machine is said to be so; applications are named.
+    assert_eq!(entry(&log, "administrator.link")["by"], "machine");
+    assert_eq!(
+        entry(&log, "administrator.claimed")["account_username"],
+        "owner"
+    );
+    assert_eq!(entry(&log, "application.register")["detail"], "Shop");
+    // The newest first.
+    assert_eq!(log[0]["action"], "account.delete");
 }

@@ -51,6 +51,16 @@ pub enum Error {
     #[error("row not found")]
     NotFound,
 
+    /// A link (setup, administrator, invitation) is unknown, expired, used
+    /// up, or not of the kind the operation takes.
+    #[error("this link is not valid (any more)")]
+    LinkSpent,
+
+    /// The change would leave the server without an administrator who can
+    /// sign in.
+    #[error("the last administrator cannot be removed")]
+    LastAdministrator,
+
     /// A `Credential` was handed to an atomic-registration entry point with
     /// a `user_id` that does not match the `User` being created. Returned
     /// by [`EncryptedStore::register_user_with_credential`](crate::EncryptedStore::register_user_with_credential)

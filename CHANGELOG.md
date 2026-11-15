@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Who may sign up is a policy kept in the database** (core#88): `open`,
+  `invitation` (the default) or `closed`. `AppState::with_signup_open` and
+  the `signup_open` field are gone; `EncryptedStore::set_signup_policy` sets
+  it, and so does an administrator. `GET /auth/server` returns `policy` next
+  to `sign_up`. A server that nobody opened takes accounts by link only.
+- `POST /auth/register/begin` takes a `link` (a setup link or an invitation);
+  `EncryptedStore::register_user_with_credential` takes it in place of the
+  identities it no longer creates, and spends it with the account.
+- Refusals the interface acts on carry a `code` next to their sentence
+  (`confirmation_required`, `suspended`, `invitation_required`,
+  `link_invalid`, `signup_closed`, `recovery_code_required`).
+- The operator's log no longer carries an account identifier when a recovery
+  code is used.
+
+### Added
+
+- **Administration** (core#88). The role is on the account
+  (`users.admin`). The first administrator is made with a one-time setup link
+  on a server without account (`brigid_api::setup_link`), or, on a server that
+  has accounts, with a link that grants the role to the signed-in account that
+  opens it (`brigid_api::administrator_link`, `POST /admin/claim`). `/admin/…`
+  lists accounts (generated username, dates, passkey count, recovery code
+  present), suspends, deletes, grants and withdraws the role, registers
+  applications, sets the sign-up policy and makes invitations. Reading needs
+  an administrator; every change also needs a passkey ceremony done in the
+  session at most five minutes ago (`/auth/confirm/begin|finish`), and is
+  logged. No administration response holds an identity, a label, an
+  attribute or where an identity is used.
+- **Suspension**: a suspended account has no session, opens none, recovers
+  nothing and gets no token; nothing of it is deleted.
+- **Invitations**: links that create ordinary accounts, as many as their
+  maker says (1 to 100), for 1 to 90 days (7 by default), revocable.
+- **The last administrator** keeps the role and the account: withdrawing,
+  suspending or deleting is refused, from the administration and from the
+  account's own page.
+- **The log of administrative actions** is encrypted, names accounts by
+  their identifier only (names are looked up when it is read, so an entry
+  about a deleted account names nobody), and entries older than
+  `AppState::admin_log_retention` (twelve months by default) are deleted.
+- Schema script `0003_administration.sql`.
+
 ### Security
 
 - The Content Security Policy of API responses (JSON and redirects) is

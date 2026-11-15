@@ -33,6 +33,9 @@ pub enum RegistrationPurpose {
 /// In-flight registration session keyed by a temporary session UUID.
 pub struct PendingRegistration {
     pub purpose: RegistrationPurpose,
+    /// The setup link or the invitation that allows this sign-up, when the
+    /// server asks for one. Spent when the account is created.
+    pub link: Option<String>,
     pub user_id: Uuid,
     pub username: String,
     pub server: String,
@@ -60,6 +63,9 @@ pub enum AuthenticationPurpose {
     SignIn,
     /// Deleting the signed-in account (`/account/delete/*`).
     DeleteAccount,
+    /// Confirming, in an open session, that the person is there: asked
+    /// before an administrative change (`/auth/confirm/*`).
+    Confirm,
 }
 
 /// In-flight authentication session keyed by a temporary session UUID.
@@ -122,6 +128,16 @@ pub struct IssuedCode {
     pub created_at: Instant,
 }
 
+/// The log of administrative actions is kept twelve months unless the
+/// operator says otherwise.
+pub(crate) const ADMIN_LOG_RETENTION: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// An administrative change needs a passkey ceremony at most this old.
+pub(crate) const CONFIRMATION_TTL: Duration = Duration::from_secs(300);
+
+/// A setup link, and a link that grants the administrator role, last an hour.
+pub const OPERATOR_LINK_TTL: Duration = Duration::from_secs(3600);
+
 /// A person has ten minutes to sign in and choose an identity.
 pub(crate) const PENDING_AUTHORIZATION_TTL: Duration = Duration::from_secs(600);
 
@@ -167,9 +183,12 @@ pub struct AppState {
     pub pending_authorizations: Arc<Mutex<HashMap<String, PendingAuthorization>>>,
     /// Authorization codes waiting to be exchanged, by code.
     pub authorization_codes: Arc<Mutex<HashMap<String, IssuedCode>>>,
-    /// Whether new accounts can be created. Closing it leaves sign-in,
-    /// recovery and added passkeys untouched.
-    pub signup_open: bool,
+    /// How long an entry of the log of administrative actions is kept. The
+    /// log holds identifiers of accounts: it is not kept for ever.
+    pub admin_log_retention: Duration,
+    /// How old the latest passkey ceremony of a session may be for an
+    /// administrative change to be accepted from it.
+    pub confirmation_ttl: Duration,
     /// Whether to trust `x-forwarded-for` for rate-limit key extraction.
     ///
     /// MUST be `true` only when the API is reachable exclusively through a
@@ -200,7 +219,8 @@ impl AppState {
             pending_authentications: Arc::new(Mutex::new(HashMap::new())),
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
             authorization_codes: Arc::new(Mutex::new(HashMap::new())),
-            signup_open: true,
+            admin_log_retention: ADMIN_LOG_RETENTION,
+            confirmation_ttl: CONFIRMATION_TTL,
             // Default to false — safe for direct exposure and tests. The
             // production deployment binary (`server-leaf`) must opt-in when
             // Caddy (or another trusted proxy) terminates the public TLS edge.
@@ -216,10 +236,17 @@ impl AppState {
         self
     }
 
-    /// Open or close the creation of accounts.
+    /// How recent a passkey ceremony an administrative change asks for.
     #[must_use]
-    pub fn with_signup_open(mut self, open: bool) -> Self {
-        self.signup_open = open;
+    pub fn with_confirmation_ttl(mut self, ttl: Duration) -> Self {
+        self.confirmation_ttl = ttl;
+        self
+    }
+
+    /// How long the log of administrative actions is kept.
+    #[must_use]
+    pub fn with_admin_log_retention(mut self, retention: Duration) -> Self {
+        self.admin_log_retention = retention;
         self
     }
 

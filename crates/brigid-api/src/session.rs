@@ -94,6 +94,10 @@ pub struct AccountSession {
     pub idle_expires_at: i64,
     /// Unix time the session ends in any case.
     pub expires_at: i64,
+    /// Unix time of the latest passkey ceremony done in this session.
+    pub confirmed_at: i64,
+    /// Whether the account is an administrator of this server.
+    pub admin: bool,
 }
 
 impl AccountSession {
@@ -123,12 +127,24 @@ impl AccountSession {
         else {
             return Ok(None);
         };
+        // A suspended account has no session, whatever cookie it holds.
+        let standing = state
+            .store
+            .account_standing(account.id)
+            .await
+            .map_err(|e| internal!(e))?
+            .unwrap_or_default();
+        if standing.suspended {
+            return Ok(None);
+        }
         Ok(Some(Self {
             account,
             token: token.to_owned(),
             auth_time: info.created_at,
             idle_expires_at: info.idle_expires_at,
             expires_at: info.expires_at,
+            confirmed_at: info.confirmed_at,
+            admin: standing.admin,
         }))
     }
 }
@@ -176,6 +192,48 @@ impl FromRequestParts<Arc<AppState>> for Onboarded {
         let session = AccountSession::from_request_parts(parts, state).await?;
         if !Self::check(state, &session).await? {
             return Err(ApiError::RecoveryCodeRequired);
+        }
+        Ok(Self(session))
+    }
+}
+
+/// A signed-in administrator. `403` for any other account: what the
+/// administration can read is refused to it, not hidden from it.
+pub struct Administrator(pub AccountSession);
+
+impl FromRequestParts<Arc<AppState>> for Administrator {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let session = AccountSession::from_request_parts(parts, state).await?;
+        if !session.admin {
+            return Err(ApiError::Forbidden);
+        }
+        Ok(Self(session))
+    }
+}
+
+/// A signed-in administrator who used a passkey in this session a few
+/// minutes ago at most: what every administrative change asks for, so that
+/// an open, unattended session changes nothing. `403` with the code
+/// `confirmation_required` otherwise; `/auth/confirm/*` is the ceremony.
+pub struct ConfirmedAdministrator(pub AccountSession);
+
+impl FromRequestParts<Arc<AppState>> for ConfirmedAdministrator {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let Administrator(session) = Administrator::from_request_parts(parts, state).await?;
+        let now = helpers4::time::unix_now().map_or(i64::MAX, |secs| secs as i64);
+        let ttl = i64::try_from(state.confirmation_ttl.as_secs()).unwrap_or(i64::MAX);
+        if now.saturating_sub(session.confirmed_at) >= ttl {
+            return Err(ApiError::ConfirmationRequired);
         }
         Ok(Self(session))
     }

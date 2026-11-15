@@ -41,6 +41,10 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 - **No secrets in logs** — `tracing` spans must never capture key material, credentials, or tokens.
 - **No `unwrap()` on error paths** — typed errors via `thiserror`.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
+- **Administration** — what an administrator can reach stops at the account: no `/admin`
+  response holds an identity, a label, an attribute or a grant, and none gives access back
+  to an account. The log of administrative actions names accounts by identifier only and
+  is deleted after its retention period. Operational log lines carry no account identifier.
 - **OIDC** — Authorization Code flow only, PKCE `S256` for every client, EdDSA only; a
   relying party receives a VSID. The labels of an identity (name, logo, description) never
   leave the server. An attribute (`brigid-identity/src/attributes.rs`) reaches a relying
@@ -63,6 +67,10 @@ POST /auth/login/finish    → account session (HttpOnly cookie), no token
 
 POST /account/recovery-code            → the recovery code; until it exists, identities and applications answer 403
 POST /account/delete/begin, /finish    → a passkey ceremony of its own, then the account and all about it are gone
+
+GET  /admin/accounts, /admin/applications, /admin/sign-up, /admin/log → an administrator's session
+POST|PUT|DELETE /admin/…               → also a passkey ceremony at most 5 minutes old (/auth/confirm/begin|finish), logged
+POST /admin/claim                      → the role, for a link made on the machine
 
 GET  /authorize                        → relying party's request, held; 303 to the UI page /continue/
 GET  /auth/authorize/{request}         → what the page shows (site name, identities, attributes asked)
