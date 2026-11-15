@@ -1780,6 +1780,8 @@ async fn identity_crud_roundtrip_and_isolation() {
         "10.41.2",
     )
     .await;
+    finish_onboarding(&app, &alice_token, "10.41.1").await;
+    finish_onboarding(&app, &bob_token, "10.41.2").await;
 
     // Create
     let (status, created) = identity_request(
@@ -2256,16 +2258,7 @@ async fn no_token_for_a_caller_supplied_client_id() {
     )
     .await;
 
-    let (_, list) = identity_request(
-        &app,
-        "GET",
-        "/account/identities",
-        Some(&cookie),
-        "10.46.2.1",
-        None,
-    )
-    .await;
-    let id = list[0]["id"].as_str().unwrap();
+    let id = finish_onboarding(&app, &cookie, "10.46.2").await[0];
     let (status, _) = identity_request(
         &app,
         "POST",
@@ -2537,7 +2530,7 @@ async fn signup_without_username_signs_in() {
     let token = cookie.as_str();
     let user_id = Uuid::nil();
 
-    // The session works, the passkey has its name, the starter identities exist.
+    // The session works and the passkey has its name.
     let (status, j) = identity_request(
         &app,
         "GET",
@@ -2549,18 +2542,127 @@ async fn signup_without_username_signs_in() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(j[0]["label"], "1Password");
-    let (_, j) = identity_request(
-        &app,
-        "GET",
-        &format!("/account/identities?user_id={user_id}"),
-        Some(token),
-        "10.54.2.2",
-        None,
-    )
-    .await;
-    assert_eq!(j.as_array().unwrap().len(), 3);
 
     let _ = (user_id, rp_origin);
+}
+
+/// core#98: an account cannot leave onboarding without a recovery code, and
+/// the server creates no identity for it.
+#[tokio::test]
+async fn an_account_without_a_recovery_code_can_do_nothing_else() {
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (cookie, _, passkey) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "onboarding@localhost",
+        &rp_origin,
+        &mut dev,
+        "10.80.1",
+    )
+    .await;
+    let xff = Addresses::new("10.81");
+    let call = async |method: &str, uri: &str, body: Option<serde_json::Value>| {
+        identity_request(&app, method, uri, Some(&cookie), &xff.next(), body).await
+    };
+
+    // Signed in, and told that the onboarding is not over.
+    let (status, j) = call("GET", "/auth/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["recovery_code"], false);
+
+    // Identities and applications are closed, by a refusal that says why.
+    let some_id = Uuid::new_v4();
+    for (method, uri, body) in [
+        ("GET", "/account/identities".to_string(), None),
+        (
+            "POST",
+            "/account/identities".to_string(),
+            Some(serde_json::json!({ "template": "personal" })),
+        ),
+        (
+            "PATCH",
+            format!("/account/identities/{some_id}"),
+            Some(serde_json::json!({ "name": "x" })),
+        ),
+        ("DELETE", format!("/account/identities/{some_id}"), None),
+        (
+            "GET",
+            format!("/account/identities/{some_id}/applications"),
+            None,
+        ),
+    ] {
+        let (status, j) = call(method, &uri, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(j["error"], "a recovery code is required first");
+    }
+    // Nor can it present itself to an application: the page is told to send
+    // the person to their onboarding, and learns nothing else.
+    let (shop, _) = state
+        .store
+        .create_client("Shop", &[REDIRECT.to_string()], false)
+        .await
+        .unwrap();
+    let request = begin_authorization(&app, &shop.client_id, "", &xff.next()).await;
+    let (status, j) = call("GET", &format!("/auth/authorize/{request}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["needs_recovery_code"], true);
+    assert_eq!(j["identities"], serde_json::json!([]));
+    let (status, _) = call(
+        "POST",
+        &format!("/auth/authorize/{request}/approve"),
+        Some(serde_json::json!({ "identity_id": some_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let silent = begin_authorization(&app, &shop.client_id, "&prompt=none", &xff.next()).await;
+    let (_, j) = call("POST", &format!("/auth/authorize/{silent}/silent"), None).await;
+    assert_eq!(
+        query_of(j["redirect_to"].as_str().unwrap())["error"],
+        "interaction_required"
+    );
+
+    // What the onboarding needs stays open: the passkey's name, the code.
+    let (status, _) = call(
+        "PATCH",
+        &format!("/auth/passkeys/{passkey}"),
+        Some(serde_json::json!({ "label": "This laptop" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, j) = call("GET", "/account/recovery-code", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["code_created_at"], serde_json::Value::Null);
+    let (status, _) = call("POST", "/account/recovery-code", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // With the code, the account is open, and starts with no identity: the
+    // server proposes some, the browser creates the ones kept.
+    let (_, j) = call("GET", "/auth/session", None).await;
+    assert_eq!(j["recovery_code"], true);
+    let (status, j) = call("GET", "/account/identities", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j, serde_json::json!([]));
+    let (_, templates) = call("GET", "/account/identity-templates", None).await;
+    let starters: Vec<&str> = templates
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["starter"] == true)
+        .map(|t| t["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(starters, ["public", "personal", "work"]);
+    let (_, j) = call("GET", &format!("/auth/authorize/{request}"), None).await;
+    assert_eq!(j["needs_recovery_code"], false);
+
+    // A code can be replaced, never removed.
+    let (status, _) = call("POST", "/account/recovery-code", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call("DELETE", "/account/recovery-code", None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,7 +2786,55 @@ fn verified_claims(state: &AppState, jwt: &str) -> serde_json::Value {
     serde_json::from_slice(&Base64UrlUnpadded::decode_vec(payload).unwrap()).unwrap()
 }
 
-/// A signed-in account with its identities, and an authenticator to go with.
+/// What the onboarding does once the passkey exists: the recovery code, then
+/// the starter identities, created by the browser from the templates marked
+/// `starter`. Returns the identities' ids, in the order of the templates.
+async fn finish_onboarding(app: &axum::Router, cookie: &str, xff_base: &str) -> Vec<Uuid> {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/account/recovery-code",
+        Some(cookie),
+        &format!("{xff_base}.20"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let (status, templates) = identity_request(
+        app,
+        "GET",
+        "/account/identity-templates",
+        Some(cookie),
+        &format!("{xff_base}.21"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut ids = Vec::new();
+    for (n, template) in templates
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["starter"] == true)
+        .enumerate()
+    {
+        let (status, j) = identity_request(
+            app,
+            "POST",
+            "/account/identities",
+            Some(cookie),
+            &format!("{xff_base}.{}", 22 + n),
+            Some(serde_json::json!({ "template": template["key"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{j}");
+        ids.push(serde_json::from_value(j["id"].clone()).unwrap());
+    }
+    ids
+}
+
+/// A signed-in account past its onboarding, with its identities, and an
+/// authenticator to go with.
 async fn signed_in_account(
     app: &axum::Router,
     username: &str,
@@ -2697,22 +2847,7 @@ async fn signed_in_account(
     let (cookie, account_id, _) =
         register_and_login_for_passkey_tests(app.clone(), username, &rp_origin, &mut dev, xff_base)
             .await;
-    let (status, list) = identity_request(
-        app,
-        "GET",
-        "/account/identities",
-        Some(&cookie),
-        &format!("{xff_base}.9"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let ids = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| serde_json::from_value(i["id"].clone()).unwrap())
-        .collect();
+    let ids = finish_onboarding(app, &cookie, xff_base).await;
     (cookie, account_id, ids)
 }
 
@@ -4251,4 +4386,177 @@ async fn the_label_of_an_identity_appears_in_no_token() {
         ]
     );
     assert_eq!(claims["preferred_username"], "ada_l");
+}
+
+// ---------------------------------------------------------------------------
+// Leaving: /account/delete
+// ---------------------------------------------------------------------------
+
+/// core#98: deletion needs a fresh ceremony, and leaves nothing about the
+/// account.
+#[tokio::test]
+async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing() {
+    use brigid_identity::{Attribute, Need};
+    use webauthn_authenticator_rs::WebauthnAuthenticator;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+    use webauthn_rs::prelude::RequestChallengeResponse;
+
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
+    let xff = Addresses::new("10.83");
+
+    // Two accounts. The first has lived: identities, attributes, an
+    // application it signed in to and shared an address with.
+    let mut ada_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (ada, ada_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "leaving@localhost",
+        &rp_origin,
+        &mut ada_key,
+        "10.82.1",
+    )
+    .await;
+    let identities = finish_onboarding(&app, &ada, "10.82.1").await;
+    let mut bob_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (bob, bob_id, _) = register_and_login_for_passkey_tests(
+        app.clone(),
+        "staying@localhost",
+        &rp_origin,
+        &mut bob_key,
+        "10.82.2",
+    )
+    .await;
+    let bob_identities = finish_onboarding(&app, &bob, "10.82.2").await;
+    let shop = client_asking(&state, "Shop", &[(Attribute::Email, Need::Required)]).await;
+    for (cookie, identity) in [(&ada, identities[0]), (&bob, bob_identities[0])] {
+        let (status, _) = set_attributes(
+            &app,
+            cookie,
+            identity,
+            serde_json::json!({ "email": "someone@example.org" }),
+            &xff.next(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request = begin_authorization(&app, &shop, "&scope=openid+email", &xff.next()).await;
+        let (status, j) = answer(&app, &request, cookie, identity, &["email"], &xff.next()).await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+    }
+
+    let post = async |uri: &str, cookie: Option<&str>, body: serde_json::Value| {
+        identity_request(&app, "POST", uri, cookie, &xff.next(), Some(body)).await
+    };
+    // The software authenticator of the tests keeps no discoverable passkey:
+    // a sign-in ceremony names its account.
+    let begin = async |uri: &str, cookie: Option<&str>| {
+        let named = serde_json::json!({ "username": "leaving@localhost" });
+        let (status, j) = post(uri, cookie, named).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {j}");
+        let challenge: RequestChallengeResponse =
+            serde_json::from_value(j["challenge"].clone()).unwrap();
+        (j["session_id"].clone(), challenge)
+    };
+
+    // Not without a session.
+    let (status, _) = post("/account/delete/begin", None, serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A ceremony done to sign in deletes nothing: the session alone, even
+    // with a passkey answer made for something else, is not enough.
+    let (session_id, challenge) = begin("/auth/login/begin", None).await;
+    let credential = ada_key
+        .do_authentication(rp_origin.clone(), challenge)
+        .unwrap();
+    let (status, _) = post(
+        "/account/delete/finish",
+        Some(&ada),
+        serde_json::json!({ "session_id": session_id, "credential": credential }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A ceremony begun to delete does not sign anyone in either.
+    let (session_id, challenge) = begin("/account/delete/begin", Some(&ada)).await;
+    let credential = ada_key
+        .do_authentication(rp_origin.clone(), challenge)
+        .unwrap();
+    let answer_body = serde_json::json!({ "session_id": session_id, "credential": credential });
+    let (status, _) = post("/auth/login/finish", None, answer_body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Someone else's session cannot finish it: the ceremony was begun for
+    // one account, and deletes that one or nothing.
+    let (status, _) = post("/account/delete/finish", Some(&bob), answer_body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Nor can another passkey answer this account's ceremony.
+    let (session_id, challenge) = begin("/account/delete/begin", Some(&ada)).await;
+    assert!(
+        bob_key
+            .do_authentication(rp_origin.clone(), challenge)
+            .is_err(),
+        "the challenge names this account's passkeys only"
+    );
+    let _ = session_id;
+    for account in [ada_id, bob_id] {
+        assert!(state.store.fetch_user(account).await.unwrap().is_some());
+    }
+
+    // The account's own passkey, for that purpose: it is gone.
+    let (session_id, challenge) = begin("/account/delete/begin", Some(&ada)).await;
+    let credential = ada_key
+        .do_authentication(rp_origin.clone(), challenge)
+        .unwrap();
+    let (status, set_cookie, _) = request_with_cookie(
+        &app,
+        "POST",
+        "/account/delete/finish",
+        Some(&ada),
+        &xff.next(),
+        Some(serde_json::json!({ "session_id": session_id, "credential": credential })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(set_cookie.is_some(), "the session cookie is cleared");
+
+    // Nothing is left of it: no account, no passkey, no session, no
+    // identity, nothing about the application.
+    let store = &state.store;
+    assert!(store.fetch_user(ada_id).await.unwrap().is_none());
+    assert!(store.fetch_credentials(ada_id).await.unwrap().is_empty());
+    assert!(store.fetch_identities(ada_id).await.unwrap().is_empty());
+    assert!(
+        store
+            .grants_for_client(ada_id, &shop)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.chosen_identity(ada_id, &shop).await.unwrap(), None);
+    assert_eq!(
+        store.recovery_status(ada_id).await.unwrap(),
+        brigid_store::RecoveryStatus::default()
+    );
+    let (status, _) =
+        identity_request(&app, "GET", "/auth/session", Some(&ada), &xff.next(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Its passkey opens nothing any more: there is no account to sign in to.
+    let (status, _) = post(
+        "/auth/login/begin",
+        None,
+        serde_json::json!({ "username": "leaving@localhost" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The other account lost nothing.
+    assert!(store.fetch_user(bob_id).await.unwrap().is_some());
+    assert_eq!(store.fetch_identities(bob_id).await.unwrap().len(), 3);
+    assert_eq!(
+        store.grants_for_client(bob_id, &shop).await.unwrap().len(),
+        1
+    );
+    let (status, _) =
+        identity_request(&app, "GET", "/auth/session", Some(&bob), &xff.next(), None).await;
+    assert_eq!(status, StatusCode::OK);
 }

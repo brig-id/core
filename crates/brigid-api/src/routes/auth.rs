@@ -17,9 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
-    session::{AccountSession, clear_cookie, open_session},
+    session::{AccountSession, Onboarded, clear_cookie, open_session},
     state::{
-        AppState, PendingAuthentication, PendingLogin, PendingRegistration, RegistrationPurpose,
+        AppState, AuthenticationPurpose, PendingAuthentication, PendingLogin, PendingRegistration,
+        RegistrationPurpose,
     },
 };
 
@@ -207,10 +208,11 @@ pub async fn register_finish(
     // with "no credentials"). The store-level transaction commits both or
     // neither.
     let cred = passkey_to_credential(user_id, &passkey).map_err(|e| internal!(e))?;
-    let identities = crate::routes::identities::starter_identities(user_id);
+    // No identity is created here: the onboarding proposes some, and the
+    // browser creates the ones the person keeps.
     state
         .store
-        .register_user_with_credential(&user, &cred, &identities)
+        .register_user_with_credential(&user, &cred, &[])
         .await
         .map_err(|e| match e {
             brigid_store::Error::Duplicate => {
@@ -447,6 +449,7 @@ pub async fn login_begin(
         map.insert(
             session_id,
             PendingAuthentication {
+                purpose: AuthenticationPurpose::SignIn,
                 login,
                 created_at: Instant::now(),
             },
@@ -467,12 +470,40 @@ pub async fn login_finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = state
-        .pending_authentications
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&body.session_id)
-        .ok_or(ApiError::BadRequest("unknown session".into()))?;
+    let user_id = finish_authentication(&state, &body, AuthenticationPurpose::SignIn).await?;
+    let user = state
+        .store
+        .fetch_user(user_id)
+        .await
+        .map_err(|e| internal!(e))?
+        .ok_or(ApiError::NotFound)?;
+
+    // A session, never a token: brig·id's API takes no ID token as a
+    // credential, and a relying party gets one only through its own flow
+    // (ADR-005).
+    let cookie = open_session(&state, &user).await?;
+    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
+}
+
+/// Finishes an authentication ceremony begun for `purpose` and returns the
+/// account whose passkey answered. A ceremony begun for another purpose is
+/// left in place and reported as unknown, as a missing one is.
+pub(crate) async fn finish_authentication(
+    state: &AppState,
+    body: &FinishLoginRequest,
+    purpose: AuthenticationPurpose,
+) -> Result<Uuid, ApiError> {
+    let pending = {
+        let mut map = state
+            .pending_authentications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(&body.session_id) {
+            Some(p) if p.purpose == purpose => {}
+            _ => return Err(ApiError::BadRequest("unknown session".into())),
+        }
+        map.remove(&body.session_id).expect("checked above")
+    };
 
     // Authoritative TTL check at finish time — see `register_finish`.
     if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
@@ -525,35 +556,7 @@ pub async fn login_finish(
         }
     }
 
-    let user = state
-        .store
-        .fetch_user(user_id)
-        .await
-        .map_err(|e| internal!(e))?
-        .ok_or(ApiError::NotFound)?;
-
-    // Accounts created before identities existed get the starter set on
-    // their first sign-in (ADR-002).
-    let existing = state
-        .store
-        .fetch_identities(user.id)
-        .await
-        .map_err(|e| internal!(e))?;
-    if existing.is_empty() {
-        for identity in crate::routes::identities::starter_identities(user.id) {
-            state
-                .store
-                .store_identity(&identity)
-                .await
-                .map_err(|e| internal!(e))?;
-        }
-    }
-
-    // A session, never a token: brig·id's API takes no ID token as a
-    // credential, and a relying party gets one only through its own flow
-    // (ADR-005).
-    let cookie = open_session(&state, &user).await?;
-    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
+    Ok(user_id)
 }
 
 /// `DELETE /auth/passkeys/{id}`: delete a passkey of the signed-in account.
@@ -642,16 +645,23 @@ pub struct SessionResponse {
     pub idle_expires_at: i64,
     /// Unix time the session ends in any case: sign in again then.
     pub expires_at: i64,
+    /// Whether the account has a recovery code. Without one it is still in
+    /// its onboarding: identities and applications are closed to it.
+    pub recovery_code: bool,
 }
 
 /// `GET /auth/session`: is the session still good? `200` with its deadlines,
 /// or `401` (none, expired, or the account is gone) so the client signs out.
-pub async fn session(session: AccountSession) -> impl IntoResponse {
-    (
+pub async fn session(
+    State(state): State<Arc<AppState>>,
+    session: AccountSession,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok((
         StatusCode::OK,
         Json(SessionResponse {
             idle_expires_at: session.idle_expires_at,
             expires_at: session.expires_at,
+            recovery_code: Onboarded::check(&state, &session).await?,
         }),
-    )
+    ))
 }

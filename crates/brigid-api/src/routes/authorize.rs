@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, internal},
     routes::identities::{IdentityView, attribute_named},
-    session::AccountSession,
+    session::{AccountSession, Onboarded},
     state::{AppState, IssuedCode, PendingAuthorization, Prompt},
 };
 
@@ -189,6 +189,9 @@ pub struct RequestView {
     /// Whether the relying party asked for the choice to be shown even when
     /// one is remembered.
     pub force_choice: bool,
+    /// The account has no recovery code yet: it must finish its onboarding
+    /// before it can present an identity anywhere.
+    pub needs_recovery_code: bool,
     /// The account's identities, with their attributes. Their names and
     /// logos are for the person: the relying party receives none of this.
     pub identities: Vec<IdentityView>,
@@ -237,6 +240,7 @@ pub async fn request(
         must_sign_in: must_sign_in(&pending, session.as_ref()),
         silent: pending.prompt == Prompt::None,
         force_choice: pending.prompt == Prompt::Select,
+        needs_recovery_code: false,
         identities: Vec::new(),
         chosen: None,
         asked: pending
@@ -250,6 +254,11 @@ pub async fn request(
         decisions: BTreeMap::new(),
     };
     if let Some(session) = session {
+        if !Onboarded::check(&state, &session).await? {
+            // Nothing of the account is shown before its onboarding is done.
+            view.needs_recovery_code = true;
+            return Ok(Json(view));
+        }
         let identities = state
             .store
             .fetch_identities(session.account.id)
@@ -317,7 +326,7 @@ pub struct Answer {
 pub async fn approve(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    session: AccountSession,
+    Onboarded(session): Onboarded,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Answer>, ApiError> {
     let pending = state.pending_authorization(&id).ok_or(ApiError::NotFound)?;
@@ -435,6 +444,12 @@ pub async fn silent(
     let Some(session) = session.filter(|s| !must_sign_in(&pending, Some(s))) else {
         return Ok(refuse("login_required", "the person must sign in"));
     };
+    if !Onboarded::check(&state, &session).await? {
+        return Ok(refuse(
+            "interaction_required",
+            "the person must finish setting up their account",
+        ));
+    }
     let chosen = state
         .store
         .chosen_identity(session.account.id, &pending.client_id)

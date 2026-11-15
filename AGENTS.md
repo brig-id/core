@@ -61,6 +61,9 @@ POST /auth/register/finish → store encrypted credential
 POST /auth/login/begin     → WebAuthn RequestChallenge
 POST /auth/login/finish    → account session (HttpOnly cookie), no token
 
+POST /account/recovery-code            → the recovery code; until it exists, identities and applications answer 403
+POST /account/delete/begin, /finish    → a passkey ceremony of its own, then the account and all about it are gone
+
 GET  /authorize                        → relying party's request, held; 303 to the UI page /continue/
 GET  /auth/authorize/{request}         → what the page shows (site name, identities, attributes asked)
 POST /auth/authorize/{request}/approve → code for the chosen identity and the attributes accepted (also /deny, /silent)

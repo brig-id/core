@@ -146,6 +146,41 @@ impl FromRequestParts<Arc<AppState>> for AccountSession {
     }
 }
 
+/// A signed-in account that finished its onboarding: it has a recovery code.
+///
+/// An account without one can sign in, manage its passkeys and create its
+/// code, and nothing else: no identity, no application. Losing every passkey
+/// would otherwise lose the account for good, since nobody else can give
+/// access back. `403` until the code exists; `401` without a session.
+pub struct Onboarded(pub AccountSession);
+
+impl Onboarded {
+    /// Whether `session`'s account has a usable recovery code.
+    pub async fn check(state: &AppState, session: &AccountSession) -> Result<bool, ApiError> {
+        let status = state
+            .store
+            .recovery_status(session.account.id)
+            .await
+            .map_err(|e| internal!(e))?;
+        Ok(status.code_created_at.is_some())
+    }
+}
+
+impl FromRequestParts<Arc<AppState>> for Onboarded {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let session = AccountSession::from_request_parts(parts, state).await?;
+        if !Self::check(state, &session).await? {
+            return Err(ApiError::RecoveryCodeRequired);
+        }
+        Ok(Self(session))
+    }
+}
+
 /// Refuses a request that changes something (any method but GET, HEAD,
 /// OPTIONS) unless its `Origin` is this server's: with `SameSite=Strict`, the
 /// second barrier against cross-site requests (ADR-005 §1). Browsers send

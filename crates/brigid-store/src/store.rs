@@ -857,6 +857,20 @@ impl EncryptedStore {
         Ok(())
     }
 
+    /// Delete an account and everything recorded about it: its passkeys,
+    /// its recovery code, its sessions, its identities with their attributes,
+    /// the identity it presented to each relying party and what it shared
+    /// there. Returns whether the account existed.
+    ///
+    /// Nothing is kept: no tombstone, no log of who it was.
+    pub async fn delete_account(&self, account_id: Uuid) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(account_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     // -- Account recovery (ADR-004) -------------------------------------------
 
     /// Make `recovery_id`/`verifier` the account's recovery code, replacing
@@ -3183,5 +3197,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// Every table that holds something about an account is emptied of it,
+    /// and of it only.
+    #[tokio::test]
+    async fn deleting_an_account_leaves_no_row_about_it() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let (site, _) = store
+            .create_client("Shop", &["https://shop.example/cb".to_string()], false)
+            .await
+            .unwrap();
+        let mut accounts = Vec::new();
+        for name in ["leaving", "staying"] {
+            let mut user = sample_user();
+            user.id = Uuid::new_v4();
+            user.username = name.into();
+            store.store_user(&user).await.unwrap();
+            store
+                .store_credential(&Credential {
+                    id: Uuid::new_v4(),
+                    user_id: user.id,
+                    data: b"passkey".to_vec(),
+                })
+                .await
+                .unwrap();
+            store
+                .set_recovery_code(user.id, &[7u8; 8], &[9u8; 32])
+                .await
+                .ok();
+            store
+                .create_session(
+                    user.id,
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(600),
+                )
+                .await
+                .unwrap();
+            let identity = sample_identity(user.id);
+            store.store_identity(&identity).await.unwrap();
+            store
+                .set_chosen_identity(user.id, &site.client_id, identity.id)
+                .await
+                .unwrap();
+            store
+                .record_grant(user.id, identity.id, &site.client_id, &BTreeMap::new())
+                .await
+                .unwrap();
+            accounts.push((user.id, identity.id));
+        }
+        let (leaving, leaving_identity) = accounts[0];
+
+        // Rows per table that name an account or one of its identities.
+        let rows = async |account: Uuid, identity: Uuid| -> Vec<i64> {
+            let mut counts = Vec::new();
+            for (table, column, id) in [
+                ("users", "id", account),
+                ("webauthn_credentials", "user_id", account),
+                ("account_recovery", "user_id", account),
+                ("sessions", "account_id", account),
+                ("identities", "account_id", account),
+                ("client_identities", "account_id", account),
+                ("grants", "identity_id", identity),
+            ] {
+                let count: i64 =
+                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
+                        .bind(id.to_string())
+                        .fetch_one(&store.pool)
+                        .await
+                        .unwrap();
+                counts.push(count);
+            }
+            counts
+        };
+        // The second recovery code has the same public part as the first and
+        // is refused: one account has a code, which is enough here.
+        let before = rows(leaving, leaving_identity).await;
+        assert!(before.iter().all(|n| *n == 1), "{before:?}");
+        let other_before = rows(accounts[1].0, accounts[1].1).await;
+
+        assert!(store.delete_account(leaving).await.unwrap());
+        assert_eq!(rows(leaving, leaving_identity).await, vec![0; 7]);
+        assert_eq!(rows(accounts[1].0, accounts[1].1).await, other_before);
+        assert!(
+            !store.delete_account(leaving).await.unwrap(),
+            "gone is gone"
+        );
+        // The application itself is not the account's: it stays.
+        assert!(store.fetch_client(&site.client_id).await.unwrap().is_some());
     }
 }
