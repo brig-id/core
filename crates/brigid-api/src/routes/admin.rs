@@ -667,6 +667,29 @@ pub async fn revoke_invitation(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// -- The server ----------------------------------------------------------------------
+
+/// What runs here, for those who administer it. A visitor is not told: the
+/// version of a sign-in server is not published to whoever asks.
+#[derive(Debug, Serialize)]
+pub struct ServerView {
+    /// The edition (`seedling`), when the program said which it is.
+    pub edition: Option<String>,
+    /// Its version.
+    pub version: Option<String>,
+}
+
+/// `GET /admin/server`
+pub async fn server(
+    State(state): State<Arc<AppState>>,
+    Administrator(_): Administrator,
+) -> Json<ServerView> {
+    Json(ServerView {
+        edition: state.edition.as_ref().map(|e| e.name.clone()),
+        version: state.edition.as_ref().map(|e| e.version.clone()),
+    })
+}
+
 // -- The log -----------------------------------------------------------------------
 
 /// An entry of the log, with the names it can still be given.

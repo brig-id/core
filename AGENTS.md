@@ -68,7 +68,7 @@ POST /auth/login/finish    → account session (HttpOnly cookie), no token
 POST /account/recovery-code            → the recovery code; until it exists, identities and applications answer 403
 POST /account/delete/begin, /finish    → a passkey ceremony of its own, then the account and all about it are gone
 
-GET  /admin/accounts, /admin/applications, /admin/sign-up, /admin/log → an administrator's session
+GET  /admin/accounts, /admin/applications, /admin/sign-up, /admin/log, /admin/server → an administrator's session
 POST|PUT|DELETE /admin/…               → also a passkey ceremony at most 5 minutes old (/auth/confirm/begin|finish), logged
 POST /admin/claim                      → the role, for a link made on the machine
 
