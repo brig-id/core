@@ -29,14 +29,14 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master @ 2026-08-05
         with:
           toolchain: nightly
 
       - name: Install cargo-binstall
         # Pinned action commit — fetches a checksummed cargo-binstall
         # binary from its signed GitHub release. Matches brig-id/crypto's fuzz.yml.
-        uses: cargo-bins/cargo-binstall@851112458b5f28a29e5bc14a690c3f283d9dcc6f # v1.26.2
+        uses: cargo-bins/cargo-binstall@5885714d0a40a14b2535c6ffc051fd8e49aa9665 # v1.27.0
 
       - name: Install cargo-fuzz
         # Use the upstream prebuilt binary from the cargo-fuzz GitHub release
