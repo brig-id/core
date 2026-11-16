@@ -189,6 +189,9 @@ pub struct AppState {
     /// How old the latest passkey ceremony of a session may be for an
     /// administrative change to be accepted from it.
     pub confirmation_ttl: Duration,
+    /// The program this server is, and its version: what its administrators
+    /// read to know what runs. `None` when the program did not say.
+    pub edition: Option<Edition>,
     /// Whether to trust `x-forwarded-for` for rate-limit key extraction.
     ///
     /// MUST be `true` only when the API is reachable exclusively through a
@@ -196,6 +199,13 @@ pub struct AppState {
     /// overwrites the header. If the API is reachable directly, an attacker
     /// can forge the header to bypass rate limits — keep this `false`.
     pub trust_forwarded_for: bool,
+}
+
+/// The program a server is, as it names itself: an edition and its version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edition {
+    pub name: String,
+    pub version: String,
 }
 
 impl AppState {
@@ -221,6 +231,7 @@ impl AppState {
             authorization_codes: Arc::new(Mutex::new(HashMap::new())),
             admin_log_retention: ADMIN_LOG_RETENTION,
             confirmation_ttl: CONFIRMATION_TTL,
+            edition: None,
             // Default to false — safe for direct exposure and tests. The
             // production deployment binary (`server-leaf`) must opt-in when
             // Caddy (or another trusted proxy) terminates the public TLS edge.
@@ -240,6 +251,17 @@ impl AppState {
     #[must_use]
     pub fn with_confirmation_ttl(mut self, ttl: Duration) -> Self {
         self.confirmation_ttl = ttl;
+        self
+    }
+
+    /// The program built on this crate, and its version (`seedling`,
+    /// `0.6.1`): shown to the server's administrators, and to nobody else.
+    #[must_use]
+    pub fn with_edition(mut self, name: &str, version: &str) -> Self {
+        self.edition = Some(Edition {
+            name: name.to_owned(),
+            version: version.to_owned(),
+        });
         self
     }
 

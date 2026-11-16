@@ -226,6 +226,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/admin/invitations", post(admin::invite))
         .route("/admin/invitations/{id}", delete(admin::revoke_invitation))
         .route("/admin/log", get(admin::read_log))
+        .route("/admin/server", get(admin::server))
         // Leaving: a passkey ceremony of its own, then nothing is left.
         .route("/account/delete/begin", post(account::delete_begin))
         .route("/account/delete/finish", post(account::delete_finish))
