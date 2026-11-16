@@ -16,7 +16,7 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 url.workspace = true
-webauthn-rs = { version = "0.5", features = [
+webauthn-rs = { version = "0.6", features = [
   "danger-allow-state-serialisation",
   # start/finish_discoverable_authentication: username-less passkey login.
   "conditional-ui",
