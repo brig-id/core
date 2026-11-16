@@ -33,4 +33,4 @@ sqlx = { version = "0.8", features = [
   "macros",
 ] }
 time.workspace = true
-webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
