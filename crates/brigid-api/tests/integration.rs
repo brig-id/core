@@ -5442,13 +5442,17 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
     assert_eq!(state.store.count_accounts().await.unwrap(), 4);
 }
 
-/// What runs here is told to those who administer the server, and to them
-/// only: a visitor asking a sign-in server its version is told nothing.
+/// What runs here is public: the interface shows it at its foot, to anyone.
+/// The administration reads the same.
 #[tokio::test]
-async fn the_version_of_a_server_is_for_its_administrators() {
+async fn the_version_of_a_server_is_public() {
     let (_, app, admin, _) =
         administered(fresh_app_state().await.with_edition("seedling", "9.8.7")).await;
     let xff = Addresses::new("10.97");
+    let (status, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(j["edition"], "seedling");
+    assert_eq!(j["version"], "9.8.7");
     let (status, j) = identity_request(
         &app,
         "GET",
@@ -5464,31 +5468,10 @@ async fn the_version_of_a_server_is_for_its_administrators() {
         serde_json::json!({ "edition": "seedling", "version": "9.8.7" })
     );
 
-    // Nowhere else: not in what the server says of itself before sign-in,
-    // not in its discovery document, not in the session of an account.
-    for uri in [
-        "/auth/server",
-        "/.well-known/openid-configuration",
-        "/auth/session",
-        "/health",
-    ] {
-        let (_, j) = identity_request(&app, "GET", uri, Some(&admin), &xff.next(), None).await;
-        assert!(!j.to_string().contains("9.8.7"), "{uri}: {j}");
-    }
-
     // A program that did not say what it is: the answer says so.
-    let (_, app, admin, _) = administered(fresh_app_state().await).await;
-    let (status, j) = identity_request(
-        &app,
-        "GET",
-        "/admin/server",
-        Some(&admin),
-        &xff.next(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(j, serde_json::json!({ "edition": null, "version": null }));
+    let (_, app, _, _) = administered(fresh_app_state().await).await;
+    let (_, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
+    assert!(j["edition"].is_null() && j["version"].is_null(), "{j}");
 }
 
 #[tokio::test]

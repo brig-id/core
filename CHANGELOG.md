@@ -27,9 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`GET /admin/server`**: the edition and the version of the program, as it
-  declared them with `AppState::with_edition` (`seedling`, `0.6.1`). For
-  administrators only: nothing a visitor can reach names a version.
+- **The edition and the version of the program**, as it declared them with
+  `AppState::with_edition` (`seedling`, `0.6.1`): public in
+  `GET /auth/server` (`edition`, `version`), and in `GET /admin/server`.
 - **Administration** (core#88). The role is on the account
   (`users.admin`). The first administrator is made with a one-time setup link
   on a server without account (`brigid_api::setup_link`), or, on a server that
