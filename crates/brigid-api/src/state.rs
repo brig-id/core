@@ -255,7 +255,7 @@ impl AppState {
     }
 
     /// The program built on this crate, and its version (`seedling`,
-    /// `0.6.1`): shown to the server's administrators, and to nobody else.
+    /// `0.6.1`): public, in `GET /auth/server`.
     #[must_use]
     pub fn with_edition(mut self, name: &str, version: &str) -> Self {
         self.edition = Some(Edition {

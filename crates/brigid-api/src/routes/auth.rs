@@ -90,6 +90,10 @@ pub struct ServerInfo {
     pub sign_up: bool,
     /// Who may create an account: `open`, `invitation` or `closed`.
     pub policy: SignupPolicy,
+    /// The program this server is (`seedling`), when it said so.
+    pub edition: Option<String>,
+    /// Its version: shown at the foot of the interface, to anyone.
+    pub version: Option<String>,
 }
 
 /// `GET /auth/server`
@@ -102,6 +106,8 @@ pub async fn server_info(State(state): State<Arc<AppState>>) -> Result<Json<Serv
     Ok(Json(ServerInfo {
         sign_up: policy == SignupPolicy::Open,
         policy,
+        edition: state.edition.as_ref().map(|e| e.name.clone()),
+        version: state.edition.as_ref().map(|e| e.version.clone()),
     }))
 }
 

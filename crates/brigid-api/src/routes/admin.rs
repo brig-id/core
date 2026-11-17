@@ -669,8 +669,8 @@ pub async fn revoke_invitation(
 
 // -- The server ----------------------------------------------------------------------
 
-/// What runs here, for those who administer it. A visitor is not told: the
-/// version of a sign-in server is not published to whoever asks.
+/// What runs here. The same is public in `GET /auth/server`; this answer
+/// stays for the administration, which asks it.
 #[derive(Debug, Serialize)]
 pub struct ServerView {
     /// The edition (`seedling`), when the program said which it is.
