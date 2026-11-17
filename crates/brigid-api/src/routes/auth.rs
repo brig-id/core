@@ -166,7 +166,7 @@ pub async fn register_begin(
         }
         None => generated_root_id(&state, &host).await?,
     };
-    let handle = format!("{}@{}", root_id.username, root_id.server);
+    let handle = passkey_name(&root_id.username, &root_id.server);
 
     let user_id = Uuid::new_v4();
     let (ccr, reg_state) = state
@@ -282,6 +282,14 @@ pub async fn register_finish(
 
 /// A free generated username on this server (ADR-003). A clash with an
 /// existing account is retried; a few in a row means something else is wrong.
+/// The name of the account in every passkey made for it: what a passkey
+/// manager shows next to the passkey. The same for the first passkey, those
+/// added later and the one made with the recovery code, so that a person
+/// sees one account, of one server: `swift-otter-4821@id.example.org`.
+pub(crate) fn passkey_name(username: &str, server: &str) -> String {
+    format!("{username}@{server}")
+}
+
 async fn generated_root_id(state: &AppState, host: &str) -> Result<RootId, ApiError> {
     for _ in 0..5 {
         let username = brigid_identity::generate_username().map_err(|e| internal!(e))?;
@@ -320,7 +328,11 @@ pub async fn add_credential_begin(
 
     let (ccr, reg_state) = state
         .webauthn
-        .begin_registration(user.id, &user.username, Some(exclude_credentials))
+        .begin_registration(
+            user.id,
+            &passkey_name(&user.username, &user.server),
+            Some(exclude_credentials),
+        )
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
