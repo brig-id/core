@@ -2434,6 +2434,60 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     assert!(j["last_used_at"].is_string());
 }
 
+/// Every passkey of an account carries the same name, the one its first
+/// passkey got: a passkey manager shows one account, of one server, and not
+/// `name@server` for one passkey and `name` for the next.
+#[tokio::test]
+async fn every_passkey_of_an_account_has_the_same_name() {
+    let app = build_router(make_state().await, &[]);
+    let xff = Addresses::new("10.93");
+    let name = "same-name@localhost";
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/register/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "username": name })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["challenge"]["publicKey"]["user"]["name"], name);
+
+    let mut key = new_key();
+    let cookie = sign_up_with(&app, name, None, &mut key, &xff)
+        .await
+        .unwrap();
+    let code = take_recovery_code(&app, &cookie, &xff).await;
+
+    // A passkey added from the account.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/begin",
+        Some(&cookie),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["challenge"]["publicKey"]["user"]["name"], name);
+    assert_eq!(j["challenge"]["publicKey"]["user"]["displayName"], name);
+
+    // The passkey the recovery code makes.
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/recovery/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["challenge"]["publicKey"]["user"]["name"], name);
+}
+
 /// A session begun to add a passkey can't be completed as a new account.
 #[tokio::test]
 async fn registration_sessions_finish_only_as_what_they_began() {

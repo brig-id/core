@@ -140,7 +140,11 @@ pub async fn begin(
     let exclude = existing.iter().map(|p| p.cred_id().clone()).collect();
     let (ccr, reg_state) = state
         .webauthn
-        .begin_registration(user.id, &user.username, Some(exclude))
+        .begin_registration(
+            user.id,
+            &crate::routes::auth::passkey_name(&user.username, &user.server),
+            Some(exclude),
+        )
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
