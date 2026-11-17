@@ -1,61 +1,41 @@
 version: 2
+
+# One pull request a week for everything this repository depends on, all
+# ecosystems together: Dependabot opens no other.
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+
 updates:
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    # A breaking release is its own piece of work, not part of the weekly
+    # update: it would hold every other update back.
     ignore:
-      # sha3 0.12 dropped the `digest::core_api::CoreProxy` impl (rewrote to a
-      # monolithic sponge-based struct), which breaks Hkdf<Sha3_256>/Hmac<Sha3_256>
-      # construction. No fix released upstream yet — see RustCrypto/hashes.
-      # Remove once hmac/hkdf regain compatibility with sha3 >=0.12.
+      # sha3 0.12 dropped the `digest::core_api::CoreProxy` impl, which breaks
+      # Hkdf<Sha3_256>/Hmac<Sha3_256>. Remove once hmac/hkdf follow.
       - dependency-name: "sha3"
         versions: [">=0.12.0"]
-    groups:
-      rustcrypto-traits:
-        # All RustCrypto crates that share digest/crypto-common/signature traits
-        # must move together — bumping one alone breaks the trait bounds of others.
-        patterns:
-          - "aes-gcm"
-          - "aes"
-          - "cipher"
-          - "crypto-common"
-          - "der"
-          - "digest"
-          - "ed25519"
-          - "ed25519-dalek"
-          - "hkdf"
-          - "hmac"
-          - "ml-dsa"
-          - "ml-kem"
-          - "module-lattice"
-          - "pkcs8"
-          - "secrecy"
-          - "sha3"
-          - "shake"
-          - "signature"
-          - "spki"
-          - "x25519-dalek"
-          - "zeroize"
-      jsonwebtoken-major:
-        # jsonwebtoken 9→10 is a major API rewrite (Validation, key types, errors)
-        # that requires coordinated changes in brigid-oidc.
-        patterns:
-          - "jsonwebtoken"
+      # p256 0.14 belongs to the RustCrypto release that moves digest,
+      # signature and the rest together.
+      - dependency-name: "p256"
+        versions: [">=0.14.0"]
+      # webauthn-rs 0.6 changes the server side of every ceremony; the
+      # server's tests follow it (brig-id/server-seedling).
+      - dependency-name: "webauthn-rs"
+        versions: [">=0.6.0"]
+      - dependency-name: "webauthn-rs-proto"
+        versions: [">=0.6.0"]
+      - dependency-name: "webauthn-authenticator-rs"
+        versions: [">=0.6.0"]
 
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-    groups:
-      github-actions:
-        patterns:
-          - "*"
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
