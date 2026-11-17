@@ -147,6 +147,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Every passkey of an account carries the same name** (`name@server`): a
+  passkey added later, or made with the recovery code, named the account
+  `name` alone, so a passkey manager showed two accounts.
+
 - `brigid-api` — `POST /auth/register/begin` refuses a username on another
   server (`alice@elsewhere.example`): an account's domain is this server's.
   The `server` claim of every token now comes from the server's own
