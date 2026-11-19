@@ -6,6 +6,7 @@
     "webauthn",
     "oidc",
     "api",
+    "server",
     "ui",
     "workspace",
     "ci",

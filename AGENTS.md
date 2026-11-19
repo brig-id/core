@@ -17,6 +17,8 @@ issues, pull requests. No exceptions.
 | `brigid-webauthn` | Passkey registration and authentication flows |
 | `brigid-oidc` | ID token issuance (EdDSA), PKCE, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
+| `brigid-server` | What every server edition runs: configuration, operator commands, startup, the embedded interface, metrics |
+| `brigid-ui-embed` | Build-time helper: embeds the built interface in an edition's executable |
 
 ## Roadmap & planning
 
@@ -120,6 +122,7 @@ Format: `type(scope): <emoji> description`
 | `webauthn` | `crates/brigid-webauthn` |
 | `oidc` | `crates/brigid-oidc` |
 | `api` | `crates/brigid-api` |
+| `server` | `crates/brigid-server`, `crates/brigid-ui-embed` |
 | `workspace` | Root `Cargo.toml`, workspace-level changes |
 | `ci` | `.github/workflows/` |
 | `deps` | Dependency bumps |

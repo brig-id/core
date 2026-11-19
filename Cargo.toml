@@ -5,6 +5,8 @@ members = [
     "crates/brigid-webauthn",
     "crates/brigid-oidc",
     "crates/brigid-api",
+    "crates/brigid-server",
+    "crates/brigid-ui-embed",
 ]
 resolver = "2"
 
