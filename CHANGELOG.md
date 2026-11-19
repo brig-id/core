@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`brigid-server`: the server every edition runs** (core#94). Configuration,
+  the operator commands (`rotate-key`, `rotate-oidc-key`, `client`, `admin`,
+  `signup`, `healthcheck`), startup, the embedded interface and the metrics
+  listener moved here from server-seedling, unchanged in behaviour. An
+  edition describes itself with `Edition` (name, version, interface, where
+  its configuration and key live) and calls `run`; it adds its own commands
+  next to `Command` (seedling: `init`). grove is built the same way.
+- **`brigid-ui-embed`**: the build-time half of the embedded interface, called
+  from an edition's `build.rs`.
+
 ### Changed
 
 - **Who may sign up is a policy kept in the database** (core#88): `open`,

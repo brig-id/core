@@ -1,0 +1,48 @@
+[package]
+name = "brigid-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "The brig·id server every edition runs: configuration, operator commands, startup, interface, metrics"
+
+[dependencies]
+brigid-api.workspace = true
+brigid-store.workspace = true
+brigid-identity.workspace = true
+brigid-webauthn.workspace = true
+brigid-oidc.workspace = true
+brigid-crypto.workspace = true
+
+# CLI + configuration
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+
+tokio.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# HTTP / TLS
+axum = "0.8"
+axum-server = { version = "0.9", features = ["tls-rustls"] }
+tower-http = { version = "0.7", features = ["set-header"] }
+# The embedded interface is compressed at build time (brigid-ui-embed); a
+# client that takes no compression gets it unpacked.
+flate2 = "1"
+# Only used to install a default process-wide `CryptoProvider` at startup —
+# see the call site in `run` for why this is needed.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+time.workspace = true
+# geteuid, and dropping root for a command typed on the machine (owner.rs).
+libc = "0.2"
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["test"] }
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
