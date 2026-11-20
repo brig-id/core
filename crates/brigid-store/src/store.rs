@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 use crate::{
     error::{Error, Result},
     model::{
-        Client, Credential, Decision, Grant, Identity, LinkKind, RecoveryStatus, StoredOidcKey,
-        User,
+        Client, ClientList, ClientPolicy, Credential, Decision, Grant, Identity, LinkKind,
+        RecoveryStatus, StoredOidcKey, User,
     },
 };
 
@@ -1335,6 +1335,7 @@ impl EncryptedStore {
             confidential,
             attributes: BTreeMap::new(),
             created_at: now_unix(),
+            document: None,
         };
         sqlx::query(
             "INSERT INTO clients (client_id, name, redirect_uris, secret_hash, created_at) \
@@ -1354,7 +1355,7 @@ impl EncryptedStore {
     pub async fn fetch_client(&self, client_id: &str) -> Result<Option<Client>> {
         let row = sqlx::query(
             "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
-             attributes, created_at FROM clients WHERE client_id = ?",
+             attributes, created_at, document FROM clients WHERE client_id = ?",
         )
         .bind(client_id)
         .fetch_optional(&self.pool)
@@ -1366,7 +1367,7 @@ impl EncryptedStore {
     pub async fn list_clients(&self) -> Result<Vec<Client>> {
         sqlx::query(
             "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
-             attributes, created_at FROM clients ORDER BY created_at, client_id",
+             attributes, created_at, document FROM clients ORDER BY created_at, client_id",
         )
         .fetch_all(&self.pool)
         .await?
@@ -1402,6 +1403,107 @@ impl EncryptedStore {
             .execute(&self.pool)
             .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// Keep the latest valid document of a client that describes itself
+    /// (protocol.md §6): created at its first use, replaced at each read.
+    /// What people chose and shared for it stays. A `client_id` that is a
+    /// registered client's is left alone (it cannot be a URL, but the store
+    /// does not rely on that).
+    pub async fn save_described_client(&self, client: &Client) -> Result<()> {
+        let Some(document) = &client.document else {
+            return Err(Error::InvalidClient(
+                "a described client needs its document",
+            ));
+        };
+        sqlx::query(
+            "INSERT INTO clients (client_id, name, redirect_uris, secret_hash, created_at, \
+             attributes, document) VALUES (?, ?, ?, NULL, ?, ?, ?) \
+             ON CONFLICT (client_id) DO UPDATE SET name = excluded.name, \
+             redirect_uris = excluded.redirect_uris, attributes = excluded.attributes, \
+             document = excluded.document WHERE clients.document IS NOT NULL",
+        )
+        .bind(&client.client_id)
+        .bind(&client.name)
+        .bind(serde_json::to_string(&client.redirect_uris).map_err(|_| Error::InvalidBlob)?)
+        .bind(client.created_at)
+        .bind(serde_json::to_string(&client.attributes).map_err(|_| Error::InvalidBlob)?)
+        .bind(serde_json::to_string(document).map_err(|_| Error::InvalidBlob)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Which clients that describe themselves are accepted. `open` until the
+    /// operator says otherwise.
+    pub async fn client_policy(&self) -> Result<ClientPolicy> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE name = 'clients'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value
+            .as_deref()
+            .and_then(ClientPolicy::parse)
+            .unwrap_or(ClientPolicy::Open))
+    }
+
+    pub async fn set_client_policy(&self, policy: ClientPolicy) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (name, value) VALUES ('clients', ?) \
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+        )
+        .bind(policy.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The operator's list `client_id` is on, if any.
+    pub async fn client_list(&self, client_id: &str) -> Result<Option<ClientList>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT list FROM client_lists WHERE client_id = ?")
+                .bind(client_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value.as_deref().and_then(ClientList::parse))
+    }
+
+    /// Put `client_id` on a list (it leaves the other one), or on none.
+    /// Returns whether something changed.
+    pub async fn set_client_list(&self, client_id: &str, list: Option<ClientList>) -> Result<bool> {
+        let done = match list {
+            Some(list) => {
+                sqlx::query(
+                    "INSERT INTO client_lists (client_id, list, created_at) VALUES (?, ?, ?) \
+                     ON CONFLICT (client_id) DO UPDATE SET list = excluded.list, \
+                     created_at = excluded.created_at WHERE client_lists.list != excluded.list",
+                )
+                .bind(client_id)
+                .bind(list.as_str())
+                .bind(now_unix())
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query("DELETE FROM client_lists WHERE client_id = ?")
+                    .bind(client_id)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Both lists, by `client_id`.
+    pub async fn client_lists(&self) -> Result<Vec<(String, ClientList)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT client_id, list FROM client_lists ORDER BY list, client_id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, list)| ClientList::parse(&list).map(|list| (id, list)))
+            .collect())
     }
 
     /// Whether `secret` is the secret of confidential client `client_id`.
@@ -1673,6 +1775,10 @@ fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Client> {
         attributes: serde_json::from_str(&row.try_get::<String, _>("attributes")?)
             .map_err(|_| Error::InvalidBlob)?,
         created_at: row.try_get("created_at")?,
+        document: row
+            .try_get::<Option<String>, _>("document")?
+            .map(|document| serde_json::from_str(&document).map_err(|_| Error::InvalidBlob))
+            .transpose()?,
     })
 }
 
@@ -3341,5 +3447,115 @@ mod tests {
         );
         // The application itself is not the account's: it stays.
         assert!(store.fetch_client(&site.client_id).await.unwrap().is_some());
+    }
+
+    fn described(name: &str, fetched_at: i64) -> Client {
+        Client {
+            client_id: "https://shop.example/oauth-client-metadata.json".into(),
+            name: name.into(),
+            redirect_uris: vec!["https://shop.example/cb".into()],
+            confidential: false,
+            attributes: BTreeMap::from([(Attribute::Email, Need::Optional)]),
+            created_at: 100,
+            document: Some(crate::model::ClientDocument {
+                application_type: crate::model::ApplicationType::Web,
+                auth: crate::model::ClientAuth::None,
+                jwks: None,
+                jwks_uri: None,
+                client_uri: None,
+                logo_uri: Some("https://shop.example/logo.png".into()),
+                fetched_at,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_described_client_is_kept_and_replaced_by_its_latest_document() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        store
+            .save_described_client(&described("Shop", 1))
+            .await
+            .unwrap();
+        let kept = store
+            .fetch_client("https://shop.example/oauth-client-metadata.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(kept.described());
+        assert_eq!(kept, described("Shop", 1));
+
+        store
+            .save_described_client(&described("Shop 2", 2))
+            .await
+            .unwrap();
+        let kept = store
+            .fetch_client("https://shop.example/oauth-client-metadata.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.name, "Shop 2");
+        assert_eq!(kept.document.unwrap().fetched_at, 2);
+        assert_eq!(store.list_clients().await.unwrap().len(), 1);
+
+        // A registered client is never overwritten by a document.
+        let (site, _) = store
+            .create_client("Registered", &["https://a.example/cb".into()], false)
+            .await
+            .unwrap();
+        let mut fake = described("Fake", 3);
+        fake.client_id = site.client_id.clone();
+        store.save_described_client(&fake).await.unwrap();
+        let site = store.fetch_client(&site.client_id).await.unwrap().unwrap();
+        assert_eq!(site.name, "Registered");
+        assert!(!site.described());
+    }
+
+    #[tokio::test]
+    async fn the_client_policy_is_open_until_set_and_lists_are_exclusive() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let url = "https://shop.example/oauth-client-metadata.json";
+        assert_eq!(store.client_policy().await.unwrap(), ClientPolicy::Open);
+        for policy in [
+            ClientPolicy::Listed,
+            ClientPolicy::Registered,
+            ClientPolicy::Open,
+        ] {
+            store.set_client_policy(policy).await.unwrap();
+            assert_eq!(store.client_policy().await.unwrap(), policy);
+        }
+        assert_eq!(store.client_list(url).await.unwrap(), None);
+        assert!(
+            store
+                .set_client_list(url, Some(ClientList::Accepted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_client_list(url, Some(ClientList::Accepted))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_client_list(url, Some(ClientList::Refused))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.client_list(url).await.unwrap(),
+            Some(ClientList::Refused)
+        );
+        assert_eq!(
+            store.client_lists().await.unwrap(),
+            vec![(url.to_owned(), ClientList::Refused)]
+        );
+        assert!(store.set_client_list(url, None).await.unwrap());
+        assert!(!store.set_client_list(url, None).await.unwrap());
+        assert!(store.client_lists().await.unwrap().is_empty());
     }
 }

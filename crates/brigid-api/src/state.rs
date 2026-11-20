@@ -8,7 +8,7 @@ use std::{
 
 use brigid_identity::{Attribute, Attributes, Need};
 use brigid_oidc::OidcSigningKey;
-use brigid_store::EncryptedStore;
+use brigid_store::{Client, ClientList, ClientPolicy, EncryptedStore};
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
@@ -199,6 +199,9 @@ pub struct AppState {
     /// overwrites the header. If the API is reachable directly, an attacker
     /// can forge the header to bypass rate limits — keep this `false`.
     pub trust_forwarded_for: bool,
+    /// What reads the documents of clients that describe themselves, and
+    /// what was read of them lately (protocol.md §6).
+    pub described: Arc<crate::described::Described>,
 }
 
 /// The program a server is, as it names itself: an edition and its version.
@@ -236,6 +239,68 @@ impl AppState {
             // production deployment binary (`server-leaf`) must opt-in when
             // Caddy (or another trusted proxy) terminates the public TLS edge.
             trust_forwarded_for: false,
+            described: Arc::new(crate::described::Described::new(default_fetcher())),
+        }
+    }
+
+    /// What reads client documents: tests give their own.
+    #[must_use]
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn crate::described::Fetch>) -> Self {
+        self.described = Arc::new(crate::described::Described::new(fetcher));
+        self
+    }
+
+    /// The client `client_id`: registered on the machine, or describing
+    /// itself at that URL and accepted by the operator's policy. `None` when
+    /// it is neither, or its document cannot be read and was never read.
+    ///
+    /// A document read is kept in the store: the identities chosen for the
+    /// client and what people shared with it point to it, and it serves
+    /// while a new read fails.
+    pub async fn client(&self, client_id: &str) -> Result<Option<Client>, crate::error::ApiError> {
+        let internal = |e: brigid_store::Error| crate::error::ApiError::Internal(Box::new(e));
+        let Some(url) = crate::described::client_id_url(client_id) else {
+            // A registered client; a described one is never read by this
+            // way, so that the policy and the lists always apply.
+            return Ok(self
+                .store
+                .fetch_client(client_id)
+                .await
+                .map_err(internal)?
+                .filter(|client| !client.described()));
+        };
+        let list = self.store.client_list(client_id).await.map_err(internal)?;
+        let accepted = match self.store.client_policy().await.map_err(internal)? {
+            ClientPolicy::Registered => false,
+            ClientPolicy::Open => list != Some(ClientList::Refused),
+            ClientPolicy::Listed => list == Some(ClientList::Accepted),
+        };
+        if !accepted {
+            return Ok(None);
+        }
+        let now = helpers4::time::unix_now().map_or(0, |secs| secs as i64);
+        match self.described.client(&url, now).await {
+            Ok(mut client) => {
+                // The first sign-in's date stays the creation date.
+                if let Some(known) = self.store.fetch_client(client_id).await.map_err(internal)? {
+                    client.created_at = known.created_at;
+                }
+                self.store
+                    .save_described_client(&client)
+                    .await
+                    .map_err(internal)?;
+                Ok(Some(client))
+            }
+            Err(reason) => {
+                tracing::info!(client_id, %reason, "client document not usable");
+                // The last valid document, while a new read fails.
+                Ok(self
+                    .store
+                    .fetch_client(client_id)
+                    .await
+                    .map_err(internal)?
+                    .filter(Client::described))
+            }
         }
     }
 
@@ -384,6 +449,26 @@ impl AppState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, v| v.created_at > cutoff);
+    }
+}
+
+/// Reads documents over HTTPS; if the TLS backend cannot start, a fetcher
+/// that reads nothing, so that registered clients keep working.
+fn default_fetcher() -> Arc<dyn crate::described::Fetch> {
+    match crate::described::HttpFetcher::new() {
+        Ok(fetcher) => Arc::new(fetcher),
+        Err(e) => {
+            tracing::error!(error = %e, "cannot read client documents");
+            Arc::new(Unreachable)
+        }
+    }
+}
+
+struct Unreachable;
+
+impl crate::described::Fetch for Unreachable {
+    fn fetch<'a>(&'a self, _: &'a Url) -> crate::described::FetchFuture<'a> {
+        Box::pin(async { Err("this server cannot read client documents".into()) })
     }
 }
 

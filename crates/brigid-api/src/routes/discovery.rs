@@ -8,8 +8,18 @@ use brigid_oidc::{build_jwks, build_openid_configuration};
 use crate::{error::ApiError, state::AppState};
 
 /// `GET /.well-known/openid-configuration`
-pub async fn openid_configuration(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(build_openid_configuration(&state.base_url))
+pub async fn openid_configuration(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let policy = state
+        .store
+        .client_policy()
+        .await
+        .map_err(|e| ApiError::Internal(Box::new(e)))?;
+    Ok(Json(build_openid_configuration(
+        &state.base_url,
+        policy != brigid_store::ClientPolicy::Registered,
+    )))
 }
 
 /// `GET /.well-known/jwks.json`

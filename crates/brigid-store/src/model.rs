@@ -80,6 +80,120 @@ pub struct Client {
     pub attributes: BTreeMap<Attribute, Need>,
     /// Unix seconds.
     pub created_at: i64,
+    /// For a client that describes itself (its `client_id` is the URL of a
+    /// document it publishes, protocol.md §6): what the document says besides
+    /// the fields above. `None` for a client registered on the machine.
+    pub document: Option<ClientDocument>,
+}
+
+impl Client {
+    /// Whether the client describes itself in a document it publishes,
+    /// instead of being registered on the machine.
+    pub fn described(&self) -> bool {
+        self.document.is_some()
+    }
+}
+
+/// What the server keeps of a client's own document (protocol.md §6),
+/// besides its name, redirect URIs and attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDocument {
+    /// `web` (runs on a server or in a browser page) or `native` (a desktop
+    /// or mobile application, RFC 8252).
+    pub application_type: ApplicationType,
+    /// How it authenticates at the token endpoint.
+    pub auth: ClientAuth,
+    /// Its public keys, given in the document (`jwks`), for `private_key_jwt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<serde_json::Value>,
+    /// Where its public keys are published (`jwks_uri`), for `private_key_jwt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+    /// Its home page, as it declares it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_uri: Option<String>,
+    /// Its logo, as it declares it: shown only for a client the operator
+    /// accepted, since anyone can declare anyone's logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
+    /// When the server last read a valid document (Unix seconds).
+    pub fetched_at: i64,
+}
+
+/// The kind of a client that describes itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationType {
+    Web,
+    Native,
+}
+
+/// How a client that describes itself authenticates at the token endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuth {
+    /// It does not: PKCE alone ties it to the code (a page in a browser, a
+    /// native application).
+    None,
+    /// A JWT signed by one of its keys (RFC 7523).
+    PrivateKeyJwt,
+}
+
+/// Which clients that describe themselves this server accepts
+/// (protocol.md §6, the operator's policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientPolicy {
+    /// None: only the clients registered on the machine.
+    Registered,
+    /// Any, except those on the list of refused clients. The default.
+    Open,
+    /// Only those on the list of accepted clients.
+    Listed,
+}
+
+impl ClientPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::Open => "open",
+            Self::Listed => "listed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "registered" => Some(Self::Registered),
+            "open" => Some(Self::Open),
+            "listed" => Some(Self::Listed),
+            _ => None,
+        }
+    }
+}
+
+/// A list of the operator's, for clients that describe themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientList {
+    Accepted,
+    Refused,
+}
+
+impl ClientList {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "accepted" => Some(Self::Accepted),
+            "refused" => Some(Self::Refused),
+            _ => None,
+        }
+    }
 }
 
 /// What a person decided about one attribute for one relying party.

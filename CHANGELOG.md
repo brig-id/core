@@ -20,6 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   next to `Command` (seedling: `init`). grove is built the same way.
 - **`brigid-ui-embed`**: the build-time half of the embedded interface, called
   from an edition's `build.rs`.
+- **Sites that describe themselves** (protocol.md §6, OAuth Client ID
+  Metadata Document): a `client_id` that is an HTTPS URL names a JSON
+  document the site publishes (name, redirect URIs, how it authenticates,
+  `brigid_attributes`); any server that allows it signs people in to it with
+  no registration. `brigid_api::described` reads it (https and a domain name
+  only, special-use addresses refused on the address connected to, no
+  redirect, no proxy, 5 KiB, 10 s, cached 5 min to a day, errors never
+  cached) and checks it (redirect URIs on the `client_id`'s origin; for a
+  native application, RFC 8252: loopback with any port, the reversed-host
+  scheme, or its own https origin). The server keeps the latest valid
+  document in `clients.document` (migration 0004), and uses it while a new
+  read fails.
+- **`private_key_jwt`** (RFC 7523) for those sites: an assertion signed with
+  EdDSA or ES256 by a key of the document (`jwks` or `jwks_uri`), for the
+  issuer or the token endpoint, valid at most ten minutes, `jti` used once.
+  A site that declares keys cannot fall back to PKCE alone; none of them has
+  a secret.
+- **The operator's policy for those sites**: `open` (the default: any, except
+  the refused ones), `listed` (only the accepted ones) or `registered` (none),
+  kept in the database with two lists (`EncryptedStore::set_client_policy`,
+  `set_client_list`); commands `client policy`, `client accept`,
+  `client refuse`, `client unlist`. Discovery says
+  `client_id_metadata_document_supported` (and `private_key_jwt`).
+- The linking page gets the host of a site that describes itself
+  (`client.host`), shown first since anyone can declare any name, and its
+  logo (`client.logo`) only for a site the operator accepted.
 
 ### Changed
 
