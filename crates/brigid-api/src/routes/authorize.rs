@@ -69,15 +69,17 @@ async fn begin(state: &AppState, params: &HashMap<String, String>) -> Response {
     // Until the client and its redirect URI are known to be registered,
     // nothing is sent anywhere but to this server's own page.
     let client = match param("client_id") {
-        Some(id) => state.store.fetch_client(id).await,
+        Some(id) => state.client(id).await,
         None => Ok(None),
     };
     let client = match client {
         Ok(Some(client)) => client,
         Ok(None) => return see_other(&format!("{UI_PATH}?error=unknown_client")),
-        Err(e) => return ApiError::Internal(Box::new(e)).into_response(),
+        Err(e) => return e.into_response(),
     };
-    let Some(redirect_uri) = param("redirect_uri").filter(|uri| registered(&client, uri)) else {
+    let Some(redirect_uri) =
+        param("redirect_uri").filter(|uri| crate::described::accepts_redirect(&client, uri))
+    else {
         return see_other(&format!("{UI_PATH}?error=invalid_redirect_uri"));
     };
 
@@ -216,7 +218,39 @@ pub struct AskedView {
 
 #[derive(Debug, Serialize)]
 pub struct ClientView {
+    /// The name it was registered with, or the one its document declares.
     pub name: String,
+    /// For a client that describes itself: the host of its `client_id`,
+    /// shown first and always, since anyone can declare any name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Its logo, only for a client the operator accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+}
+
+impl ClientView {
+    pub(crate) async fn of(state: &AppState, client: Client) -> Result<Self, ApiError> {
+        let host = client
+            .document
+            .is_some()
+            .then(|| url::Url::parse(&client.client_id).ok())
+            .flatten()
+            .and_then(|url| url.host_str().map(str::to_owned));
+        let trusted = client.described()
+            && state
+                .store
+                .client_list(&client.client_id)
+                .await
+                .map_err(|e| internal!(e))?
+                == Some(brigid_store::ClientList::Accepted);
+        let logo = client.document.and_then(|d| d.logo_uri).filter(|_| trusted);
+        Ok(Self {
+            name: client.name,
+            host,
+            logo,
+        })
+    }
 }
 
 /// `GET /auth/authorize/{request}`
@@ -235,7 +269,7 @@ pub async fn request(
     let session = AccountSession::from_headers(&state, &headers).await?;
 
     let mut view = RequestView {
-        client: ClientView { name: client.name },
+        client: ClientView::of(&state, client).await?,
         signed_in: session.is_some(),
         must_sign_in: must_sign_in(&pending, session.as_ref()),
         silent: pending.prompt == Prompt::None,
@@ -600,12 +634,6 @@ fn parse_prompt(value: Option<&str>) -> Option<Prompt> {
     } else {
         Prompt::Default
     })
-}
-
-/// Exact comparison with the registered redirect URIs: no prefix, no
-/// normalisation, no wildcard.
-fn registered(client: &Client, redirect_uri: &str) -> bool {
-    client.redirect_uris.iter().any(|uri| uri == redirect_uri)
 }
 
 /// The relying party's redirect URI with an OAuth error. `iss` lets the

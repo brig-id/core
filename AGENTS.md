@@ -53,6 +53,11 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
   party only if its registration lets it ask, the request asks, and the person accepted the
   value the identity has now (`standing` in `brigid-api/src/routes/authorize.rs`). Pending
   requests and codes are held in memory with a TTL and a cap.
+- **Sites that describe themselves** (`brigid-api/src/described.rs`) — the server fetches
+  a document at a URL anyone chooses: keep every rule of the module (https and a domain
+  name, the resolver that drops special-use addresses, no redirect, no proxy, 5 KiB, 10 s,
+  errors never cached). Such a site has no secret: `private_key_jwt` (EdDSA or ES256, `jti`
+  once) or PKCE alone. The linking page shows its host, never only its declared name.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
   (`default-src 'self'`, no `unsafe-inline`).
 - **Rate limiting** — per client IP via `tower-governor`: the WebAuthn ceremonies

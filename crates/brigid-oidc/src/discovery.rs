@@ -41,6 +41,13 @@ pub struct OpenIDConfiguration {
     pub claims_supported: Vec<&'static str>,
     /// The authorization response names its issuer (RFC 9207).
     pub authorization_response_iss_parameter_supported: bool,
+    /// Algorithms of the assertions of `private_key_jwt` (clients that
+    /// describe themselves and publish keys).
+    pub token_endpoint_auth_signing_alg_values_supported: Vec<&'static str>,
+    /// A `client_id` may be the URL of a document the client publishes
+    /// (draft-ietf-oauth-client-id-metadata-document): `false` when the
+    /// operator accepts registered clients only.
+    pub client_id_metadata_document_supported: bool,
 }
 
 /// Build a JWKS from one or more signing keys.
@@ -63,7 +70,7 @@ pub fn build_jwks(keys: &[&OidcSigningKey]) -> JwkSet {
 }
 
 /// Build the `.well-known/openid-configuration` response for `base_url`.
-pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
+pub fn build_openid_configuration(base_url: &Url, described_clients: bool) -> OpenIDConfiguration {
     let base = base_url.as_str().trim_end_matches('/');
     OpenIDConfiguration {
         issuer: base.to_string(),
@@ -83,6 +90,7 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
         token_endpoint_auth_methods_supported: vec![
             "client_secret_basic",
             "client_secret_post",
+            "private_key_jwt",
             "none",
         ],
         code_challenge_methods_supported: vec!["S256"],
@@ -104,6 +112,8 @@ pub fn build_openid_configuration(base_url: &Url) -> OpenIDConfiguration {
             "zoneinfo",
         ],
         authorization_response_iss_parameter_supported: true,
+        token_endpoint_auth_signing_alg_values_supported: vec!["EdDSA", "ES256"],
+        client_id_metadata_document_supported: described_clients,
     }
 }
 
@@ -145,7 +155,7 @@ mod tests {
     #[test]
     fn openid_configuration_valid_json() {
         let base_url = Url::parse("https://example.com").unwrap();
-        let config = build_openid_configuration(&base_url);
+        let config = build_openid_configuration(&base_url, true);
         let json = serde_json::to_string(&config).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -194,7 +204,7 @@ mod tests {
     #[test]
     fn openid_configuration_trailing_slash() {
         let base_url = Url::parse("https://example.com/").unwrap();
-        let config = build_openid_configuration(&base_url);
+        let config = build_openid_configuration(&base_url, true);
         // Must not double-slash
         assert!(!config.jwks_uri.contains("//well-known"));
         assert_eq!(config.issuer, "https://example.com");

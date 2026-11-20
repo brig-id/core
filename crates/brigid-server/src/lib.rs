@@ -40,7 +40,7 @@ use brigid_api::{AppState, build_router};
 use brigid_crypto::MasterKey;
 use brigid_identity::{Attribute, Need};
 use brigid_oidc::OidcSigningKey;
-use brigid_store::EncryptedStore;
+use brigid_store::{ClientList, ClientPolicy, EncryptedStore};
 use brigid_webauthn::WebauthnService;
 
 /// What makes an executable one edition of the server.
@@ -181,6 +181,32 @@ pub enum ClientCommand {
     /// server, and the identity each person chose for it is forgotten.
     Remove {
         /// The `client_id` printed by `add` and `list`.
+        client_id: String,
+    },
+    /// Say which sites that describe themselves (their `client_id` is the
+    /// URL of a document they publish) may sign people in, with no
+    /// registration: `open` (any, except the refused ones; the default),
+    /// `listed` (only the accepted ones) or `registered` (none: only the
+    /// sites added here). Without a value, prints the current one and the
+    /// lists.
+    Policy {
+        /// `open`, `listed` or `registered`.
+        policy: Option<String>,
+    },
+    /// Accept a site that describes itself: under `listed`, only accepted
+    /// sites sign people in; an accepted site's logo is shown.
+    Accept {
+        /// The site's `client_id`: the URL of its document.
+        client_id: String,
+    },
+    /// Refuse a site that describes itself, whatever the policy.
+    Refuse {
+        /// The site's `client_id`: the URL of its document.
+        client_id: String,
+    },
+    /// Take a site off the accepted or refused list.
+    Unlist {
+        /// The site's `client_id`: the URL of its document.
         client_id: String,
     },
 }
@@ -583,10 +609,11 @@ async fn client_command(edition: &Edition, db: &config::DatabaseConfig, action: 
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
                     client.client_id,
-                    if client.confidential {
-                        "confidential"
-                    } else {
-                        "public"
+                    match (client.described(), client.confidential) {
+                        (true, true) => "described, signs",
+                        (true, false) => "described, public",
+                        (false, true) => "confidential",
+                        (false, false) => "public",
                     },
                     client.name,
                     client.redirect_uris.join(" "),
@@ -596,6 +623,39 @@ async fn client_command(edition: &Edition, db: &config::DatabaseConfig, action: 
             if clients.is_empty() {
                 eprintln!("No site is registered.");
             }
+        }
+        ClientCommand::Policy { policy } => {
+            if let Some(policy) = policy {
+                let policy = ClientPolicy::parse(&policy).unwrap_or_else(|| {
+                    fail("The policy is open, listed or registered.");
+                });
+                store
+                    .set_client_policy(policy)
+                    .await
+                    .expect("failed to record the policy");
+                eprintln!("✓ Sites that describe themselves: {}.", policy.as_str());
+            }
+            let policy = store
+                .client_policy()
+                .await
+                .expect("failed to read the policy");
+            println!("policy={}", policy.as_str());
+            for (client_id, list) in store
+                .client_lists()
+                .await
+                .expect("failed to read the lists")
+            {
+                println!("{}={client_id}", list.as_str());
+            }
+        }
+        ClientCommand::Accept { client_id } => {
+            list_client(&store, &client_id, Some(ClientList::Accepted)).await;
+        }
+        ClientCommand::Refuse { client_id } => {
+            list_client(&store, &client_id, Some(ClientList::Refused)).await;
+        }
+        ClientCommand::Unlist { client_id } => {
+            list_client(&store, &client_id, None).await;
         }
         ClientCommand::Remove { client_id } => {
             let existed = store
@@ -609,6 +669,23 @@ async fn client_command(edition: &Edition, db: &config::DatabaseConfig, action: 
                 std::process::exit(2);
             }
         }
+    }
+}
+
+/// Puts a site that describes itself on a list, or on none.
+async fn list_client(store: &EncryptedStore, client_id: &str, list: Option<ClientList>) {
+    if brigid_api::described::client_id_url(client_id).is_none() {
+        fail(&format!(
+            "{client_id} is not the URL of a client document (https, a domain, a path)."
+        ));
+    }
+    store
+        .set_client_list(client_id, list)
+        .await
+        .expect("failed to record the list");
+    match list {
+        Some(list) => eprintln!("✓ {client_id} is {}.", list.as_str()),
+        None => eprintln!("✓ {client_id} is on no list."),
     }
 }
 

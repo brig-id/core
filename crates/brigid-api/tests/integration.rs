@@ -5644,3 +5644,383 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
     // The newest first.
     assert_eq!(log[0]["action"], "account.delete");
 }
+
+// ---------------------------------------------------------------------------
+// Clients that describe themselves (protocol.md §6)
+// ---------------------------------------------------------------------------
+
+const DESCRIBED: &str = "https://shop.example/oauth-client-metadata.json";
+
+/// Serves client documents from memory and counts the reads.
+struct Documents {
+    documents: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl Documents {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            documents: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn publish(&self, url: &str, document: serde_json::Value) {
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(url.to_owned(), serde_json::to_vec(&document).unwrap());
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl brigid_api::described::Fetch for Documents {
+    fn fetch<'a>(&'a self, url: &'a Url) -> brigid_api::described::FetchFuture<'a> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let found = self.documents.lock().unwrap().get(url.as_str()).cloned();
+        Box::pin(async move {
+            found
+                .map(|body| brigid_api::described::Fetched {
+                    body,
+                    max_age: None,
+                })
+                .ok_or_else(|| format!("{url}: 404"))
+        })
+    }
+}
+
+fn shop_document(extra: serde_json::Value) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "client_id": DESCRIBED,
+        "client_name": "Example Shop",
+        "logo_uri": "https://shop.example/logo.png",
+        "redirect_uris": [REDIRECT],
+        "token_endpoint_auth_method": "none",
+        "brigid_attributes": { "email": "optional" },
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        document[k] = v.clone();
+    }
+    document
+}
+
+async fn state_reading(documents: &Arc<Documents>) -> Arc<AppState> {
+    let state = fresh_app_state()
+        .await
+        .with_fetcher(Arc::clone(documents) as Arc<dyn brigid_api::described::Fetch>);
+    state
+        .store
+        .set_signup_policy(brigid_store::SignupPolicy::Open)
+        .await
+        .unwrap();
+    Arc::new(state)
+}
+
+fn encoded(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+#[tokio::test]
+async fn a_site_that_describes_itself_signs_people_in_with_no_registration() {
+    let documents = Documents::new();
+    documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
+    let state = state_reading(&documents).await;
+    let app = build_router(Arc::clone(&state), &[]);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let discovery = response_body_json(resp.into_body()).await;
+    assert_eq!(discovery["client_id_metadata_document_supported"], true);
+
+    let (cookie, _, identities) = signed_in_account(&app, "cimd@localhost", "10.70.1").await;
+    let id = begin_authorization(&app, &encoded(DESCRIBED), "", "10.70.2.1").await;
+    assert_eq!(documents.reads(), 1);
+
+    // The page shows the host first; the logo is not shown for a site the
+    // operator did not accept.
+    let (status, view) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{id}"),
+        Some(&cookie),
+        "10.70.2.2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["client"]["host"], "shop.example");
+    assert_eq!(view["client"]["name"], "Example Shop");
+    assert!(view["client"].get("logo").is_none());
+
+    let code = approve(&app, &id, &cookie, identities[0], "10.70.2.3").await;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+        ("client_id", DESCRIBED),
+    ];
+    let (status, _, j) = token_request(&app, &form, None, "10.70.2.4").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let claims = verified_claims(&state, j["id_token"].as_str().unwrap());
+    assert_eq!(claims["aud"], DESCRIBED);
+
+    // The document was read once: the token endpoint used the cache.
+    assert_eq!(documents.reads(), 1);
+    // The store keeps it, as a client that describes itself.
+    let kept = state.store.fetch_client(DESCRIBED).await.unwrap().unwrap();
+    assert!(kept.described());
+
+    // A secret is no way in for a client that has none.
+    let id = begin_authorization(&app, &encoded(DESCRIBED), "", "10.70.3.1").await;
+    let code = approve(&app, &id, &cookie, identities[0], "10.70.3.2").await;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, _) = token_request(&app, &form, Some((DESCRIBED, "guess")), "10.70.3.3").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_operator_decides_which_sites_that_describe_themselves_are_accepted() {
+    use brigid_store::{ClientList, ClientPolicy};
+    let documents = Documents::new();
+    documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
+    let state = state_reading(&documents).await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let query = authorize_query(&encoded(DESCRIBED), "");
+
+    // registered: no site that describes itself, and discovery says so.
+    state
+        .store
+        .set_client_policy(ClientPolicy::Registered)
+        .await
+        .unwrap();
+    assert_eq!(
+        authorize(&app, &query, "10.71.1.1").await,
+        "/continue/?error=unknown_client"
+    );
+    assert_eq!(documents.reads(), 0, "nothing is read for a refused site");
+
+    // listed: only the accepted ones, whose logo is shown.
+    state
+        .store
+        .set_client_policy(ClientPolicy::Listed)
+        .await
+        .unwrap();
+    assert_eq!(
+        authorize(&app, &query, "10.71.2.1").await,
+        "/continue/?error=unknown_client"
+    );
+    state
+        .store
+        .set_client_list(DESCRIBED, Some(ClientList::Accepted))
+        .await
+        .unwrap();
+    let (cookie, _, _) = signed_in_account(&app, "listed@localhost", "10.71.3").await;
+    let id = begin_authorization(&app, &encoded(DESCRIBED), "", "10.71.4.1").await;
+    let (_, view) = identity_request(
+        &app,
+        "GET",
+        &format!("/auth/authorize/{id}"),
+        Some(&cookie),
+        "10.71.4.2",
+        None,
+    )
+    .await;
+    assert_eq!(view["client"]["logo"], "https://shop.example/logo.png");
+
+    // open: any, except the refused ones.
+    state
+        .store
+        .set_client_policy(ClientPolicy::Open)
+        .await
+        .unwrap();
+    state
+        .store
+        .set_client_list(DESCRIBED, Some(ClientList::Refused))
+        .await
+        .unwrap();
+    assert_eq!(
+        authorize(&app, &query, "10.71.5.1").await,
+        "/continue/?error=unknown_client"
+    );
+    state.store.set_client_list(DESCRIBED, None).await.unwrap();
+    assert!(
+        authorize(&app, &query, "10.71.5.2")
+            .await
+            .starts_with("/continue/?request=")
+    );
+}
+
+#[tokio::test]
+async fn a_document_that_is_missing_or_wrong_signs_nobody_in() {
+    let documents = Documents::new();
+    let state = state_reading(&documents).await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let query = authorize_query(&encoded(DESCRIBED), "");
+    // Nothing published.
+    assert_eq!(
+        authorize(&app, &query, "10.72.1.1").await,
+        "/continue/?error=unknown_client"
+    );
+    // A redirect URI on another site.
+    documents.publish(
+        DESCRIBED,
+        shop_document(serde_json::json!({ "redirect_uris": ["https://evil.example/cb"] })),
+    );
+    assert_eq!(
+        authorize(&app, &query, "10.72.1.2").await,
+        "/continue/?error=unknown_client"
+    );
+    // Valid, but the request names a redirect URI it does not list.
+    documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
+    let other = query.replace("shop.example%2Fcb", "shop.example%2Fother");
+    assert_eq!(
+        authorize(&app, &other, "10.72.1.3").await,
+        "/continue/?error=invalid_redirect_uri"
+    );
+    // An error is never cached: once valid, it works.
+    assert!(
+        authorize(&app, &query, "10.72.1.4")
+            .await
+            .starts_with("/continue/?request=")
+    );
+}
+
+/// A client assertion (RFC 7523) signed by `key`.
+fn assertion(key: &ed25519_dalek::SigningKey, claims: serde_json::Value) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use ed25519_dalek::Signer;
+    let header = serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": "k1" });
+    let part =
+        |v: &serde_json::Value| Base64UrlUnpadded::encode_string(&serde_json::to_vec(v).unwrap());
+    let input = format!("{}.{}", part(&header), part(&claims));
+    let signature = key.sign(input.as_bytes());
+    format!(
+        "{input}.{}",
+        Base64UrlUnpadded::encode_string(&signature.to_bytes())
+    )
+}
+
+#[tokio::test]
+async fn a_site_with_keys_proves_itself_with_a_signed_assertion_used_once() {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+    let jwk = serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": "k1",
+        "use": "sig",
+        "x": Base64UrlUnpadded::encode_string(key.verifying_key().as_bytes()),
+    });
+    let documents = Documents::new();
+    documents.publish(
+        DESCRIBED,
+        shop_document(serde_json::json!({
+            "token_endpoint_auth_method": "private_key_jwt",
+            "jwks": { "keys": [jwk] },
+        })),
+    );
+    let state = state_reading(&documents).await;
+    let app = build_router(Arc::clone(&state), &[]);
+    let (cookie, _, identities) = signed_in_account(&app, "keys@localhost", "10.73.1").await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = |jti: &str, aud: &str, exp: i64| {
+        serde_json::json!({
+            "iss": DESCRIBED, "sub": DESCRIBED, "aud": aud, "exp": exp, "jti": jti,
+        })
+    };
+    let token = "http://localhost:8080/token";
+    let code_for = |n: u8| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        let identity = identities[0];
+        async move {
+            let id =
+                begin_authorization(&app, &encoded(DESCRIBED), "", &format!("10.73.{n}.1")).await;
+            approve(&app, &id, &cookie, identity, &format!("10.73.{n}.2")).await
+        }
+    };
+    let exchange = |code: String, assertion: Option<String>, n: u8| {
+        let app = app.clone();
+        async move {
+            let mut form = vec![
+                ("grant_type", "authorization_code".to_owned()),
+                ("code", code),
+                ("redirect_uri", REDIRECT.to_owned()),
+                ("code_verifier", PKCE_VERIFIER.to_owned()),
+                ("client_id", DESCRIBED.to_owned()),
+            ];
+            if let Some(assertion) = assertion {
+                form.push((
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_owned(),
+                ));
+                form.push(("client_assertion", assertion));
+            }
+            let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            token_request(&app, &form, None, &format!("10.73.{n}.3"))
+                .await
+                .0
+        }
+    };
+
+    // Without its assertion: refused, no falling back to PKCE alone.
+    assert_eq!(
+        exchange(code_for(2).await, None, 2).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Signed by another key, for another audience, too long, without jti:
+    // refused.
+    for (n, bad) in [
+        (3, assertion(&other_key, claims("a", token, now + 60))),
+        (
+            4,
+            assertion(&key, claims("b", "https://other.example", now + 60)),
+        ),
+        (5, assertion(&key, claims("c", token, now + 3600))),
+        (6, assertion(&key, claims("", token, now + 60))),
+        (7, assertion(&key, claims("d", token, now - 120))),
+    ] {
+        assert_eq!(
+            exchange(code_for(n).await, Some(bad), n).await,
+            StatusCode::UNAUTHORIZED,
+            "case {n}"
+        );
+    }
+    // A good one, to the token endpoint or to the issuer.
+    let good = assertion(&key, claims("once", token, now + 60));
+    assert_eq!(
+        exchange(code_for(8).await, Some(good.clone()), 8).await,
+        StatusCode::OK
+    );
+    let to_issuer = assertion(&key, claims("other", "http://localhost:8080", now + 60));
+    assert_eq!(
+        exchange(code_for(9).await, Some(to_issuer), 9).await,
+        StatusCode::OK
+    );
+    // The same assertion a second time: refused.
+    assert_eq!(
+        exchange(code_for(10).await, Some(good), 10).await,
+        StatusCode::UNAUTHORIZED
+    );
+}

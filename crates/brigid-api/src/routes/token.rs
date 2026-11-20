@@ -14,7 +14,18 @@ use brigid_identity::identity_vsid;
 use brigid_oidc::{IssuanceParams, issue_token};
 use serde_json::json;
 
+use brigid_store::{Client, ClientAuth};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
+use serde::Deserialize;
+
 use crate::state::{AppState, random_token};
+
+/// `client_assertion_type` of a signed assertion (RFC 7523 §2.2).
+const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+/// An assertion is a proof for one request: one valid longer than this is
+/// refused, which also bounds how long its `jti` is remembered.
+const MAX_ASSERTION_LIFETIME_SECS: i64 = 600;
 
 /// An ID token is a statement about one sign-in, read once by the relying
 /// party: five minutes (ADR-005 §2).
@@ -110,43 +121,82 @@ async fn exchange(
             .filter(|v| !v.is_empty())
     };
 
-    // Who is asking: HTTP Basic, or the form (never both).
+    // Who is asking: a signed assertion (a client that describes itself and
+    // publishes keys), HTTP Basic, or the form; one of them only.
     let basic = basic_credentials(headers)?;
-    let (client_id, secret) = match (&basic, param("client_id"), param("client_secret")) {
-        (Some(_), _, Some(_)) => {
+    let client = if let Some(assertion) = param("client_assertion") {
+        if param("client_assertion_type") != Some(JWT_BEARER) {
+            return Err(TokenError::bad_request(
+                "invalid_request",
+                "client_assertion_type must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ));
+        }
+        if basic.is_some() || param("client_secret").is_some() {
             return Err(TokenError::bad_request(
                 "invalid_request",
                 "one client authentication method at a time",
             ));
         }
-        (Some((id, _)), Some(form_id), None) if id != form_id => {
+        // The client is the assertion's issuer; a client_id sent beside it
+        // must be the same.
+        let issuer = unverified_issuer(assertion).ok_or_else(TokenError::invalid_client)?;
+        if param("client_id").is_some_and(|id| id != issuer) {
             return Err(TokenError::invalid_client());
         }
-        (Some((id, secret)), _, None) => (id.as_str(), Some(secret.as_str())),
-        (None, Some(id), secret) => (id, secret),
-        (None, None, _) => return Err(TokenError::invalid_client()),
-    };
-    let client = state
-        .store
-        .fetch_client(client_id)
-        .await
-        .map_err(TokenError::internal)?
-        .ok_or_else(TokenError::invalid_client)?;
-    let authenticated = match (client.confidential, secret) {
-        (true, Some(secret)) => state
-            .store
-            .verify_client_secret(client_id, secret)
+        let client = state
+            .client(&issuer)
             .await
-            .map_err(TokenError::internal)?,
-        // A public client has no secret: PKCE is what ties it to the code.
-        (false, None) => true,
-        // A confidential client without its secret, or a secret presented for
-        // a client that has none.
-        _ => false,
+            .map_err(TokenError::internal)?
+            .ok_or_else(TokenError::invalid_client)?;
+        let signs = client
+            .document
+            .as_ref()
+            .is_some_and(|d| d.auth == ClientAuth::PrivateKeyJwt);
+        if !signs || !verify_assertion(state, &client, assertion).await? {
+            return Err(TokenError::invalid_client());
+        }
+        client
+    } else {
+        let (client_id, secret) = match (&basic, param("client_id"), param("client_secret")) {
+            (Some(_), _, Some(_)) => {
+                return Err(TokenError::bad_request(
+                    "invalid_request",
+                    "one client authentication method at a time",
+                ));
+            }
+            (Some((id, _)), Some(form_id), None) if id != form_id => {
+                return Err(TokenError::invalid_client());
+            }
+            (Some((id, secret)), _, None) => (id.as_str(), Some(secret.as_str())),
+            (None, Some(id), secret) => (id, secret),
+            (None, None, _) => return Err(TokenError::invalid_client()),
+        };
+        let client = state
+            .client(client_id)
+            .await
+            .map_err(TokenError::internal)?
+            .ok_or_else(TokenError::invalid_client)?;
+        let authenticated = match (&client.document, client.confidential, secret) {
+            // A client that describes itself has no secret. One that
+            // publishes keys must sign: it cannot fall back to nothing.
+            (Some(document), _, None) => document.auth == ClientAuth::None,
+            (Some(_), _, Some(_)) => false,
+            (None, true, Some(secret)) => state
+                .store
+                .verify_client_secret(client_id, secret)
+                .await
+                .map_err(TokenError::internal)?,
+            // A public client has no secret: PKCE is what ties it to the code.
+            (None, false, None) => true,
+            // A confidential client without its secret, or a secret presented
+            // for a client that has none.
+            _ => false,
+        };
+        if !authenticated {
+            return Err(TokenError::invalid_client());
+        }
+        client
     };
-    if !authenticated {
-        return Err(TokenError::invalid_client());
-    }
 
     if param("grant_type") != Some("authorization_code") {
         return Err(TokenError::bad_request(
@@ -214,6 +264,113 @@ async fn exchange(
         "expires_in": ID_TOKEN_TTL_SECS,
         "id_token": id_token,
     }))
+}
+
+/// The `iss` of a JWT, read without checking anything: only to know which
+/// client's keys to check it with.
+fn unverified_issuer(jwt: &str) -> Option<String> {
+    use base64ct::{Base64UrlUnpadded, Encoding as _};
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = Base64UrlUnpadded::decode_vec(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("iss")?.as_str().map(str::to_owned)
+}
+
+#[derive(Deserialize)]
+struct AssertionClaims {
+    exp: i64,
+    jti: Option<String>,
+}
+
+/// Whether `jwt` is a valid client assertion of `client` (RFC 7523,
+/// protocol.md §6): signed with EdDSA or ES256 by one of the keys its
+/// document gives, `typ` absent or a JWT, issued by and about the client,
+/// for this server (its issuer or its token endpoint), not expired, valid
+/// at most ten minutes, and a `jti` never seen before.
+async fn verify_assertion(
+    state: &AppState,
+    client: &Client,
+    jwt: &str,
+) -> Result<bool, TokenError> {
+    let Some(document) = &client.document else {
+        return Ok(false);
+    };
+    let Ok(header) = jsonwebtoken::decode_header(jwt) else {
+        return Ok(false);
+    };
+    if !matches!(header.alg, Algorithm::EdDSA | Algorithm::ES256) {
+        return Ok(false);
+    }
+    let typ_ok = header.typ.as_deref().is_none_or(|typ| {
+        typ.eq_ignore_ascii_case("JWT") || typ.eq_ignore_ascii_case("client-authentication+jwt")
+    });
+    if !typ_ok {
+        return Ok(false);
+    }
+
+    let mut validation = Validation::new(header.alg);
+    validation.set_audience(&[
+        state.issuer().to_owned(),
+        format!("{}/token", state.issuer()),
+    ]);
+    validation.set_issuer(&[client.client_id.as_str()]);
+    validation.sub = Some(client.client_id.clone());
+    validation.set_required_spec_claims(&["exp", "iss", "sub", "aud"]);
+    validation.leeway = 30;
+    validation.validate_nbf = true;
+
+    let verify = |set: &JwkSet| -> Option<AssertionClaims> {
+        set.keys
+            .iter()
+            .filter(|key| crate::described::usable_key(key, Some(header.alg)))
+            .filter(|key| match (&header.kid, &key.common.key_id) {
+                (Some(kid), Some(key_id)) => kid == key_id,
+                (Some(_), None) => false,
+                (None, _) => true,
+            })
+            .find_map(|key| {
+                let decoding = DecodingKey::from_jwk(key).ok()?;
+                jsonwebtoken::decode::<AssertionClaims>(jwt, &decoding, &validation)
+                    .ok()
+                    .map(|data| data.claims)
+            })
+    };
+    let claims = if let Some(jwks) = &document.jwks {
+        let Ok(set) = serde_json::from_value::<JwkSet>(jwks.clone()) else {
+            return Ok(false);
+        };
+        verify(&set)
+    } else if let Some(uri) = &document.jwks_uri {
+        let cached = state.described.key_set(uri, false).await;
+        match cached.as_ref().ok().and_then(&verify) {
+            Some(claims) => Some(claims),
+            // A key the set does not have may be one the client just
+            // added: read the set again (at most once a minute).
+            None => match state.described.key_set(uri, true).await {
+                Ok(set) => verify(&set),
+                Err(reason) => {
+                    tracing::info!(client_id = %client.client_id, %reason, "client keys not usable");
+                    None
+                }
+            },
+        }
+    } else {
+        None
+    };
+    let Some(claims) = claims else {
+        return Ok(false);
+    };
+
+    let now = helpers4::time::unix_now().map_or(0, |secs| secs as i64);
+    let Some(jti) = claims.jti.filter(|jti| !jti.is_empty() && jti.len() <= 256) else {
+        return Ok(false);
+    };
+    if claims.exp - now > MAX_ASSERTION_LIFETIME_SECS {
+        return Ok(false);
+    }
+    Ok(state
+        .described
+        .first_use(&client.client_id, &jti, claims.exp, now))
 }
 
 /// The client id and secret of an `Authorization: Basic` header, each

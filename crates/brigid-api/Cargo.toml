@@ -26,6 +26,11 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "set-header", "trace"] }
 tower_governor = "0.8"
 tracing = "0.1"
+# Reads the documents of clients that describe themselves, and their keys
+# (src/described.rs): rustls on aws-lc-rs, as the server's own TLS; no proxy.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# Verifies the signed assertions of those clients (private_key_jwt).
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 webauthn-rs = { version = "0.5", features = [
   "danger-allow-state-serialisation",
   # start/finish_discoverable_authentication: username-less passkey login.

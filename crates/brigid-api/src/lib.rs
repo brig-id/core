@@ -1,5 +1,6 @@
 //! brigid-api: Axum HTTP server wiring all brig·id business logic crates.
 
+pub mod described;
 pub mod error;
 pub mod router;
 pub mod session;
