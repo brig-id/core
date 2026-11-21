@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A master key sealed by the machine** (server-seedling#98): `Edition::sealed_key_path`, a key
+  encrypted by `systemd-creds` (with the TPM when there is one). A command typed as root on the
+  machine unseals it with `systemd-creds decrypt` when no clear key file exists
+  (`brigid_server::unseal`); the service receives it from systemd as before, through
+  `BRIGID_MASTER_KEY_FILE`. `SEALED_KEY_NAME` is the credential's name (`master.key`).
 - **`brigid-server`: the server every edition runs** (core#94). Configuration,
   the operator commands (`rotate-key`, `rotate-oidc-key`, `client`, `admin`,
   `signup`, `healthcheck`), startup, the embedded interface and the metrics
