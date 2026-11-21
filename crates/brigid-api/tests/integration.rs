@@ -6024,3 +6024,103 @@ async fn a_site_with_keys_proves_itself_with_a_signed_assertion_used_once() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn administrators_decide_which_sites_that_describe_themselves_are_accepted() {
+    let documents = Documents::new();
+    documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
+    let (state, app, admin, _) = administered(
+        fresh_app_state()
+            .await
+            .with_fetcher(Arc::clone(&documents) as Arc<dyn brigid_api::described::Fetch>),
+    )
+    .await;
+    let xff = Addresses::new("10.97");
+    let act = async |method: &str, uri: &str, body: Option<serde_json::Value>| {
+        identity_request(&app, method, uri, Some(&admin), &xff.next(), body).await
+    };
+
+    // As a server starts: any, every attribute.
+    let (status, j) = act("GET", "/admin/described", None).await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j["policy"], "open");
+    assert_eq!(j["accepted"], serde_json::json!([]));
+    assert_eq!(j["attributes"].as_array().unwrap().len(), 6);
+
+    // The cap takes away what the document asks beyond it.
+    let (status, _) = act(
+        "PUT",
+        "/admin/described",
+        Some(serde_json::json!({ "attributes": ["given_name"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let asks_email =
+        authorize_query(&encoded(DESCRIBED), "").replace("scope=openid", "scope=openid%20email");
+    let location = authorize(&app, &asks_email, &xff.next()).await;
+    assert!(location.starts_with(REDIRECT), "{location}");
+    assert_eq!(query_of(&location)["error"], "invalid_scope");
+    // The identifier alone is still fine.
+    assert!(
+        authorize(&app, &authorize_query(&encoded(DESCRIBED), ""), &xff.next())
+            .await
+            .starts_with("/continue/?request=")
+    );
+
+    // The application list says where it comes from.
+    let (_, apps) = act("GET", "/admin/applications", None).await;
+    let shop = &apps.as_array().unwrap()[0];
+    assert_eq!(shop["described"], true);
+    assert_eq!(shop["host"], "shop.example");
+    assert_eq!(shop["attributes"], serde_json::json!({}));
+
+    // listed, and the lists.
+    let (status, _) = act(
+        "PUT",
+        "/admin/described",
+        Some(serde_json::json!({ "policy": "listed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        authorize(&app, &authorize_query(&encoded(DESCRIBED), ""), &xff.next()).await,
+        "/continue/?error=unknown_client"
+    );
+    let (status, _) = act(
+        "PUT",
+        "/admin/described/list",
+        Some(serde_json::json!({ "client_id": "not a url", "list": "accepted" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = act(
+        "PUT",
+        "/admin/described/list",
+        Some(serde_json::json!({ "client_id": DESCRIBED, "list": "accepted" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, j) = act("GET", "/admin/described", None).await;
+    assert_eq!(j["policy"], "listed");
+    assert_eq!(j["accepted"], serde_json::json!([DESCRIBED]));
+    assert!(
+        authorize(&app, &authorize_query(&encoded(DESCRIBED), ""), &xff.next())
+            .await
+            .starts_with("/continue/?request=")
+    );
+    let (status, _) = act(
+        "PUT",
+        "/admin/described/list",
+        Some(serde_json::json!({ "client_id": DESCRIBED, "list": null })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(state.store.client_lists().await.unwrap(), vec![]);
+
+    // Every change is in the log.
+    let (_, log) = act("GET", "/admin/log", None).await;
+    let text = log.to_string();
+    for action in ["described.policy", "described.attributes", "described.list"] {
+        assert!(text.contains(action), "{action} missing from {text}");
+    }
+}

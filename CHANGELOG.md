@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Administrators manage the sites that describe themselves**: `GET /admin/described`
+  (policy, accepted and refused lists, the cap on attributes), `PUT /admin/described`
+  (`policy`, `attributes`), `PUT /admin/described/list` (`client_id`, `list`: `accepted`,
+  `refused` or `null`). Every change is in the log (`described.*`). `/admin/applications`
+  says which applications describe themselves (`described`, `host`, `logo_uri`).
+- **The operator caps what those sites may ask for** (`EncryptedStore::set_described_attributes`,
+  command `client limit --allow … | --all | --none`): what a document asks beyond it is
+  dropped, as if not asked. Every attribute until set.
 - **`brigid-server`: the server every edition runs** (core#94). Configuration,
   the operator commands (`rotate-key`, `rotate-oidc-key`, `client`, `admin`,
   `signup`, `healthcheck`), startup, the embedded interface and the metrics

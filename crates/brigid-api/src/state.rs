@@ -281,6 +281,12 @@ impl AppState {
         let now = helpers4::time::unix_now().map_or(0, |secs| secs as i64);
         match self.described.client(&url, now).await {
             Ok(mut client) => {
+                // The operator's cap: what the document asks beyond it is
+                // dropped, as if the document did not ask it.
+                let cap = self.store.described_attributes().await.map_err(internal)?;
+                client
+                    .attributes
+                    .retain(|attribute, _| cap.contains(attribute));
                 // The first sign-in's date stays the creation date.
                 if let Some(known) = self.store.fetch_client(client_id).await.map_err(internal)? {
                     client.created_at = known.created_at;
@@ -293,13 +299,21 @@ impl AppState {
             }
             Err(reason) => {
                 tracing::info!(client_id, %reason, "client document not usable");
-                // The last valid document, while a new read fails.
+                // The last valid document, while a new read fails, under
+                // today's cap.
+                let cap = self.store.described_attributes().await.map_err(internal)?;
                 Ok(self
                     .store
                     .fetch_client(client_id)
                     .await
                     .map_err(internal)?
-                    .filter(Client::described))
+                    .filter(Client::described)
+                    .map(|mut client| {
+                        client
+                            .attributes
+                            .retain(|attribute, _| cap.contains(attribute));
+                        client
+                    }))
             }
         }
     }
