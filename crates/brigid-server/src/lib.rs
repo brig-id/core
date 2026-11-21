@@ -215,6 +215,19 @@ pub enum ClientCommand {
         /// The site's `client_id`: the URL of its document.
         client_id: String,
     },
+    /// Say what a site that describes itself may ask people to share, at
+    /// most, whatever its document says. Without an option, prints it.
+    Limit {
+        /// An attribute such sites may ask for. Repeat for several.
+        #[arg(long = "allow", value_name = "ATTRIBUTE")]
+        allow: Vec<String>,
+        /// No limit: any attribute (the default).
+        #[arg(long, conflicts_with = "allow")]
+        all: bool,
+        /// An identifier only: no attribute at all.
+        #[arg(long, conflicts_with_all = ["allow", "all"])]
+        none: bool,
+    },
 }
 
 /// What a site may ask people to share about the identity they present.
@@ -696,6 +709,37 @@ async fn client_command(edition: &Edition, db: &config::DatabaseConfig, action: 
         }
         ClientCommand::Unlist { client_id } => {
             list_client(&store, &client_id, None).await;
+        }
+        ClientCommand::Limit { allow, all, none } => {
+            let cap: Option<std::collections::BTreeSet<Attribute>> = if all {
+                Some(Attribute::ALL.into_iter().collect())
+            } else if none {
+                Some(std::collections::BTreeSet::new())
+            } else if allow.is_empty() {
+                None
+            } else {
+                Some(
+                    allow
+                        .iter()
+                        .map(|name| {
+                            Attribute::parse(name)
+                                .unwrap_or_else(|| fail(&format!("{name} is not an attribute.")))
+                        })
+                        .collect(),
+                )
+            };
+            if let Some(cap) = &cap {
+                store
+                    .set_described_attributes(cap)
+                    .await
+                    .expect("failed to record the limit");
+            }
+            let cap = store
+                .described_attributes()
+                .await
+                .expect("failed to read the limit");
+            let names: Vec<&str> = cap.iter().map(|a| a.claim()).collect();
+            println!("attributes={}", names.join(" "));
         }
         ClientCommand::Remove { client_id } => {
             let existed = store

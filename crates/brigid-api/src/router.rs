@@ -222,6 +222,11 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/admin/applications/{client_id}/attributes",
             put(admin::set_application_attributes),
         )
+        .route(
+            "/admin/described",
+            get(admin::described).put(admin::set_described),
+        )
+        .route("/admin/described/list", put(admin::set_described_list))
         .route("/admin/sign-up", get(admin::signup).put(admin::set_signup))
         .route("/admin/invitations", post(admin::invite))
         .route("/admin/invitations/{id}", delete(admin::revoke_invitation))
