@@ -57,6 +57,12 @@ pub struct Edition {
     pub config_path: Option<&'static str>,
     /// The master key file read when the environment names none.
     pub key_path: Option<&'static str>,
+    /// The master key sealed by `systemd-creds` (with the machine's TPM when
+    /// it has one), read when the environment names none and `key_path` does
+    /// not exist: unsealed with `systemd-creds decrypt`, which only root on
+    /// that machine can do. The service itself receives the key from systemd
+    /// (`LoadCredentialEncrypted=`), through `BRIGID_MASTER_KEY_FILE`.
+    pub sealed_key_path: Option<&'static str>,
     /// Ends the message given when no master key is found: how this edition
     /// makes one (", or create /etc/brigid/master.key with `seedling init`").
     pub key_hint: &'static str,
@@ -354,8 +360,9 @@ static PRELOADED_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The master key, in hex, from the first of: `BRIGID_MASTER_KEY_FILE` (a
 /// mounted secret, or the credential systemd hands the service),
-/// `BRIGID_MASTER_KEY`, or the edition's own key file (`Edition::key_path`).
-/// Never from the configuration file.
+/// `BRIGID_MASTER_KEY`, the edition's own key file (`Edition::key_path`), or
+/// its sealed key (`Edition::sealed_key_path`). Never from the configuration
+/// file.
 fn master_key_hex(edition: &Edition) -> Result<String, String> {
     let read =
         |path: &Path| std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
@@ -370,10 +377,43 @@ fn master_key_hex(edition: &Edition) -> Result<String, String> {
     {
         return read(default);
     }
+    if let Some(sealed) = edition.sealed_key_path.map(Path::new)
+        && sealed.exists()
+    {
+        return unseal(sealed);
+    }
     Err(format!(
         "no master key: set BRIGID_MASTER_KEY_FILE to a file holding it, or BRIGID_MASTER_KEY{}",
         edition.key_hint
     ))
+}
+
+/// The name a sealed master key carries: `systemd-creds` binds it, and the
+/// unit's `LoadCredentialEncrypted=master.key:…` must use the same.
+pub const SEALED_KEY_NAME: &str = "master.key";
+
+/// The key sealed at `path`, unsealed by `systemd-creds` (it needs root, and
+/// this machine's TPM or host key: a copy of the file elsewhere is useless).
+pub fn unseal(path: &Path) -> Result<String, String> {
+    unseal_with(std::ffi::OsStr::new("systemd-creds"), path)
+}
+
+fn unseal_with(program: &std::ffi::OsStr, path: &Path) -> Result<String, String> {
+    let out = std::process::Command::new(program)
+        .arg("decrypt")
+        .arg(format!("--name={SEALED_KEY_NAME}"))
+        .arg(path)
+        .arg("-")
+        .output()
+        .map_err(|e| format!("cannot run systemd-creds to unseal {}: {e}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "systemd-creds could not unseal {} (root, on the machine that sealed it): {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|_| format!("{}: not a key", path.display()))
 }
 
 fn load_master_key(edition: &Edition) -> MasterKey {
@@ -1058,5 +1098,42 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A stand-in for `systemd-creds`: prints the file it is given when the
+    /// arguments are the expected ones, fails otherwise.
+    fn fake(dir: &Path) -> std::path::PathBuf {
+        let program = dir.join("systemd-creds");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n[ \"$1\" = decrypt ] && [ \"$2\" = --name=master.key ] && [ \"$4\" = - ] \
+             && exec cat \"$3\"\necho refused >&2; exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[test]
+    fn a_sealed_key_is_unsealed_by_systemd_creds_under_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fake(dir.path());
+        let sealed = dir.path().join("master.key.cred");
+        std::fs::write(&sealed, "ab".repeat(32)).unwrap();
+        assert_eq!(
+            unseal_with(program.as_os_str(), &sealed).unwrap(),
+            "ab".repeat(32)
+        );
+        let missing = dir.path().join("nothing.cred");
+        let err = unseal_with(program.as_os_str(), &missing).unwrap_err();
+        assert!(err.contains("could not unseal"), "{err}");
+        let err = unseal_with(std::ffi::OsStr::new("/no/such/program"), &sealed).unwrap_err();
+        assert!(err.contains("cannot run systemd-creds"), "{err}");
     }
 }
