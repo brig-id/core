@@ -40,13 +40,13 @@ multiple-versions = "warn"
 wildcards = "warn"
 
 [[bans.skip-tree]]
-# webauthn-rs-core unconditionally depends on openssl via webauthn-attestation-ca
-# (used for X.509 attestation certificate chain verification — not for TLS).
-# All network connections in brigid use rustls; OpenSSL is never used for TLS.
-# This dependency cannot be removed without replacing the webauthn-rs library.
-# Tracked upstream: https://github.com/kanidm/webauthn-rs/issues
+# webauthn-rs-core 0.5 depends on openssl for attestation chains AND for the
+# verification of every assertion signature (crypto.rs, COSEKey::verify_signature).
+# Never for TLS: rustls handles every connection. webauthn-rs 0.6 replaces it
+# with RustCrypto (crypto-glue); the upgrade waits for crypto-glue on rsa 0.10
+# (docs/dependencies.md).
 name = "openssl-sys"
-reason = "transitive dep of webauthn-rs-core via webauthn-attestation-ca for X.509 attestation cert parsing; not used for TLS connections (rustls handles all TLS); no upstream alternative available"
+reason = "webauthn-rs-core 0.5 verifies attestation chains and assertion signatures with OpenSSL; never TLS; removed by webauthn-rs 0.6 once crypto-glue releases on rsa 0.10 (docs/dependencies.md)"
 
 [sources]
 unknown-registry = "deny"

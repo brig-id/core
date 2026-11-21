@@ -35,11 +35,12 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
   - VSID must never be derived from a virtual identity.
   - Same `(did_root, client_id, salt)` → same VSID; different `client_id` → different VSID.
 - **No OpenSSL** — use `rustls` everywhere; TLS 1.3 minimum. **Single
-  documented exception:** `webauthn-rs`'s attestation CA chain validator
-  (`webauthn-attestation-ca`) pulls in `openssl-sys` transitively. The
-  exception is scoped strictly to attestation chain verification — TLS,
-  KEM, DSA, KDF and signature flows must stay on rustls / RustCrypto.
-  `server-leaf/Dockerfile` documents the link-time consequences.
+  documented exception, until webauthn-rs 0.6:** `webauthn-rs-core` 0.5 uses
+  OpenSSL not only for attestation chains but to verify **every passkey
+  assertion signature** and for its SHA-256 (`docs/dependencies.md`). Our own
+  code adds none: TLS, KEM, DSA, KDF and our signatures stay on rustls /
+  RustCrypto. webauthn-rs 0.6 moves to RustCrypto; the upgrade waits for a
+  release of `crypto-glue` built on `rsa` 0.10.
 - **No secrets in logs** — `tracing` spans must never capture key material, credentials, or tokens.
 - **No `unwrap()` on error paths** — typed errors via `thiserror`.
 - **WebAuthn** — RP ID must be strict (no wildcard); signature counter must be verified.
