@@ -696,13 +696,10 @@ async fn list_client(store: &EncryptedStore, client_id: &str, list: Option<Clien
 /// Runs `command`, or the server itself when there is none. `config` is the
 /// `--config` the edition's command line was given.
 pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Command>) {
-    // `axum-server`'s `tls-rustls` feature and `reqwest`'s TLS backend each
-    // pull in a different rustls crypto provider (`aws-lc-rs` and `ring`
-    // respectively) — Cargo unifies both onto the one `rustls` crate in the
-    // dependency graph, so rustls refuses to auto-select either and panics
-    // the first time a TLS handshake is attempted. Installing one explicitly
-    // up front resolves the ambiguity; which of the two is picked doesn't
-    // matter functionally, so this matches axum-server's own default pairing.
+    // One rustls crypto provider for the whole process, aws-lc-rs: the
+    // server's TLS (axum-server) and the client that reads documents of sites
+    // (reqwest). Installed explicitly, so that a dependency enabling another
+    // provider later can never leave rustls choosing at the first handshake.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("no CryptoProvider should be installed yet — this runs once at startup");
