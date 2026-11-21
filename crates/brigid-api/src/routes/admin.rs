@@ -14,7 +14,11 @@
 //! is read, so an entry about a deleted account names nobody; and entries
 //! older than the retention period are deleted.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -23,7 +27,10 @@ use axum::{
     response::IntoResponse,
 };
 use brigid_identity::{Attribute, Need};
-use brigid_store::{AdminAction, Client, Error as StoreError, Link, LinkKind, SignupPolicy};
+use brigid_store::{
+    AdminAction, Client, ClientList, ClientPolicy, Error as StoreError, Link, LinkKind,
+    SignupPolicy,
+};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -335,13 +342,32 @@ pub struct ApplicationView {
     pub confidential: bool,
     /// What it may ask people to share, and whether it needs each one.
     pub attributes: BTreeMap<Attribute, Need>,
-    /// Unix seconds.
+    /// Unix seconds: its registration, or the first sign-in for an
+    /// application that describes itself.
     pub created_at: i64,
+    /// `true` for an application that describes itself in a document it
+    /// publishes (its `client_id` is that document's URL): nobody registered
+    /// it, and its document says what it asks for.
+    pub described: bool,
+    /// For such an application: the host of its `client_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// For such an application: its logo, as it declares it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo_uri: Option<String>,
 }
 
 impl From<Client> for ApplicationView {
     fn from(c: Client) -> Self {
+        let host = c
+            .described()
+            .then(|| url::Url::parse(&c.client_id).ok())
+            .flatten()
+            .and_then(|u| u.host_str().map(str::to_owned));
         Self {
+            described: c.described(),
+            logo_uri: c.document.and_then(|d| d.logo_uri),
+            host,
             client_id: c.client_id,
             name: c.name,
             redirect_uris: c.redirect_uris,
@@ -486,6 +512,135 @@ pub async fn remove_application(
         Some(session.account.id),
         None,
         Some(client.name),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// -- Applications that describe themselves --------------------------------------
+
+/// Which applications that describe themselves this server accepts, with no
+/// registration (protocol.md §6).
+#[derive(Debug, Serialize)]
+pub struct DescribedView {
+    pub policy: ClientPolicy,
+    /// Accepted under `listed`; their logo is shown.
+    pub accepted: Vec<String>,
+    /// Never accepted.
+    pub refused: Vec<String>,
+    /// What such an application may ask for at most, whatever its document says.
+    pub attributes: BTreeSet<Attribute>,
+}
+
+/// `GET /admin/described`
+pub async fn described(
+    State(state): State<Arc<AppState>>,
+    Administrator(_): Administrator,
+) -> Result<impl IntoResponse, ApiError> {
+    let lists = state.store.client_lists().await.map_err(|e| internal!(e))?;
+    let on = |list: ClientList| {
+        lists
+            .iter()
+            .filter(|(_, l)| *l == list)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    Ok(Json(DescribedView {
+        policy: state
+            .store
+            .client_policy()
+            .await
+            .map_err(|e| internal!(e))?,
+        accepted: on(ClientList::Accepted),
+        refused: on(ClientList::Refused),
+        attributes: state
+            .store
+            .described_attributes()
+            .await
+            .map_err(|e| internal!(e))?,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DescribedChange {
+    pub policy: Option<ClientPolicy>,
+    pub attributes: Option<BTreeSet<Attribute>>,
+}
+
+/// `PUT /admin/described`: the policy, the cap on attributes, or both.
+pub async fn set_described(
+    State(state): State<Arc<AppState>>,
+    ConfirmedAdministrator(session): ConfirmedAdministrator,
+    Json(body): Json<DescribedChange>,
+) -> Result<impl IntoResponse, ApiError> {
+    if let Some(policy) = body.policy {
+        state
+            .store
+            .set_client_policy(policy)
+            .await
+            .map_err(|e| internal!(e))?;
+        log(
+            &state,
+            "described.policy",
+            Some(session.account.id),
+            None,
+            Some(policy.as_str().to_owned()),
+        )
+        .await;
+    }
+    if let Some(attributes) = body.attributes {
+        state
+            .store
+            .set_described_attributes(&attributes)
+            .await
+            .map_err(|e| internal!(e))?;
+        let names: Vec<&str> = attributes.iter().map(|a| a.claim()).collect();
+        log(
+            &state,
+            "described.attributes",
+            Some(session.account.id),
+            None,
+            Some(names.join(" ")),
+        )
+        .await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListChange {
+    /// The application's `client_id`: the URL of its document.
+    pub client_id: String,
+    /// `accepted`, `refused`, or `null` for neither.
+    pub list: Option<ClientList>,
+}
+
+/// `PUT /admin/described/list`: put an application on a list, or on none.
+pub async fn set_described_list(
+    State(state): State<Arc<AppState>>,
+    ConfirmedAdministrator(session): ConfirmedAdministrator,
+    Json(body): Json<ListChange>,
+) -> Result<impl IntoResponse, ApiError> {
+    if crate::described::client_id_url(&body.client_id).is_none() {
+        return Err(ApiError::BadRequest(
+            "client_id must be the https URL of a client document".into(),
+        ));
+    }
+    state
+        .store
+        .set_client_list(&body.client_id, body.list)
+        .await
+        .map_err(|e| internal!(e))?;
+    log(
+        &state,
+        "described.list",
+        Some(session.account.id),
+        None,
+        Some(format!(
+            "{} {}",
+            body.list.map_or("none", ClientList::as_str),
+            body.client_id
+        )),
     )
     .await;
     Ok(StatusCode::NO_CONTENT)

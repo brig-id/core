@@ -3,7 +3,7 @@
 //! Every sensitive field is encrypted with a per-user HKDF-derived key
 //! before writing to SQLite. A raw DB dump must never expose readable secrets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brigid_crypto::{EncryptedBlob, MasterKey};
 use brigid_identity::{Attribute, Attributes, Need};
@@ -1453,6 +1453,31 @@ impl EncryptedStore {
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(policy.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The attributes a client that describes itself may ask for, whatever
+    /// its document says: the operator's cap. Every attribute until the
+    /// operator says otherwise.
+    pub async fn described_attributes(&self) -> Result<BTreeSet<Attribute>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT value FROM settings WHERE name = 'described_attributes'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match value {
+            Some(json) => serde_json::from_str(&json).map_err(|_| Error::InvalidBlob)?,
+            None => Attribute::ALL.into_iter().collect(),
+        })
+    }
+
+    pub async fn set_described_attributes(&self, attributes: &BTreeSet<Attribute>) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (name, value) VALUES ('described_attributes', ?) \
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+        )
+        .bind(serde_json::to_string(attributes).map_err(|_| Error::InvalidBlob)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -3557,5 +3582,24 @@ mod tests {
         assert!(store.set_client_list(url, None).await.unwrap());
         assert!(!store.set_client_list(url, None).await.unwrap());
         assert!(store.client_lists().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_cap_on_described_clients_is_every_attribute_until_set() {
+        let store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.described_attributes().await.unwrap().len(),
+            Attribute::ALL.len()
+        );
+        let cap = BTreeSet::from([Attribute::GivenName]);
+        store.set_described_attributes(&cap).await.unwrap();
+        assert_eq!(store.described_attributes().await.unwrap(), cap);
+        store
+            .set_described_attributes(&BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(store.described_attributes().await.unwrap().is_empty());
     }
 }
