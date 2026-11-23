@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **21 archetypes in four groups** (`everyday`, `work`, `leisure`, `online`): the templates of
+  an identity, each with its own logo, and descriptions that say what the identity is for
+  rather than who sees it ("Yours alone: not even aunt Monique gets in."). `GET
+  /account/identity-templates` gives each its `group`. The three starters are unchanged.
 - **A master key sealed by the machine** (server-seedling#98): `Edition::sealed_key_path`, a key
   encrypted by `systemd-creds` (with the TPM when there is one). A command typed as root on the
   machine unseals it with `systemd-creds decrypt` when no clear key file exists

@@ -1935,7 +1935,7 @@ async fn identity_crud_roundtrip_and_isolation() {
     assert_eq!(from_template["logo"], "icon:ph:house-line");
     assert_eq!(
         from_template["description"],
-        "Shared within a restricted circle."
+        "Family life: the school, the doctor, the group photos."
     );
 
     let (status, _) = identity_request(

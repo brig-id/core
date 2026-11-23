@@ -73,6 +73,8 @@ pub struct CreateIdentityRequest {
 
 #[derive(Debug, Serialize)]
 pub struct TemplateView {
+    /// The group it is shown in: `everyday`, `work`, `leisure`, `online`.
+    pub group: &'static str,
     pub key: &'static str,
     pub name: &'static str,
     pub logo: &'static str,
@@ -109,6 +111,7 @@ pub(crate) fn new_identity(
 pub async fn list_templates() -> impl IntoResponse {
     let starters = brigid_identity::templates::DEFAULT_TEMPLATE_KEYS;
     let view = |t: &'static brigid_identity::IdentityTemplate| TemplateView {
+        group: t.group,
         key: t.key,
         name: t.name,
         logo: t.logo,
