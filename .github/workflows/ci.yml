@@ -56,7 +56,7 @@ jobs:
           bin=pebble-bin/pebble-linux-amd64/linux/amd64/pebble
           dns=pebble-bin/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
           chmod +x "$bin" "$dns"
-          "$dns" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dns01 127.0.0.1:8053 \
+          "$dns" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dnsserver 127.0.0.1:8053 \
             -http01 "" -tlsalpn01 "" -https01 "" -doh "" -management 127.0.0.1:8055 \
             > challtestsrv.log 2>&1 &
           (cd pebble-src && PEBBLE_VA_NOSLEEP=1 "../$bin" -config test/config/pebble-config.json \
