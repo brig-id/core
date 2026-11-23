@@ -19,7 +19,7 @@ use uuid::Uuid;
 use brigid_api::{AppState, build_router};
 
 /// The server asks for a discoverable credential (`residentKey: required`,
-/// ADR-003); `SoftPasskey` keeps no resident keys and refuses such a request.
+/// spec `model.md` §1); `SoftPasskey` keeps no resident keys and refuses such a request.
 /// The tests check the request, then relax it for the software authenticator
 /// (registration finish does not depend on it).
 fn for_soft_passkey(
@@ -44,7 +44,7 @@ fn for_soft_passkey(
 }
 
 /// This server's origin, as a browser sends it on every request that changes
-/// something (ADR-005: the API refuses those from any other origin).
+/// something (spec `protocol.md` §5: the API refuses those from any other origin).
 const ORIGIN: &str = "http://localhost:8080";
 
 /// The `name=value` of the session cookie a response sets.
@@ -107,7 +107,7 @@ async fn response_body_json(body: Body) -> serde_json::Value {
 #[tokio::test]
 async fn health_returns_200() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -128,7 +128,7 @@ async fn health_returns_200() {
 #[tokio::test]
 async fn ready_returns_200_when_db_accessible() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -151,7 +151,7 @@ async fn ready_returns_200_when_db_accessible() {
 #[tokio::test]
 async fn openid_configuration_describes_the_code_flow() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -195,7 +195,7 @@ async fn openid_configuration_describes_the_code_flow() {
 #[tokio::test]
 async fn jwks_returns_valid_json() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -221,7 +221,7 @@ async fn jwks_returns_valid_json() {
 #[tokio::test]
 async fn security_headers_present() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -248,50 +248,41 @@ async fn security_headers_present() {
 // Auth: error paths (no WebAuthn hardware required)
 // ---------------------------------------------------------------------------
 
+/// The username is generated: a hidden handle, never typed. One sent with
+/// the request (an older interface did) is ignored, and so is a name for
+/// another server.
 #[tokio::test]
-async fn register_begin_rejects_invalid_username() {
+async fn sign_up_generates_the_username_whatever_the_request_says() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
-    let body = serde_json::json!({ "username": "not-an-email" });
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .method("POST")
-                .uri("/auth/register/begin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn register_begin_rejects_a_username_on_another_server() {
-    let state = make_state().await;
-    let app = build_router(state, &[]);
-
-    let body = serde_json::json!({ "username": "alice@elsewhere.example" });
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .method("POST")
-                .uri("/auth/register/begin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let json = response_body_json(resp.into_body()).await;
-    assert_eq!(json["error"], "accounts on this server end with @localhost");
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "username": "alice@elsewhere.example" }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header("origin", ORIGIN)
+                    .method("POST")
+                    .uri("/auth/register/begin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_body_json(resp.into_body()).await;
+        let name = json["challenge"]["publicKey"]["user"]["name"]
+            .as_str()
+            .unwrap();
+        assert!(
+            name.ends_with("@localhost") && !name.starts_with("alice"),
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -301,7 +292,7 @@ async fn register_finish_rejects_malformed_credential() {
     // a well-formed `PublicKeyCredential` payload and is covered by the full
     // end-to-end flow exercised in `brigid-webauthn` integration tests.
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let body = serde_json::json!({
         "session_id": Uuid::new_v4(),
@@ -328,7 +319,7 @@ async fn login_finish_rejects_malformed_credential() {
     // See `register_finish_rejects_malformed_credential` — 422 here also
     // reflects JSON extraction failure, not the unknown-session branch.
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let body = serde_json::json!({
         "session_id": Uuid::new_v4(),
@@ -350,12 +341,13 @@ async fn login_finish_rejects_malformed_credential() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// Signing in names nobody: the challenge lists no credential, and the
+/// passkey says whose it is.
 #[tokio::test]
-async fn login_begin_returns_404_for_unknown_user() {
+async fn sign_in_asks_a_discoverable_passkey() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
-    let body = serde_json::json!({ "username": "nobody@example.com", "client_id": "test-client" });
     let resp = app
         .oneshot(
             Request::builder()
@@ -363,13 +355,19 @@ async fn login_begin_returns_404_for_unknown_user() {
                 .method("POST")
                 .uri("/auth/login/begin")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_body_json(resp.into_body()).await;
+    assert!(
+        json["challenge"]["publicKey"]["allowCredentials"]
+            .as_array()
+            .is_none_or(|a| a.is_empty()),
+        "{json}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -382,13 +380,13 @@ async fn register_and_login_roundtrip() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
 
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
     // -- Register begin --
-    let body = serde_json::json!({ "username": "alice@localhost" });
+    let body = serde_json::json!({});
     let resp = app
         .clone()
         .oneshot(
@@ -408,6 +406,8 @@ async fn register_and_login_roundtrip() {
     let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+    // The WebAuthn user handle is the account id.
+    let account_id = Uuid::from_slice(ccr.public_key.user.id.as_ref()).unwrap();
 
     // -- Perform registration with soft passkey --
     let reg_credential = auth_client
@@ -439,7 +439,7 @@ async fn register_and_login_roundtrip() {
     );
 
     // -- Login begin --
-    let body = serde_json::json!({ "username": "alice@localhost", "client_id": "test-client" });
+    let body = serde_json::json!({});
     let resp = app
         .clone()
         .oneshot(
@@ -461,7 +461,13 @@ async fn register_and_login_roundtrip() {
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
 
     // -- Perform authentication with soft passkey --
-    let auth_credential = auth_client.do_authentication(rp_origin, rcr).unwrap();
+    let auth_credential = answer_discoverable(
+        &mut auth_client,
+        &rp_origin,
+        rcr,
+        &reg_credential.id,
+        account_id,
+    );
 
     // -- Login finish --
     let finish_body = serde_json::json!({
@@ -481,7 +487,7 @@ async fn register_and_login_roundtrip() {
         )
         .await
         .unwrap();
-    // A session in a cookie, never a token (ADR-005).
+    // A session in a cookie, never a token (spec `protocol.md` §5).
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "login/finish failed");
     let cookie = cookie_of(&resp);
     assert!(cookie.starts_with("brigid_session="), "{cookie}");
@@ -489,87 +495,14 @@ async fn register_and_login_roundtrip() {
     assert!(body.is_empty(), "no token in the body");
 }
 
-#[tokio::test]
-async fn register_begin_conflict_for_duplicate_user() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
-    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-
-    let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
-
-    let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
-
-    let body = serde_json::json!({ "username": "bob@localhost" });
-
-    // First registration.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .method("POST")
-                .uri("/auth/register/begin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let begin_json: serde_json::Value =
-        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
-    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
-        serde_json::from_value(begin_json["challenge"].clone()).unwrap();
-    let reg_credential = auth_client
-        .do_registration(rp_origin, for_soft_passkey(ccr))
-        .unwrap();
-
-    let finish_body = serde_json::json!({
-        "session_id": session_id,
-        "credential": reg_credential,
-    });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .method("POST")
-                .uri("/auth/register/finish")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&finish_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // Second registration attempt — must return 409 Conflict.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header("origin", ORIGIN)
-                .method("POST")
-                .uri("/auth/register/begin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-}
-
 // ---------------------------------------------------------------------------
 // Auth: logout
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn logout_requires_bearer_token() {
+async fn logout_requires_a_session() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -587,18 +520,18 @@ async fn logout_requires_bearer_token() {
 }
 
 #[tokio::test]
-async fn logout_blacklists_token() {
+async fn logout_ends_the_session() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
 
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
     // -- Register --
-    let body = serde_json::json!({ "username": "charlie@localhost", "client_id": "test-client" });
+    let body = serde_json::json!({});
     let resp = app
         .clone()
         .oneshot(
@@ -619,6 +552,7 @@ async fn logout_blacklists_token() {
     let session_id: Uuid = serde_json::from_value(begin_json["session_id"].clone()).unwrap();
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(begin_json["challenge"].clone()).unwrap();
+    let account_id = Uuid::from_slice(ccr.public_key.user.id.as_ref()).unwrap();
     let reg_credential = auth_client
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
@@ -666,7 +600,13 @@ async fn logout_blacklists_token() {
     let auth_session_id: Uuid = serde_json::from_value(login_begin["session_id"].clone()).unwrap();
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(login_begin["challenge"].clone()).unwrap();
-    let auth_credential = auth_client.do_authentication(rp_origin, rcr).unwrap();
+    let auth_credential = answer_discoverable(
+        &mut auth_client,
+        &rp_origin,
+        rcr,
+        &reg_credential.id,
+        account_id,
+    );
 
     let resp = app
         .clone()
@@ -740,7 +680,7 @@ async fn logout_blacklists_token() {
     );
 
     // -- A restart (a new router on the same database) does not revive it --
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
 
     let resp = app
         .oneshot(
@@ -769,7 +709,7 @@ async fn logout_blacklists_token() {
 #[tokio::test]
 async fn rate_limit_triggers_after_burst() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
     let body = serde_json::to_vec(
         &serde_json::json!({ "username": "test@localhost", "client_id": "test-client" }),
     )
@@ -816,7 +756,7 @@ async fn rate_limit_triggers_after_burst() {
 #[tokio::test]
 async fn account_routes_do_not_share_the_ceremony_quota() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
     let get = |uri: &'static str| {
         Request::builder()
             .header("origin", ORIGIN)
@@ -848,15 +788,13 @@ async fn account_routes_do_not_share_the_ceremony_quota() {
     for _ in 0..30 {
         let resp = app
             .clone()
-            .oneshot(get("/account/identity-templates"))
+            .oneshot(get("/account/identities"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // No session: refused, but not throttled.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-    let resp = app
-        .oneshot(get("/account/identity-templates"))
-        .await
-        .unwrap();
+    let resp = app.oneshot(get("/account/identities")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -864,18 +802,19 @@ async fn account_routes_do_not_share_the_ceremony_quota() {
 // CORS
 // ---------------------------------------------------------------------------
 
+/// The interface is served from the server's own origin: an account route
+/// answers no other one, preflight or not.
 #[tokio::test]
-async fn cors_rejects_unauthorized_origin() {
-    let allowed = Url::parse("https://allowed.example.com").unwrap();
+async fn an_account_route_answers_no_other_origin() {
     let state = make_state().await;
-    let app = build_router(state, &[allowed]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
             Request::builder()
                 .method("OPTIONS")
-                .uri("/health")
-                .header("origin", "https://evil.example.com")
+                .uri("/account/identities")
+                .header("origin", "https://elsewhere.example.com")
                 .header("access-control-request-method", "GET")
                 .body(Body::empty())
                 .unwrap(),
@@ -885,41 +824,39 @@ async fn cors_rejects_unauthorized_origin() {
 
     assert!(
         resp.headers().get("access-control-allow-origin").is_none(),
-        "evil origin must not be reflected"
-    );
-}
-
-#[tokio::test]
-async fn cors_allows_configured_origin() {
-    let allowed = Url::parse("https://allowed.example.com").unwrap();
-    let state = make_state().await;
-    let app = build_router(state, &[allowed]);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("OPTIONS")
-                .uri("/health")
-                .header("origin", "https://allowed.example.com")
-                .header("access-control-request-method", "GET")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
-        Some("https://allowed.example.com"),
-        "configured origin must be reflected"
+        "another origin must not be allowed"
     );
 }
 
 // ---------------------------------------------------------------------------
 // Passkey management: DELETE /auth/passkeys/{id}
 // ---------------------------------------------------------------------------
+
+/// The answer of a discoverable passkey to a sign-in challenge, which names
+/// no credential (the only kind the server asks). `SoftPasskey` keeps no
+/// resident key: the test names the credential for it, and gives the answer
+/// the user handle a real authenticator returns, the account id.
+fn answer_discoverable(
+    dev: &mut webauthn_authenticator_rs::WebauthnAuthenticator<
+        webauthn_authenticator_rs::softpasskey::SoftPasskey,
+    >,
+    rp_origin: &url::Url,
+    mut rcr: webauthn_rs::prelude::RequestChallengeResponse,
+    credential_id: &str,
+    account_id: Uuid,
+) -> webauthn_rs::prelude::PublicKeyCredential {
+    assert!(
+        rcr.public_key.allow_credentials.is_empty(),
+        "a sign-in challenge names no credential"
+    );
+    rcr.public_key.allow_credentials =
+        serde_json::from_value(serde_json::json!([{ "type": "public-key", "id": credential_id }]))
+            .unwrap();
+    rcr.mediation = None;
+    let mut cred = dev.do_authentication(rp_origin.clone(), rcr).unwrap();
+    cred.response.user_handle = Some(account_id.as_bytes().to_vec().into());
+    cred
+}
 
 /// Registers a user and signs in, returning (session cookie, user_id, passkey_id).
 ///
@@ -937,7 +874,8 @@ async fn register_and_login_for_passkey_tests(
 ) -> (String, Uuid, Uuid) {
     // Register begin (IP .1)
     let xff1 = format!("{xff_base}.1");
-    let body = serde_json::json!({ "username": username });
+    let _ = username;
+    let body = serde_json::json!({});
     let resp = app
         .clone()
         .oneshot(
@@ -989,7 +927,7 @@ async fn register_and_login_for_passkey_tests(
 
     // Login begin (IP .3)
     let xff3 = format!("{xff_base}.3");
-    let login_body = serde_json::json!({ "username": username, "client_id": "test-client" });
+    let login_body = serde_json::json!({});
     let resp = app
         .clone()
         .oneshot(
@@ -1009,9 +947,7 @@ async fn register_and_login_for_passkey_tests(
     let login_session: Uuid = serde_json::from_value(j["session_id"].clone()).unwrap();
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
-    let auth_cred = auth_client
-        .do_authentication(rp_origin.clone(), rcr)
-        .unwrap();
+    let auth_cred = answer_discoverable(auth_client, rp_origin, rcr, &reg_cred.id, user_id);
 
     // Login finish (IP .4)
     let xff4 = format!("{xff_base}.4");
@@ -1137,7 +1073,7 @@ async fn delete_passkey_roundtrip() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1204,7 +1140,7 @@ async fn delete_passkey_last_one_returns_409() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1250,7 +1186,7 @@ async fn another_accounts_passkey_is_not_found() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
@@ -1307,7 +1243,7 @@ async fn delete_passkey_unknown_id_returns_404() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1347,9 +1283,9 @@ async fn delete_passkey_unknown_id_returns_404() {
 }
 
 #[tokio::test]
-async fn delete_passkey_requires_bearer_token() {
+async fn delete_passkey_requires_a_session() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -1383,7 +1319,7 @@ async fn list_passkeys_returns_registered_passkeys() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1428,7 +1364,7 @@ async fn a_user_id_parameter_never_names_the_account() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
@@ -1451,7 +1387,7 @@ async fn a_user_id_parameter_never_names_the_account() {
     .await;
 
     // Alice's session naming Bob: the parameter is ignored, Alice sees her
-    // own passkeys and never Bob's (ADR-005: the account is the session's).
+    // own passkeys and never Bob's (spec `protocol.md` §5: the account is the session's).
     let resp = app
         .oneshot(
             Request::builder()
@@ -1481,7 +1417,7 @@ async fn a_user_id_parameter_never_names_the_account() {
 #[tokio::test]
 async fn list_passkeys_requires_a_session() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -1512,7 +1448,7 @@ async fn add_credential_roundtrip() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -1607,7 +1543,7 @@ async fn add_credential_is_for_the_sessions_account() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
@@ -1661,7 +1597,7 @@ async fn add_credential_is_for_the_sessions_account() {
 #[tokio::test]
 async fn add_credential_begin_requires_a_session() {
     let state = make_state().await;
-    let app = build_router(state, &[]);
+    let app = build_router(state);
 
     let resp = app
         .oneshot(
@@ -1753,8 +1689,8 @@ async fn request_with_cookie(
 }
 
 #[tokio::test]
-async fn identities_require_a_bearer_token() {
-    let app = build_router(make_state().await, &[]);
+async fn identities_require_a_session() {
+    let app = build_router(make_state().await);
     let (status, _) = identity_request(
         &app,
         "GET",
@@ -1772,7 +1708,7 @@ async fn identity_crud_roundtrip_and_isolation() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
 
     let mut alice_dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
@@ -1920,56 +1856,27 @@ async fn identity_crud_roundtrip_and_isolation() {
     .await;
     assert_eq!(list.as_array().unwrap().len(), 3);
 
-    // From a template, overriding only the name.
-    let (status, from_template) = identity_request(
-        &app,
-        "POST",
-        "/account/identities",
-        Some(&alice_token),
-        "10.41.6.1",
-        Some(serde_json::json!({"user_id": alice_id, "template": "family", "name": "Les Dupont"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(from_template["name"], "Les Dupont");
-    assert_eq!(from_template["logo"], "icon:ph:house-line");
-    assert_eq!(
-        from_template["description"],
-        "Family life: the school, the doctor, the group photos."
-    );
-
-    let (status, _) = identity_request(
-        &app,
-        "POST",
-        "/account/identities",
-        Some(&alice_token),
-        "10.41.6.2",
-        Some(serde_json::json!({"user_id": alice_id, "template": "nope"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn identity_templates_are_listed() {
-    let app = build_router(make_state().await, &[]);
-    let (status, list) = identity_request(
-        &app,
-        "GET",
-        "/account/identity-templates",
-        None,
-        "10.42.0.1",
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let keys: Vec<&str> = list
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["key"].as_str().unwrap())
-        .collect();
-    assert!(keys.contains(&"work") && keys.contains(&"isolated"));
+    // A name and an icon are required: the archetypes that fill them are
+    // the interface's, and an old `template` key fills nothing.
+    for (n, body) in [
+        serde_json::json!({ "logo": "icon:ph:house-line" }),
+        serde_json::json!({ "name": "Les Dupont" }),
+        serde_json::json!({ "template": "family" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, _) = identity_request(
+            &app,
+            "POST",
+            "/account/identities",
+            Some(&alice_token),
+            &format!("10.41.6.{}", n + 1),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]
@@ -1977,7 +1884,7 @@ async fn passkey_can_be_renamed() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (token, user_id, passkey_id) = register_and_login_for_passkey_tests(
@@ -2032,10 +1939,10 @@ async fn discoverable_login_roundtrip() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let (_, user_id, _) = register_and_login_for_passkey_tests(
+    let (first, user_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "disco@localhost",
         &rp_origin,
@@ -2044,15 +1951,15 @@ async fn discoverable_login_roundtrip() {
     )
     .await;
 
-    // A first named login only to learn the credential id SoftPasskey needs:
-    // it keeps no resident keys, so the request must name the credential.
+    // SoftPasskey keeps no resident keys: the test names the credential for
+    // it, as a deletion ceremony (begun, never finished) lists the account's.
     let (_, named) = identity_request(
         &app,
         "POST",
-        "/auth/login/begin",
-        None,
+        "/account/delete/begin",
+        Some(&first),
         "10.44.2.1",
-        Some(serde_json::json!({"username": "disco@localhost", "client_id": "test-client"})),
+        Some(serde_json::json!({})),
     )
     .await;
     let allow = named["challenge"]["publicKey"]["allowCredentials"].clone();
@@ -2132,7 +2039,7 @@ async fn discoverable_login_roundtrip() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// ADR-005 §1: the session lives in a cookie; it can be checked, it ends at
+/// spec `protocol.md` §5: the session lives in a cookie; it can be checked, it ends at
 /// sign-out (and stays ended), a forged or missing cookie is 401, and a
 /// cross-origin request that changes something is refused.
 #[tokio::test]
@@ -2141,7 +2048,7 @@ async fn cookie_session_check_sign_out_and_same_origin() {
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (cookie, _, _) = register_and_login_for_passkey_tests(
@@ -2251,7 +2158,7 @@ async fn cookie_session_check_sign_out_and_same_origin() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// ADR-005 §3: no endpoint issues a token for a caller-supplied client_id.
+/// spec `protocol.md` §6: no endpoint issues a token for a caller-supplied client_id.
 /// Sign-in opens a session and returns no token, whatever `client_id` the
 /// caller sends, and the identity token endpoint is gone.
 #[tokio::test]
@@ -2259,7 +2166,7 @@ async fn no_token_for_a_caller_supplied_client_id() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (cookie, _, _) = register_and_login_for_passkey_tests(
@@ -2285,7 +2192,7 @@ async fn no_token_for_a_caller_supplied_client_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Account recovery (ADR-004)
+// Account recovery (spec `protocol.md` §7)
 // ---------------------------------------------------------------------------
 
 /// The whole recovery path: create a code, lose the passkey, enrol a new one
@@ -2296,7 +2203,7 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut first_device = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (token, user_id, _) = register_and_login_for_passkey_tests(
@@ -2439,25 +2346,27 @@ async fn recovery_code_enrols_a_new_passkey_once() {
 /// `name@server` for one passkey and `name` for the next.
 #[tokio::test]
 async fn every_passkey_of_an_account_has_the_same_name() {
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let xff = Addresses::new("10.93");
-    let name = "same-name@localhost";
+    // The name the server generates, `<username>@<server>`.
     let (status, j) = identity_request(
         &app,
         "POST",
         "/auth/register/begin",
         None,
         &xff.next(),
-        Some(serde_json::json!({ "username": name })),
+        Some(serde_json::json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["challenge"]["publicKey"]["user"]["name"], name);
+    let generated = j["challenge"]["publicKey"]["user"]["name"].clone();
+    assert!(
+        generated.as_str().unwrap().ends_with("@localhost"),
+        "{generated}"
+    );
 
     let mut key = new_key();
-    let cookie = sign_up_with(&app, name, None, &mut key, &xff)
-        .await
-        .unwrap();
+    let cookie = sign_up_with(&app, None, &mut key, &xff).await.unwrap();
     let code = take_recovery_code(&app, &cookie, &xff).await;
 
     // A passkey added from the account.
@@ -2471,7 +2380,8 @@ async fn every_passkey_of_an_account_has_the_same_name() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{j}");
-    assert_eq!(j["challenge"]["publicKey"]["user"]["name"], name);
+    let name = j["challenge"]["publicKey"]["user"]["name"].clone();
+    assert!(name.as_str().unwrap().ends_with("@localhost"), "{name}");
     assert_eq!(j["challenge"]["publicKey"]["user"]["displayName"], name);
 
     // The passkey the recovery code makes.
@@ -2494,7 +2404,7 @@ async fn registration_sessions_finish_only_as_what_they_began() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut device = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (token, user_id, _) = register_and_login_for_passkey_tests(
@@ -2542,14 +2452,14 @@ async fn registration_sessions_finish_only_as_what_they_began() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// ADR-003: signing up without a username. The server generates the handle,
+/// spec `model.md` §1: signing up without a username. The server generates the handle,
 /// and the same ceremony signs the new account in (a session cookie).
 #[tokio::test]
 async fn signup_without_username_signs_in() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
 
@@ -2591,7 +2501,7 @@ async fn signup_without_username_signs_in() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{j}");
     assert!(
         j.is_null(),
-        "no token in the body: the session is the cookie (ADR-005)"
+        "no token in the body: the session is the cookie (spec `protocol.md` §5)"
     );
     let cookie = cookie.expect("signed in at signup");
     let token = cookie.as_str();
@@ -2620,7 +2530,7 @@ async fn an_account_without_a_recovery_code_can_do_nothing_else() {
     use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let (cookie, _, passkey) = register_and_login_for_passkey_tests(
@@ -2648,7 +2558,7 @@ async fn an_account_without_a_recovery_code_can_do_nothing_else() {
         (
             "POST",
             "/account/identities".to_string(),
-            Some(serde_json::json!({ "template": "personal" })),
+            Some(serde_json::json!({ "name": "Personal", "logo": "icon:ph:user" })),
         ),
         (
             "PATCH",
@@ -2707,21 +2617,12 @@ async fn an_account_without_a_recovery_code_can_do_nothing_else() {
     assert_eq!(status, StatusCode::OK);
 
     // With the code, the account is open, and starts with no identity: the
-    // server proposes some, the browser creates the ones kept.
+    // interface proposes some, the browser creates the ones kept.
     let (_, j) = call("GET", "/auth/session", None).await;
     assert_eq!(j["recovery_code"], true);
     let (status, j) = call("GET", "/account/identities", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(j, serde_json::json!([]));
-    let (_, templates) = call("GET", "/account/identity-templates", None).await;
-    let starters: Vec<&str> = templates
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["starter"] == true)
-        .map(|t| t["key"].as_str().unwrap())
-        .collect();
-    assert_eq!(starters, ["public", "personal", "work"]);
     let (_, j) = call("GET", &format!("/auth/authorize/{request}"), None).await;
     assert_eq!(j["needs_recovery_code"], false);
 
@@ -2733,7 +2634,7 @@ async fn an_account_without_a_recovery_code_can_do_nothing_else() {
 }
 
 // ---------------------------------------------------------------------------
-// Relying parties: /authorize, /auth/authorize/*, /token (ADR-005 §2, ADR-008)
+// Relying parties: /authorize, /auth/authorize/*, /token (spec `protocol.md` §6)
 // ---------------------------------------------------------------------------
 
 /// RFC 7636 appendix B.
@@ -2854,8 +2755,8 @@ fn verified_claims(state: &AppState, jwt: &str) -> serde_json::Value {
 }
 
 /// What the onboarding does once the passkey exists: the recovery code, then
-/// the starter identities, created by the browser from the templates marked
-/// `starter`. Returns the identities' ids, in the order of the templates.
+/// the identities the interface proposes (its archetypes Public, Personal,
+/// Work), created by the browser from their values. Returns their ids.
 async fn finish_onboarding(app: &axum::Router, cookie: &str, xff_base: &str) -> Vec<Uuid> {
     let (status, j) = identity_request(
         app,
@@ -2867,23 +2768,14 @@ async fn finish_onboarding(app: &axum::Router, cookie: &str, xff_base: &str) -> 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{j}");
-    let (status, templates) = identity_request(
-        app,
-        "GET",
-        "/account/identity-templates",
-        Some(cookie),
-        &format!("{xff_base}.21"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
     let mut ids = Vec::new();
-    for (n, template) in templates
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["starter"] == true)
-        .enumerate()
+    for (n, (name, logo)) in [
+        ("Public", "icon:ph:globe-hemisphere-west"),
+        ("Personal", "icon:ph:user"),
+        ("Work", "icon:ph:briefcase"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (status, j) = identity_request(
             app,
@@ -2891,7 +2783,7 @@ async fn finish_onboarding(app: &axum::Router, cookie: &str, xff_base: &str) -> 
             "/account/identities",
             Some(cookie),
             &format!("{xff_base}.{}", 22 + n),
-            Some(serde_json::json!({ "template": template["key"] })),
+            Some(serde_json::json!({ "name": name, "logo": logo })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{j}");
@@ -2941,7 +2833,7 @@ async fn approve(app: &axum::Router, id: &str, cookie: &str, identity: Uuid, xff
 #[tokio::test]
 async fn a_site_signs_a_person_in_and_learns_an_identifier_only() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (shop, secret) = state
         .store
         .create_client("Shop", &[REDIRECT.to_string()], true)
@@ -3106,7 +2998,7 @@ async fn a_site_signs_a_person_in_and_learns_an_identifier_only() {
 #[tokio::test]
 async fn an_authorization_request_is_checked_before_anyone_is_asked() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (shop, _) = state
         .store
         .create_client("Shop", &[REDIRECT.to_string()], true)
@@ -3261,7 +3153,7 @@ async fn an_authorization_request_is_checked_before_anyone_is_asked() {
 #[tokio::test]
 async fn the_token_endpoint_gives_nothing_without_the_client_the_code_and_the_verifier() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (shop, secret) = state
         .store
         .create_client("Shop", &[REDIRECT.to_string()], true)
@@ -3412,7 +3304,7 @@ async fn the_token_endpoint_gives_nothing_without_the_client_the_code_and_the_ve
 #[tokio::test]
 async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (shop, _) = state
         .store
         .create_client("Shop", &[REDIRECT.to_string()], false)
@@ -3609,7 +3501,7 @@ fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
 /// device and what unlocks it, in one gesture.
 #[tokio::test]
 async fn a_passkey_that_does_not_verify_its_user_is_refused() {
-    let app = build_router(make_state().await, &[]);
+    let app = build_router(make_state().await);
 
     // Sign-in states the requirement.
     let (status, j) = identity_request(
@@ -3804,7 +3696,7 @@ const ASK_ALL: &str = "&scope=openid+profile+email";
 #[tokio::test]
 async fn attributes_are_set_changed_and_removed_on_an_identity() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (cookie, _, identities) = signed_in_account(&app, "attrs@localhost", "10.70.1").await;
     let xff = Addresses::new("10.71");
     let me = identities[0];
@@ -3907,7 +3799,7 @@ async fn attributes_are_set_changed_and_removed_on_an_identity() {
 async fn an_application_receives_an_attribute_only_once_its_exact_value_was_accepted() {
     use brigid_identity::{Attribute, Need};
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let shop = client_asking(
         &state,
         "Shop",
@@ -4163,7 +4055,7 @@ async fn an_application_receives_an_attribute_only_once_its_exact_value_was_acce
 async fn refusing_an_optional_attribute_continues_and_a_required_one_stops() {
     use brigid_identity::{Attribute, Need};
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let shop = client_asking(
         &state,
         "Shop",
@@ -4303,7 +4195,7 @@ async fn the_label_of_an_identity_appears_in_no_token() {
     use base64ct::{Base64UrlUnpadded, Encoding};
     use brigid_identity::{Attribute, Need};
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     // The application may ask for everything there is, and requires it.
     let everything: Vec<_> = Attribute::ALL
         .into_iter()
@@ -4410,7 +4302,7 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
     use webauthn_rs::prelude::RequestChallengeResponse;
 
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
     let xff = Addresses::new("10.83");
 
@@ -4455,14 +4347,24 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
     let post = async |uri: &str, cookie: Option<&str>, body: serde_json::Value| {
         identity_request(&app, "POST", uri, cookie, &xff.next(), Some(body)).await
     };
-    // The software authenticator of the tests keeps no discoverable passkey:
-    // a sign-in ceremony names its account.
+    // The software authenticator of the tests keeps no discoverable passkey,
+    // and a sign-in challenge names none: the test names the account's, as a
+    // deletion ceremony lists them.
+    let ada_passkeys = {
+        let (status, j) = post("/account/delete/begin", Some(&ada), serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{j}");
+        j["challenge"]["publicKey"]["allowCredentials"].clone()
+    };
     let begin = async |uri: &str, cookie: Option<&str>| {
-        let named = serde_json::json!({ "username": "leaving@localhost" });
-        let (status, j) = post(uri, cookie, named).await;
+        let (status, j) = post(uri, cookie, serde_json::json!({})).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {j}");
-        let challenge: RequestChallengeResponse =
+        let mut challenge: RequestChallengeResponse =
             serde_json::from_value(j["challenge"].clone()).unwrap();
+        if challenge.public_key.allow_credentials.is_empty() {
+            challenge.public_key.allow_credentials =
+                serde_json::from_value(ada_passkeys.clone()).unwrap();
+            challenge.mediation = None;
+        }
         (j["session_id"].clone(), challenge)
     };
 
@@ -4549,13 +4451,15 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
         identity_request(&app, "GET", "/auth/session", Some(&ada), &xff.next(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     // Its passkey opens nothing any more: there is no account to sign in to.
+    let (session_id, credential) =
+        sign_in_answer(&app, &mut ada_key, &ada_passkeys, &ada_id.to_string(), &xff).await;
     let (status, _) = post(
-        "/auth/login/begin",
+        "/auth/login/finish",
         None,
-        serde_json::json!({ "username": "leaving@localhost" }),
+        serde_json::json!({ "session_id": session_id, "credential": credential }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // The other account lost nothing.
     assert!(store.fetch_user(bob_id).await.unwrap().is_some());
@@ -4583,16 +4487,63 @@ fn new_key() -> Key {
     )
 }
 
+/// The account's passkeys, as a deletion ceremony (begun, never finished)
+/// lists them: what a test needs to sign in again with a software
+/// authenticator, which keeps no discoverable passkey.
+async fn passkeys_of(app: &axum::Router, cookie: &str, xff: &Addresses) -> serde_json::Value {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/account/delete/begin",
+        Some(cookie),
+        &xff.next(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    j["challenge"]["publicKey"]["allowCredentials"].clone()
+}
+
+/// A sign-in begun and answered by `key` for `account`: the session id, and
+/// the answer to send to `/auth/login/finish`.
+async fn sign_in_answer(
+    app: &axum::Router,
+    key: &mut Key,
+    passkeys: &serde_json::Value,
+    account: &str,
+    xff: &Addresses,
+) -> (serde_json::Value, webauthn_rs::prelude::PublicKeyCredential) {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/auth/login/begin",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let mut challenge: webauthn_rs::prelude::RequestChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    challenge.public_key.allow_credentials = serde_json::from_value(passkeys.clone()).unwrap();
+    challenge.mediation = None;
+    let mut credential = key
+        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
+        .unwrap();
+    let account = Uuid::parse_str(account).unwrap();
+    credential.response.user_handle = Some(account.as_bytes().to_vec().into());
+    (j["session_id"].clone(), credential)
+}
+
 /// Creates an account, with the link a server may ask for. The session
 /// cookie, or the refusal.
 async fn sign_up_with(
     app: &axum::Router,
-    username: &str,
     link: Option<&str>,
     key: &mut Key,
     xff: &Addresses,
 ) -> Result<String, (StatusCode, serde_json::Value)> {
-    let mut body = serde_json::json!({ "username": username });
+    let mut body = serde_json::json!({});
     if let Some(link) = link {
         body["link"] = serde_json::json!(link);
     }
@@ -4650,14 +4601,14 @@ async fn take_recovery_code(app: &axum::Router, cookie: &str, xff: &Addresses) -
 /// with the setup link. Sign-up is left as a server starts: by invitation.
 async fn administered(state: AppState) -> (Arc<AppState>, axum::Router, String, Key) {
     let state = Arc::new(state);
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let xff = Addresses::new("10.89");
     let link = brigid_api::setup_link(&state.store)
         .await
         .unwrap()
         .expect("a server without account has a setup link");
     let mut key = new_key();
-    let cookie = sign_up_with(&app, "admin@localhost", Some(&link), &mut key, &xff)
+    let cookie = sign_up_with(&app, Some(&link), &mut key, &xff)
         .await
         .unwrap();
     take_recovery_code(&app, &cookie, &xff).await;
@@ -4668,19 +4619,19 @@ async fn administered(state: AppState) -> (Arc<AppState>, axum::Router, String, 
 #[tokio::test]
 async fn a_fresh_server_takes_no_account_until_its_setup_link_is_used() {
     let state = Arc::new(fresh_app_state().await);
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let xff = Addresses::new("10.90");
 
     // Nobody opened it: by invitation, and there is nobody to invite.
     let (_, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
     assert_eq!(j["sign_up"], false);
     assert_eq!(j["policy"], "invitation");
-    let refused = sign_up_with(&app, "early@localhost", None, &mut new_key(), &xff)
+    let refused = sign_up_with(&app, None, &mut new_key(), &xff)
         .await
         .unwrap_err();
     assert_eq!(refused.0, StatusCode::FORBIDDEN);
     assert_eq!(refused.1["code"], "invitation_required");
-    let refused = sign_up_with(&app, "early@localhost", Some("guess"), &mut new_key(), &xff)
+    let refused = sign_up_with(&app, Some("guess"), &mut new_key(), &xff)
         .await
         .unwrap_err();
     assert_eq!(refused.1["code"], "link_invalid");
@@ -4702,13 +4653,13 @@ async fn a_fresh_server_takes_no_account_until_its_setup_link_is_used() {
     let stale = brigid_api::setup_link(&state.store).await.unwrap().unwrap();
     let link = brigid_api::setup_link(&state.store).await.unwrap().unwrap();
     assert_ne!(stale, link);
-    let refused = sign_up_with(&app, "first@localhost", Some(&stale), &mut new_key(), &xff)
+    let refused = sign_up_with(&app, Some(&stale), &mut new_key(), &xff)
         .await
         .unwrap_err();
     assert_eq!(refused.1["code"], "link_invalid");
 
     // Used, it makes the first account, and that account administers.
-    let cookie = sign_up_with(&app, "first@localhost", Some(&link), &mut new_key(), &xff)
+    let cookie = sign_up_with(&app, Some(&link), &mut new_key(), &xff)
         .await
         .unwrap();
     let (_, j) = identity_request(
@@ -4724,7 +4675,7 @@ async fn a_fresh_server_takes_no_account_until_its_setup_link_is_used() {
     assert_eq!(state.store.count_administrators().await.unwrap(), 1);
 
     // Once. And a server that has an account hands out no setup link.
-    let refused = sign_up_with(&app, "second@localhost", Some(&link), &mut new_key(), &xff)
+    let refused = sign_up_with(&app, Some(&link), &mut new_key(), &xff)
         .await
         .unwrap_err();
     assert_eq!(refused.1["code"], "link_invalid");
@@ -4763,7 +4714,6 @@ fn administration(
             Some(serde_json::json!({ "email": "required" })),
         ),
         ("DELETE", format!("/admin/applications/{application}"), None),
-        ("GET", "/admin/server".into(), None),
         ("GET", "/admin/sign-up".into(), None),
         (
             "PUT",
@@ -4789,7 +4739,7 @@ fn administration(
 #[tokio::test]
 async fn only_an_administrator_reaches_the_administration() {
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let xff = Addresses::new("10.91");
     let (person, person_id, _) = signed_in_account(&app, "person@localhost", "10.91.200").await;
     let (victim, victim_id, _) = signed_in_account(&app, "victim@localhost", "10.91.201").await;
@@ -4877,9 +4827,7 @@ async fn no_administration_response_holds_anything_of_an_identity() {
     // A person with a life: identities with labels and attributes, and an
     // application one of them signed in to and shared an address with.
     let mut key = new_key();
-    let person = sign_up_with(&app, "private@localhost", None, &mut key, &xff)
-        .await
-        .unwrap();
+    let person = sign_up_with(&app, None, &mut key, &xff).await.unwrap();
     take_recovery_code(&app, &person, &xff).await;
     let (status, j) = identity_request(
         &app,
@@ -4937,7 +4885,7 @@ async fn no_administration_response_holds_anything_of_an_identity() {
         said.push_str(&j.to_string());
     }
     // The account is there, by its generated handle.
-    assert!(said.contains("private"), "{said}");
+    assert!(said.contains("\"own\":false"), "{said}");
     let said = said.to_lowercase();
     for theirs in [
         "zanzibar",
@@ -5098,9 +5046,7 @@ async fn a_suspended_account_is_closed_and_keeps_everything() {
         .await
         .unwrap();
     let mut key = new_key();
-    let person = sign_up_with(&app, "paused@localhost", None, &mut key, &xff)
-        .await
-        .unwrap();
+    let person = sign_up_with(&app, None, &mut key, &xff).await.unwrap();
     let code = take_recovery_code(&app, &person, &xff).await;
     let (_, j) = identity_request(
         &app,
@@ -5108,7 +5054,7 @@ async fn a_suspended_account_is_closed_and_keeps_everything() {
         "/account/identities",
         Some(&person),
         &xff.next(),
-        Some(serde_json::json!({ "template": "personal" })),
+        Some(serde_json::json!({ "name": "Personal", "logo": "icon:ph:user" })),
     )
     .await;
     let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
@@ -5128,11 +5074,13 @@ async fn a_suspended_account_is_closed_and_keeps_everything() {
         .find(|a| a["own"] == false)
         .unwrap()
         .clone();
-    assert_eq!(listed["username"], "paused");
+    // By its generated handle, never anything it holds.
+    assert!(listed["username"].as_str().is_some_and(|u| !u.is_empty()));
     assert_eq!(listed["passkeys"], 1);
     assert_eq!(listed["recovery_code"], true);
     assert!(listed["last_sign_in_at"].as_i64().is_some());
     let person_id = listed["id"].as_str().unwrap().to_owned();
+    let person_passkeys = passkeys_of(&app, &person, &xff).await;
     let admin_id = accounts
         .as_array()
         .unwrap()
@@ -5167,27 +5115,15 @@ async fn a_suspended_account_is_closed_and_keeps_everything() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     // Its passkey is right, and the person is told why it opens nothing.
-    let (_, j) = identity_request(
-        &app,
-        "POST",
-        "/auth/login/begin",
-        None,
-        &xff.next(),
-        Some(serde_json::json!({ "username": "paused@localhost" })),
-    )
-    .await;
-    let challenge: webauthn_rs::prelude::RequestChallengeResponse =
-        serde_json::from_value(j["challenge"].clone()).unwrap();
-    let credential = key
-        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
-        .unwrap();
+    let (session_id, credential) =
+        sign_in_answer(&app, &mut key, &person_passkeys, &person_id, &xff).await;
     let (status, cookie, j) = request_with_cookie(
         &app,
         "POST",
         "/auth/login/finish",
         None,
         &xff.next(),
-        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+        Some(serde_json::json!({ "session_id": session_id, "credential": credential })),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -5281,27 +5217,15 @@ async fn a_suspended_account_is_closed_and_keeps_everything() {
     let (status, _) = act("GET", "/admin/accounts".to_owned(), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // An unknown account is not found.
-    let (_, j) = identity_request(
-        &app,
-        "POST",
-        "/auth/login/begin",
-        None,
-        &xff.next(),
-        Some(serde_json::json!({ "username": "paused@localhost" })),
-    )
-    .await;
-    let challenge: webauthn_rs::prelude::RequestChallengeResponse =
-        serde_json::from_value(j["challenge"].clone()).unwrap();
-    let credential = key
-        .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
-        .unwrap();
+    let (session_id, credential) =
+        sign_in_answer(&app, &mut key, &person_passkeys, &person_id, &xff).await;
     let (status, new_admin, _) = request_with_cookie(
         &app,
         "POST",
         "/auth/login/finish",
         None,
         &xff.next(),
-        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+        Some(serde_json::json!({ "session_id": session_id, "credential": credential })),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -5359,8 +5283,8 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
     assert!(!j.to_string().contains(&link));
 
     // Two accounts, ordinary ones; not a third.
-    for name in ["guest-one@localhost", "guest-two@localhost"] {
-        let cookie = sign_up_with(&app, name, Some(&link), &mut new_key(), &xff)
+    for _ in 0..2 {
+        let cookie = sign_up_with(&app, Some(&link), &mut new_key(), &xff)
             .await
             .unwrap();
         let (_, j) = identity_request(
@@ -5374,15 +5298,9 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
         .await;
         assert_eq!(j["admin"], false);
     }
-    let refused = sign_up_with(
-        &app,
-        "guest-three@localhost",
-        Some(&link),
-        &mut new_key(),
-        &xff,
-    )
-    .await
-    .unwrap_err();
+    let refused = sign_up_with(&app, Some(&link), &mut new_key(), &xff)
+        .await
+        .unwrap_err();
     assert_eq!(refused.1["code"], "link_invalid");
     let (_, j) = act("GET", "/admin/sign-up", None).await;
     assert_eq!(
@@ -5399,7 +5317,7 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = act("DELETE", &uri, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let refused = sign_up_with(&app, "late@localhost", Some(&revoked), &mut new_key(), &xff)
+    let refused = sign_up_with(&app, Some(&revoked), &mut new_key(), &xff)
         .await
         .unwrap_err();
     assert_eq!(refused.1["code"], "link_invalid");
@@ -5415,7 +5333,7 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     for link in [None, Some(invitation.as_str())] {
-        let refused = sign_up_with(&app, "nobody@localhost", link, &mut new_key(), &xff)
+        let refused = sign_up_with(&app, link, &mut new_key(), &xff)
             .await
             .unwrap_err();
         assert_eq!(refused.1["code"], "signup_closed", "{link:?}");
@@ -5429,7 +5347,7 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
     assert_eq!(j["sign_up"], true);
-    sign_up_with(&app, "anyone@localhost", None, &mut new_key(), &xff)
+    sign_up_with(&app, None, &mut new_key(), &xff)
         .await
         .unwrap();
     let (status, _) = act(
@@ -5443,30 +5361,15 @@ async fn an_invitation_opens_a_server_to_as_many_accounts_as_it_says() {
 }
 
 /// What runs here is public: the interface shows it at its foot, to anyone.
-/// The administration reads the same.
 #[tokio::test]
 async fn the_version_of_a_server_is_public() {
-    let (_, app, admin, _) =
+    let (_, app, _, _) =
         administered(fresh_app_state().await.with_edition("seedling", "9.8.7")).await;
     let xff = Addresses::new("10.97");
     let (status, j) = identity_request(&app, "GET", "/auth/server", None, &xff.next(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(j["edition"], "seedling");
     assert_eq!(j["version"], "9.8.7");
-    let (status, j) = identity_request(
-        &app,
-        "GET",
-        "/admin/server",
-        Some(&admin),
-        &xff.next(),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        j,
-        serde_json::json!({ "edition": "seedling", "version": "9.8.7" })
-    );
 
     // A program that did not say what it is: the answer says so.
     let (_, app, _, _) = administered(fresh_app_state().await).await;
@@ -5479,12 +5382,12 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
     // A server that has accounts and no administrator: as one upgraded from
     // a version without administration.
     let state = make_state().await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let xff = Addresses::new("10.96");
-    let owner = sign_up_with(&app, "owner@localhost", None, &mut new_key(), &xff)
+    let owner = sign_up_with(&app, None, &mut new_key(), &xff)
         .await
         .unwrap();
-    let guest = sign_up_with(&app, "guest@localhost", None, &mut new_key(), &xff)
+    let guest = sign_up_with(&app, None, &mut new_key(), &xff)
         .await
         .unwrap();
     assert_eq!(brigid_api::setup_link(&state.store).await.unwrap(), None);
@@ -5562,7 +5465,7 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
         "/account/identities",
         Some(&guest),
         &xff.next(),
-        Some(serde_json::json!({ "template": "personal" })),
+        Some(serde_json::json!({ "name": "Personal", "logo": "icon:ph:user" })),
     )
     .await;
     let identity: Uuid = serde_json::from_value(j["id"].clone()).unwrap();
@@ -5594,15 +5497,19 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
 
     // The guest is suspended, then deleted.
     let (_, accounts) = act("GET", "/admin/accounts".into(), None).await;
-    let guest_id = accounts
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["username"] == "guest")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    // Usernames are generated: the owner is the account that reads the list.
+    let of = |own: bool| {
+        accounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["own"] == own)
+            .unwrap()
+            .clone()
+    };
+    let (owner_name, guest_account) = (of(true)["username"].clone(), of(false));
+    let guest_name = guest_account["username"].as_str().unwrap().to_owned();
+    let guest_id = guest_account["id"].as_str().unwrap().to_owned();
     let (status, _) = act("POST", format!("/admin/accounts/{guest_id}/suspend"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, log) = act("GET", "/admin/log".into(), None).await;
@@ -5617,8 +5524,8 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
     // While the account exists, the log can name it.
     let suspended = entry(&log, "account.suspend");
     assert_eq!(suspended["by"], "administrator");
-    assert_eq!(suspended["by_username"], "owner");
-    assert_eq!(suspended["account_username"], "guest");
+    assert_eq!(suspended["by_username"], owner_name);
+    assert_eq!(suspended["account_username"], guest_name);
     let (status, _) = act("DELETE", format!("/admin/accounts/{guest_id}"), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = act("DELETE", format!("/admin/accounts/{guest_id}"), None).await;
@@ -5627,7 +5534,7 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
     // Deleted, it is named nowhere: the log knows an account was concerned,
     // and no longer which.
     let (_, log) = act("GET", "/admin/log".into(), None).await;
-    assert!(!log.to_string().contains("guest"), "{log}");
+    assert!(!log.to_string().contains(&guest_name), "{log}");
     assert!(!log.to_string().contains(&guest_id), "{log}");
     for action in ["account.suspend", "account.delete"] {
         let e = entry(&log, action);
@@ -5638,7 +5545,7 @@ async fn the_role_is_claimed_with_a_link_made_on_the_machine_and_the_log_names_n
     assert_eq!(entry(&log, "administrator.link")["by"], "machine");
     assert_eq!(
         entry(&log, "administrator.claimed")["account_username"],
-        "owner"
+        owner_name
     );
     assert_eq!(entry(&log, "application.register")["detail"], "Shop");
     // The newest first.
@@ -5728,7 +5635,7 @@ async fn a_site_that_describes_itself_signs_people_in_with_no_registration() {
     let documents = Documents::new();
     documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
     let state = state_reading(&documents).await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
 
     let resp = app
         .clone()
@@ -5801,7 +5708,7 @@ async fn the_operator_decides_which_sites_that_describe_themselves_are_accepted(
     let documents = Documents::new();
     documents.publish(DESCRIBED, shop_document(serde_json::json!({})));
     let state = state_reading(&documents).await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let query = authorize_query(&encoded(DESCRIBED), "");
 
     // registered: no site that describes itself, and discovery says so.
@@ -5871,7 +5778,7 @@ async fn the_operator_decides_which_sites_that_describe_themselves_are_accepted(
 async fn a_document_that_is_missing_or_wrong_signs_nobody_in() {
     let documents = Documents::new();
     let state = state_reading(&documents).await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let query = authorize_query(&encoded(DESCRIBED), "");
     // Nothing published.
     assert_eq!(
@@ -5938,7 +5845,7 @@ async fn a_site_with_keys_proves_itself_with_a_signed_assertion_used_once() {
         })),
     );
     let state = state_reading(&documents).await;
-    let app = build_router(Arc::clone(&state), &[]);
+    let app = build_router(Arc::clone(&state));
     let (cookie, _, identities) = signed_in_account(&app, "keys@localhost", "10.73.1").await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

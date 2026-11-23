@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 use crate::key::OidcSigningKey;
 
-/// What goes into an ID token (ADR-005 §2, ADR-008).
+/// What goes into an ID token (spec `protocol.md` §6).
 pub struct IssuanceParams<'a> {
     /// The VSID of the identity for this client: the `sub` claim.
     pub vsid: &'a Vsid,

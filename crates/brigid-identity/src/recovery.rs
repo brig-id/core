@@ -1,4 +1,4 @@
-//! Account recovery codes ([ADR-004] in the spec).
+//! Account recovery codes (spec `protocol.md` §7).
 //!
 //! A code is 25 bytes, shown as 40 base32 characters in groups of four
 //! (`ABCD-EFGH-…`):
@@ -12,7 +12,6 @@
 //! The code carries neither the username nor the account id: renaming the
 //! account keeps the code valid, and the code reveals nothing about it.
 //!
-//! [ADR-004]: https://github.com/brig-id/spec/blob/main/decisions/004-account-recovery.md
 
 use hkdf::Hkdf;
 use sha3::{Digest, Sha3_256};

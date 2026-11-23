@@ -24,7 +24,7 @@ pub struct JwkSet {
 }
 
 /// OpenID Connect Discovery 1.0 metadata, for the one flow this server
-/// offers: Authorization Code with PKCE (ADR-005 §2, ADR-008).
+/// offers: Authorization Code with PKCE (spec `protocol.md` §6).
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenIDConfiguration {
     pub issuer: String,

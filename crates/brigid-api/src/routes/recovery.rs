@@ -1,4 +1,4 @@
-//! Account recovery with a recovery code ([ADR-004] in the spec).
+//! Account recovery with a recovery code (spec `protocol.md` §7).
 //!
 //! A signed-in account creates its code (`POST /account/recovery-code`) and
 //! sees whether it has one (`GET`). Someone who lost every passkey enters the
@@ -10,7 +10,6 @@
 //! the 128-bit secret makes guessing hopeless. The ceremony routes' rate limit
 //! applies.
 //!
-//! [ADR-004]: https://github.com/brig-id/spec/blob/main/decisions/004-account-recovery.md
 
 use std::{sync::Arc, time::Instant};
 

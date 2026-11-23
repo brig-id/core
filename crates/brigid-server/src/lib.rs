@@ -1009,16 +1009,6 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     let webauthn = WebauthnService::new(cfg.server.domain.as_str(), &base_url)
         .expect("failed to build WebAuthn service (check `domain` in config)");
 
-    let cors_origins: Vec<Url> = cfg
-        .security
-        .cors_origins
-        .iter()
-        .map(|s| {
-            s.parse::<Url>()
-                .unwrap_or_else(|e| panic!("invalid CORS origin '{s}' in configuration: {e}"))
-        })
-        .collect();
-
     let mut state = AppState::new(store, webauthn, oidc_key, base_url, vsid_salt)
         .with_retired_oidc_keys(retired_oidc_keys)
         // Public (`GET /auth/server`); `<server> --version` says the same on
@@ -1041,7 +1031,7 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     announce_administration(edition, &state).await;
     // The certificate obtained with ACME is kept in the database.
     let acme_store = state.store.clone();
-    let api_router = build_router(state, &cors_origins);
+    let api_router = build_router(state);
 
     // The interface. A released build carries it; `server.ui_dist_dir`, the
     // development option, names the directory of another build to serve

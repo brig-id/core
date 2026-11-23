@@ -81,7 +81,7 @@ fn username_index(master: &MasterKey, username: &str, server: &str) -> Result<St
     Ok(helpers4::hex::encode(&*key))
 }
 
-/// Keyed lookup index of a recovery code's recovery id (ADR-004), the same
+/// Keyed lookup index of a recovery code's recovery id (spec `protocol.md` §7), the same
 /// construction as [`username_index`] with its own context.
 fn recovery_index(master: &MasterKey, recovery_id: &[u8]) -> Result<String> {
     let key = brigid_crypto::hkdf::derive_user_key(master, recovery_id, b"recovery-lookup")
@@ -916,7 +916,7 @@ impl EncryptedStore {
         Ok(done.rows_affected() > 0)
     }
 
-    // -- Account recovery (ADR-004) -------------------------------------------
+    // -- Account recovery (spec `protocol.md` §7) -------------------------------------------
 
     /// Make `recovery_id`/`verifier` the account's recovery code, replacing
     /// any previous one. `last_used_at` is kept.
@@ -1230,7 +1230,7 @@ impl EncryptedStore {
         Ok(())
     }
 
-    // -- Account sessions (ADR-005 §1) -----------------------------------------
+    // -- Account sessions (spec `protocol.md` §5) -----------------------------------------
 
     /// Open a session for `account_id`: returns the token for the cookie
     /// (base64url of 32 random bytes). Only its hash is stored. The session
@@ -1323,7 +1323,7 @@ impl EncryptedStore {
         Ok(())
     }
 
-    // -- Relying parties (ADR-005 §2) ------------------------------------------
+    // -- Relying parties (spec `protocol.md` §6) ------------------------------------------
 
     /// Register a relying party. Returns it with its secret when
     /// `confidential`: 32 random bytes in base64url, of which only the hash is

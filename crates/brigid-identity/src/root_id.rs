@@ -22,7 +22,7 @@ impl RootId {
         // DNS hostnames are case-insensitive (RFC 4343). Canonicalise the
         // server component to lowercase before storing so that
         // `alice@Example.com` and `alice@example.com` produce the same
-        // `username_index`, DID:web URL, and persisted `RootId`. Without
+        // `username_index` and persisted `RootId`. Without
         // this, two clients addressing the same host could mint distinct
         // root identities for what is, by DNS, the same authority.
         Ok(Self {

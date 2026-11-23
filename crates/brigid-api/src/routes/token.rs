@@ -1,4 +1,4 @@
-//! The token endpoint (ADR-005 §2, ADR-008): a relying party exchanges an
+//! The token endpoint (spec `protocol.md` §6): a relying party exchanges an
 //! authorization code for an ID token.
 
 use std::{collections::HashMap, sync::Arc};
@@ -28,7 +28,7 @@ const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer
 const MAX_ASSERTION_LIFETIME_SECS: i64 = 600;
 
 /// An ID token is a statement about one sign-in, read once by the relying
-/// party: five minutes (ADR-005 §2).
+/// party: five minutes (spec `protocol.md` §6).
 const ID_TOKEN_TTL_SECS: u64 = 300;
 
 /// An OAuth error (RFC 6749 §5.2).
@@ -254,7 +254,7 @@ async fn exchange(
     .map_err(TokenError::internal)?;
 
     // OAuth 2.0 requires an access token in the response and libraries refuse
-    // one without it. No endpoint of this server accepts it (ADR-008): it is
+    // one without it. No endpoint of this server accepts it (spec `protocol.md` §6): it is
     // a random value, kept nowhere.
     let access_token = random_token().ok_or_else(|| TokenError::internal("no entropy"))?;
 

@@ -26,10 +26,6 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct BeginRegisterRequest {
-    /// `username@this-server`. Absent: the server generates the username
-    /// (ADR-003: it is a hidden sign-in handle).
-    #[serde(default)]
-    pub username: Option<String>,
     /// A setup link or an invitation, when the server asks for one.
     #[serde(default)]
     pub link: Option<String>,
@@ -55,14 +51,6 @@ pub struct FinishRegisterRequest {
 pub struct RenamePasskeyRequest {
     /// The new label; empty removes it.
     pub label: String,
-}
-
-#[derive(Deserialize)]
-pub struct BeginLoginRequest {
-    /// `user@server`. Absent: username-less login with a discoverable
-    /// credential (passkey autofill), the authenticator names the user.
-    #[serde(default)]
-    pub username: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -149,29 +137,8 @@ pub async fn register_begin(
 ) -> Result<impl IntoResponse, ApiError> {
     may_sign_up(&state, body.link.as_deref()).await?;
     let host = state.host()?.to_string();
-    let root_id = match body.username.as_deref() {
-        Some(handle) => {
-            let root_id = RootId::parse(handle).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            // An account lives on this server. `alice@elsewhere.example` would
-            // put a domain this server does not control in the account's DID.
-            if root_id.server != host {
-                return Err(ApiError::BadRequest(format!(
-                    "accounts on this server end with @{host}"
-                )));
-            }
-            if state
-                .store
-                .fetch_user_by_username(&root_id.username, &root_id.server)
-                .await
-                .map_err(|e| internal!(e))?
-                .is_some()
-            {
-                return Err(ApiError::Conflict(format!("user {handle} already exists")));
-            }
-            root_id
-        }
-        None => generated_root_id(&state, &host).await?,
-    };
+    // The username is generated: a hidden handle, never typed.
+    let root_id = generated_root_id(&state, &host).await?;
     let handle = passkey_name(&root_id.username, &root_id.server);
 
     let user_id = Uuid::new_v4();
@@ -280,13 +247,13 @@ pub async fn register_finish(
     }
     apply_label(&state, user_id, cred.id, body.label.as_deref()).await?;
 
-    // The new account is signed in by the same ceremony (ADR-003): a
-    // session, never a token (ADR-005).
+    // The new account is signed in by the same ceremony (spec `model.md` §1): a
+    // session, never a token (spec `protocol.md` §5).
     let cookie = open_session(&state, &user).await?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
 
-/// A free generated username on this server (ADR-003). A clash with an
+/// A free generated username on this server (spec `model.md` §1). A clash with an
 /// existing account is retried; a few in a row means something else is wrong.
 /// The name of the account in every passkey made for it: what a passkey
 /// manager shows next to the passkey. The same for the first passkey, those
@@ -471,41 +438,13 @@ pub async fn rename_passkey(
 /// `POST /auth/login/begin`
 pub async fn login_begin(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<BeginLoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (rcr, login) = match body.username.as_deref() {
-        Some(username) => {
-            let root_id =
-                RootId::parse(username).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-            let user = state
-                .store
-                .fetch_user_by_username(&root_id.username, &root_id.server)
-                .await
-                .map_err(|e| internal!(e))?
-                .ok_or(ApiError::NotFound)?;
-            let passkeys = load_passkeys(&state.store, user.id)
-                .await
-                .map_err(|e| internal!(e))?;
-            let (rcr, auth_state) = state
-                .webauthn
-                .begin_authentication(&passkeys)
-                .map_err(|e| internal!(e))?;
-            (
-                rcr,
-                PendingLogin::Named {
-                    user_id: user.id,
-                    state: auth_state,
-                },
-            )
-        }
-        None => {
-            let (rcr, auth_state) = state
-                .webauthn
-                .begin_discoverable_authentication()
-                .map_err(|e| internal!(e))?;
-            (rcr, PendingLogin::Discoverable(auth_state))
-        }
-    };
+    // Discoverable passkeys only: the authenticator says whose it is.
+    let (rcr, auth_state) = state
+        .webauthn
+        .begin_discoverable_authentication()
+        .map_err(|e| internal!(e))?;
+    let login = PendingLogin::Discoverable(auth_state);
 
     let session_id = Uuid::new_v4();
     state.evict_expired_pending();
@@ -554,7 +493,7 @@ pub async fn login_finish(
 
     // A session, never a token: brig·id's API takes no ID token as a
     // credential, and a relying party gets one only through its own flow
-    // (ADR-005).
+    // (spec `protocol.md` §5).
     let cookie = open_session(&state, &user).await?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }

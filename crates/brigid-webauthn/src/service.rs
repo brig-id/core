@@ -232,7 +232,7 @@ pub async fn update_passkey(
 // ---------------------------------------------------------------------------
 
 /// Asks the authenticator for a discoverable credential (`residentKey:
-/// required`). Signing in takes no username (ADR-003): the passkey itself
+/// required`). Signing in takes no username (spec `model.md` §1): the passkey itself
 /// names the account, which only a discoverable credential can do.
 /// webauthn-rs' passkey registration asks for `discouraged`; synced passkey
 /// providers make discoverable credentials anyway, but a security key would
