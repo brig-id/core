@@ -33,6 +33,13 @@ flate2 = "1"
 # Only used to install a default process-wide `CryptoProvider` at startup —
 # see the call site in `run` for why this is needed.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# The certificate obtained by the server itself (ACME, RFC 8555), answered
+# with TLS-ALPN-01 (RFC 8737) on the TLS listener: aws-lc like the rest of
+# rustls, rcgen for the challenge certificate and the CSR.
+instant-acme = { version = "0.8", default-features = false, features = ["aws-lc-rs", "hyper-rustls", "rcgen"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# The certificate's notAfter, to renew in time.
+x509-parser = "0.16"
 
 serde.workspace = true
 serde_json.workspace = true
@@ -45,4 +52,7 @@ libc = "0.2"
 figment = { version = "0.10", features = ["test"] }
 http-body-util = "0.1"
 tempfile = "3"
+# The ACME test against Pebble (tests/acme_pebble.rs): a client that trusts
+# Pebble's roots and resolves the test domain to the listener.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tower = { version = "0.5", features = ["util"] }

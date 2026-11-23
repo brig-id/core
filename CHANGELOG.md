@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The server obtains its own certificate** (server-seedling#75): `server.acme = true` asks an
+  ACME authority (Let's Encrypt unless `server.acme_directory` names another) for a certificate
+  for `server.domain`, proves the domain with TLS-ALPN-01 on the TLS listener itself (port 443
+  is the only one to open), and renews it once two thirds of its lifetime have passed. The
+  account and the certificate's key are stored encrypted in `server_secrets`
+  (`EncryptedStore::acme_secret`), re-encrypted by a master key rotation; a restart reuses
+  them. `server.acme_contact` gives the authority an address; `server.acme_ca` trusts a
+  private or test authority. Tested end to end against Pebble in CI.
+
 - **21 archetypes in four groups** (`everyday`, `work`, `leisure`, `online`): the templates of
   an identity, each with its own logo, and descriptions that say what the identity is for
   rather than who sees it ("Yours alone: not even aunt Monique gets in."). `GET
@@ -66,6 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The built-in TLS listener speaks TLS 1.3 only**, with certificate files as with ACME: every
+  browser that can use a passkey speaks it. A certificate file that cannot be read now stops
+  the server with the reason, before it listens. A proxy in front (Caddy, nginx) is unchanged.
 - **Who may sign up is a policy kept in the database** (core#88): `open`,
   `invitation` (the default) or `closed`. `AppState::with_signup_open` and
   the `signup_open` field are gone; `EncryptedStore::set_signup_policy` sets

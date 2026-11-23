@@ -16,6 +16,7 @@
 //! 6. Start TLS (if cert/key configured) or plain HTTP server.
 //! 7. Await graceful shutdown on `SIGTERM` / `CTRL-C`.
 
+pub mod acme;
 pub mod config;
 pub mod metrics;
 pub mod owner;
@@ -497,13 +498,78 @@ async fn rotate_oidc_key(edition: &Edition, db: &config::DatabaseConfig) {
 
 /// The address people reach this server at, with its final slash:
 /// `server.public_url` when set, else what `domain` and `port` say.
+/// How the listener holds its certificate.
+enum TlsMode {
+    /// Plain HTTP, behind a proxy that holds it.
+    Off,
+    /// Certificate files the operator renews.
+    Files { cert: PathBuf, key: PathBuf },
+    /// Obtained and renewed by the server (ACME).
+    Acme(acme::AcmeSettings),
+}
+
+impl TlsMode {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Files { .. } => "files",
+            Self::Acme(_) => "acme",
+        }
+    }
+}
+
+/// The TLS mode the configuration asks for. A configuration that names
+/// half of one, or two at once, stops the server: falling back to plain HTTP
+/// would silently disable TLS whenever an operator mistypes a single path.
+fn tls_mode(server: &config::ServerConfig) -> TlsMode {
+    match (server.acme, server.tls_cert.clone(), server.tls_key.clone()) {
+        (true, None, None) => {
+            let domain = server.domain.trim().to_ascii_lowercase();
+            if domain.parse::<std::net::IpAddr>().is_ok()
+                || !domain.contains('.')
+                || domain.ends_with(".localhost")
+            {
+                panic!(
+                    "server.acme needs a public DNS name in server.domain, not {domain:?}: \
+                     the certificate authority must reach it"
+                );
+            }
+            TlsMode::Acme(acme::AcmeSettings {
+                domain,
+                directory: server
+                    .acme_directory
+                    .clone()
+                    .unwrap_or_else(|| acme::LETS_ENCRYPT.to_owned()),
+                contact: server.acme_contact.clone(),
+                ca: server.acme_ca.clone(),
+            })
+        }
+        (true, _, _) => panic!(
+            "server.acme and server.tls_cert/tls_key are both set: the certificate comes from \
+             one or the other"
+        ),
+        (false, Some(cert), Some(key)) => TlsMode::Files { cert, key },
+        (false, None, None) => TlsMode::Off,
+        (false, Some(_), None) => panic!(
+            "server.tls_cert is set but server.tls_key is missing — \
+             both must be set together (HTTPS) or both omitted (plain HTTP)"
+        ),
+        (false, None, Some(_)) => panic!(
+            "server.tls_key is set but server.tls_cert is missing — \
+             both must be set together (HTTPS) or both omitted (plain HTTP)"
+        ),
+    }
+}
+
 fn public_url(cfg: &config::Config) -> Url {
     match cfg.server.public_url {
         Some(ref u) => u
             .parse()
             .expect("invalid `server.public_url` in configuration"),
         None => {
-            let scheme = if cfg.server.tls_cert.is_some() && cfg.server.tls_key.is_some() {
+            let scheme = if cfg.server.acme
+                || (cfg.server.tls_cert.is_some() && cfg.server.tls_key.is_some())
+            {
                 "https"
             } else {
                 "http"
@@ -973,6 +1039,8 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
             .with_confirmation_ttl(Duration::from_secs(cfg.security.admin_confirmation_seconds)),
     );
     announce_administration(edition, &state).await;
+    // The certificate obtained with ACME is kept in the database.
+    let acme_store = state.store.clone();
     let api_router = build_router(state, &cors_origins);
 
     // The interface. A released build carries it; `server.ui_dist_dir`, the
@@ -1063,56 +1131,68 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
         });
     }
 
-    match (cfg.server.tls_cert, cfg.server.tls_key) {
-        (Some(cert), Some(key)) => {
-            tracing::info!(
-                %addr,
-                domain = %cfg.server.domain,
-                tls = true,
-                session_idle_secs = cfg.security.session_ttl_seconds,
-                session_lifetime_secs = cfg.security.session_lifetime_seconds,
-                edition = edition.name,
-                "brig·id server starting"
-            );
-            let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
-                .await
-                .expect("failed to load TLS certificate/key — check tls_cert/tls_key paths");
-            axum_server::bind_rustls(addr, tls_config)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .expect("TLS server error");
-        }
-        (None, None) => {
+    let tls = tls_mode(&cfg.server);
+    tracing::info!(
+        %addr,
+        domain = %cfg.server.domain,
+        tls = tls.name(),
+        session_idle_secs = cfg.security.session_ttl_seconds,
+        session_lifetime_secs = cfg.security.session_lifetime_seconds,
+        edition = edition.name,
+        "brig·id server starting"
+    );
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    match tls {
+        TlsMode::Off => {
             tracing::warn!(
-                %addr,
-                domain = %cfg.server.domain,
-                tls = false,
-                session_idle_secs = cfg.security.session_ttl_seconds,
-                session_lifetime_secs = cfg.security.session_lifetime_seconds,
-                "TLS not configured — running plain HTTP (use Caddy or configure tls_cert/tls_key)"
+                "TLS not configured — running plain HTTP (behind a proxy that holds the \
+                 certificate, or set `server.acme`, or `tls_cert`/`tls_key`)"
             );
             axum_server::bind(addr)
                 .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .serve(service)
                 .await
                 .expect("HTTP server error");
         }
-        // Refuse to start when only one of (tls_cert, tls_key) is set: falling
-        // back to plain HTTP would silently disable TLS whenever an operator
-        // mistypes a single path. A hard failure surfaces the
-        // misconfiguration at startup rather than after public exposure.
-        (Some(_), None) => {
-            panic!(
-                "server.tls_cert is set but server.tls_key is missing — \
-                 both must be set together (HTTPS) or both omitted (plain HTTP)"
-            );
+        TlsMode::Files { cert, key } => {
+            let read = |path: &std::path::Path| {
+                std::fs::read(path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+            };
+            let loaded = acme::load(&read(&cert), &read(&key)).unwrap_or_else(|e| {
+                panic!("the certificate in tls_cert/tls_key cannot be used: {e}")
+            });
+            let certificates = Arc::new(acme::Certificates::fixed(loaded.key));
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
+                acme::server_config(certificates),
+            ));
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
+                .serve(service)
+                .await
+                .expect("TLS server error");
         }
-        (None, Some(_)) => {
-            panic!(
-                "server.tls_key is set but server.tls_cert is missing — \
-                 both must be set together (HTTPS) or both omitted (plain HTTP)"
-            );
+        TlsMode::Acme(settings) => {
+            if cfg.server.port != 443 {
+                tracing::warn!(
+                    port = cfg.server.port,
+                    "the certificate authority checks the domain on port 443: forward it to this port"
+                );
+            }
+            let certificates = Arc::new(acme::Certificates::default());
+            let manager = acme::Acme::new(settings, acme_store, certificates.clone());
+            let listening = handle.clone();
+            tokio::spawn(manager.run(async move {
+                listening.listening().await;
+            }));
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(
+                acme::server_config(certificates),
+            ));
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
+                .serve(service)
+                .await
+                .expect("TLS server error");
         }
     }
 }

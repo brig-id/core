@@ -22,7 +22,7 @@ advisories and to build for every target. Stripping symbols would save 2.6 MB (1
 | Library | Language | Brought by | Used for |
 | --- | --- | --- | --- |
 | RustCrypto (`ed25519-dalek`, `p256`, `sha2`, `sha3`, `aes-gcm`, `hkdf`…) | Rust | `brigid-crypto`, `jsonwebtoken` (`rust_crypto`) | Our own cryptography: storage encryption, key derivation, ID tokens, client assertions |
-| aws-lc (`aws-lc-rs`, `aws-lc-sys`) | C and assembly | `rustls` (`axum-server`, `reqwest`) | TLS: the server's own certificate when it serves HTTPS itself, and reading the documents of sites |
+| aws-lc (`aws-lc-rs`, `aws-lc-sys`) | C and assembly | `rustls` (`axum-server`, `reqwest`, `instant-acme`) | TLS: the server's own certificate when it serves HTTPS itself (with the ACME account and the certificate's key, `rcgen`), and reading the documents of sites |
 | OpenSSL (`openssl`, `openssl-sys`; vendored in the static binary) | C | `webauthn-rs-core` 0.5 | **Every passkey sign-in** (verifying the assertion's signature, `COSEKey::verify_signature`), SHA-256 inside webauthn-rs, and attestation chains (never asked for) |
 | ring | C and assembly | `sqlx` (`runtime-tokio-rustls`) | **Nothing**: sqlx only needs TLS for network databases; SQLite has none. Removed here |
 
