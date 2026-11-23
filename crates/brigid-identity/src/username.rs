@@ -1,10 +1,9 @@
-//! Generated account usernames ([ADR-003] in the spec): the username is an
+//! Generated account usernames (spec `model.md` §1): the username is an
 //! internal sign-in handle the user never types, so the server picks one.
 //!
 //! `<adjective>-<animal>-<4 digits>`: readable when it must be read (support,
 //! logs), about 37 million combinations, and valid for [`crate::RootId`].
 //!
-//! [ADR-003]: https://github.com/brig-id/spec/blob/main/decisions/003-usernames-and-quick-signup.md
 
 const ADJECTIVES: [&str; 64] = [
     "amber", "brave", "bright", "calm", "clever", "cosy", "crisp", "curious", "dapper", "deft",

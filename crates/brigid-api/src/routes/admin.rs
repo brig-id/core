@@ -822,29 +822,6 @@ pub async fn revoke_invitation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// -- The server ----------------------------------------------------------------------
-
-/// What runs here. The same is public in `GET /auth/server`; this answer
-/// stays for the administration, which asks it.
-#[derive(Debug, Serialize)]
-pub struct ServerView {
-    /// The edition (`seedling`), when the program said which it is.
-    pub edition: Option<String>,
-    /// Its version.
-    pub version: Option<String>,
-}
-
-/// `GET /admin/server`
-pub async fn server(
-    State(state): State<Arc<AppState>>,
-    Administrator(_): Administrator,
-) -> Json<ServerView> {
-    Json(ServerView {
-        edition: state.edition.as_ref().map(|e| e.name.clone()),
-        version: state.edition.as_ref().map(|e| e.version.clone()),
-    })
-}
-
 // -- The log -----------------------------------------------------------------------
 
 /// An entry of the log, with the names it can still be given.

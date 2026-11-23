@@ -54,12 +54,10 @@ impl From<Identity> for IdentityView {
     }
 }
 
-/// Create from scratch (`name` and `logo` required) or from a `template`,
-/// whose defaults fill whatever the request leaves out.
+/// A new identity: its `name` and `logo` are required. The archetypes that
+/// fill them belong to the interface; the server only receives the values.
 #[derive(Debug, Deserialize)]
 pub struct CreateIdentityRequest {
-    #[serde(default)]
-    pub template: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -71,20 +69,7 @@ pub struct CreateIdentityRequest {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TemplateView {
-    /// The group it is shown in: `everyday`, `work`, `leisure`, `online`.
-    pub group: &'static str,
-    pub key: &'static str,
-    pub name: &'static str,
-    pub logo: &'static str,
-    pub description: &'static str,
-    /// One of the identities the onboarding proposes to a new account. The
-    /// browser creates the ones the person keeps; the server creates none.
-    pub starter: bool,
-}
-
-/// A new identity of `account_id` with a fresh id (ADR-007: the id is what
+/// A new identity of `account_id` with a fresh id (spec `protocol.md` §2: the id is what
 /// its VSIDs are derived from).
 pub(crate) fn new_identity(
     account_id: Uuid,
@@ -104,29 +89,6 @@ pub(crate) fn new_identity(
         created_at: now,
         updated_at: now,
     }
-}
-
-/// `GET /account/identity-templates`: the templates offered at creation,
-/// the starters first, in the order the onboarding proposes them.
-pub async fn list_templates() -> impl IntoResponse {
-    let starters = brigid_identity::templates::DEFAULT_TEMPLATE_KEYS;
-    let view = |t: &'static brigid_identity::IdentityTemplate| TemplateView {
-        group: t.group,
-        key: t.key,
-        name: t.name,
-        logo: t.logo,
-        description: t.description,
-        starter: starters.contains(&t.key),
-    };
-    let views: Vec<TemplateView> = brigid_identity::default_templates()
-        .chain(
-            brigid_identity::TEMPLATES
-                .iter()
-                .filter(|t| !starters.contains(&t.key)),
-        )
-        .map(view)
-        .collect();
-    Json(views)
 }
 
 /// Every field is optional; an empty `description` clears it. `attributes`
@@ -192,24 +154,13 @@ pub async fn create_identity(
 ) -> Result<impl IntoResponse, ApiError> {
     let account_id = session.account.id;
 
-    let template = match body.template.as_deref() {
-        Some(key) => Some(
-            brigid_identity::template(key)
-                .ok_or_else(|| ApiError::BadRequest(format!("unknown template: {key}")))?,
-        ),
-        None => None,
-    };
     let name = body
         .name
-        .or_else(|| template.map(|t| t.name.to_string()))
         .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
     let logo = body
         .logo
-        .or_else(|| template.map(|t| t.logo.to_string()))
         .ok_or_else(|| ApiError::BadRequest("logo is required".into()))?;
-    let description = body
-        .description
-        .or_else(|| template.map(|t| t.description.to_string()));
+    let description = body.description;
     let mut attributes = Attributes::new();
     apply_attributes(&mut attributes, body.attributes)?;
     let identity = new_identity(account_id, name, logo, description, attributes);

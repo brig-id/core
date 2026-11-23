@@ -90,7 +90,7 @@ pub enum Prompt {
     None,
 }
 
-/// An authorization request (ADR-005 §2) that passed validation and waits
+/// An authorization request (spec `protocol.md` §6) that passed validation and waits
 /// for the person: sign in if needed, then choose an identity.
 #[derive(Debug, Clone)]
 pub struct PendingAuthorization {
@@ -98,7 +98,7 @@ pub struct PendingAuthorization {
     pub redirect_uri: String,
     pub state: Option<String>,
     pub nonce: Option<String>,
-    /// PKCE `S256` challenge (ADR-008: every client sends one).
+    /// PKCE `S256` challenge (spec `protocol.md` §6: every client sends one).
     pub code_challenge: String,
     pub prompt: Prompt,
     /// The attributes the request asks for, and whether the application
@@ -170,10 +170,10 @@ pub struct AppState {
     /// they signed still verify and they stay in the JWKS (core#22).
     pub retired_oidc_keys: Vec<Arc<OidcSigningKey>>,
     pub base_url: Url,
-    /// An account session ends after this long without use (ADR-005).
+    /// An account session ends after this long without use (spec `protocol.md` §5).
     pub session_idle: Duration,
     /// An account session ends this long after the passkey ceremony that
-    /// opened it, used or not (ADR-005).
+    /// opened it, used or not (spec `protocol.md` §5).
     pub session_lifetime: Duration,
     /// The keying material of every VSID: `EncryptedStore::vsid_secret`.
     pub vsid_salt: [u8; 32],
@@ -235,9 +235,9 @@ impl AppState {
             admin_log_retention: ADMIN_LOG_RETENTION,
             confirmation_ttl: CONFIRMATION_TTL,
             edition: None,
-            // Default to false — safe for direct exposure and tests. The
-            // production deployment binary (`server-leaf`) must opt-in when
-            // Caddy (or another trusted proxy) terminates the public TLS edge.
+            // Default to false — safe for direct exposure and tests. An
+            // edition behind a trusted proxy (Caddy, nginx) that replaces
+            // `X-Forwarded-For` opts in (`security.trust_forwarded_for`).
             trust_forwarded_for: false,
             described: Arc::new(crate::described::Described::new(default_fetcher())),
         }

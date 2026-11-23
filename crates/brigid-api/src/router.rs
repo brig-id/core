@@ -8,17 +8,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
     Router,
     extract::ConnectInfo,
-    http::{
-        HeaderName, HeaderValue, Request,
-        header::{ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONTENT_TYPE},
-    },
+    http::{HeaderName, HeaderValue, Request, header::ACCESS_CONTROL_ALLOW_ORIGIN},
     routing::{delete, get, patch, post, put},
 };
 use tower_governor::{
     GovernorError, GovernorLayer, governor::GovernorConfigBuilder, key_extractor::KeyExtractor,
 };
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
-use url::Url;
+use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 use crate::{
     routes::{account, admin, auth, authorize, discovery, health, identities, recovery, token},
@@ -81,11 +77,10 @@ impl KeyExtractor for ForwardedForExtractor {
     }
 }
 
-/// Build the Axum router for the brig·id API.
-///
-/// `cors_origins` is the list of allowed CORS origins. Pass an empty slice to
-/// disable CORS (useful in tests).
-pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
+/// Build the Axum router for the brig·id API. The interface is served from
+/// the same origin: the account's routes answer no other one. The token
+/// endpoint and the keys answer any origin, for pages that sign in.
+pub fn build_router(state: Arc<AppState>) -> Router {
     // Security headers applied to every response.
     let security_headers = tower::ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -115,32 +110,6 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
                  form-action 'none'",
             ),
         ));
-
-    // CORS — only add if origins are provided.
-    let cors = if cors_origins.is_empty() {
-        CorsLayer::new()
-    } else {
-        let origins: Vec<_> = cors_origins
-            .iter()
-            .map(|u| {
-                u.as_str()
-                    .trim_end_matches('/')
-                    .parse::<HeaderValue>()
-                    .expect("CORS origin is not a valid header value — check configuration")
-            })
-            .collect();
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::PATCH,
-                axum::http::Method::PUT,
-                axum::http::Method::DELETE,
-                axum::http::Method::OPTIONS,
-            ])
-            .allow_headers([CONTENT_TYPE, AUTHORIZATION])
-    };
 
     // Two rate limits, each per client IP.
     //
@@ -176,7 +145,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             post(auth::add_credential_finish),
         )
         // Recovery is a ceremony too, and its code is what an attacker would
-        // guess: it shares this stricter limit (ADR-004: no lockout).
+        // guess: it shares this stricter limit (spec `protocol.md` §7: no lockout).
         .route("/auth/recovery/begin", post(recovery::begin))
         .route("/auth/recovery/finish", post(recovery::finish))
         .layer(axum::middleware::from_fn_with_state(
@@ -231,14 +200,9 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/admin/invitations", post(admin::invite))
         .route("/admin/invitations/{id}", delete(admin::revoke_invitation))
         .route("/admin/log", get(admin::read_log))
-        .route("/admin/server", get(admin::server))
         // Leaving: a passkey ceremony of its own, then nothing is left.
         .route("/account/delete/begin", post(account::delete_begin))
         .route("/account/delete/finish", post(account::delete_finish))
-        .route(
-            "/account/identity-templates",
-            get(identities::list_templates),
-        )
         .route(
             "/account/identities",
             get(identities::list_identities).post(identities::create_identity),
@@ -260,7 +224,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
             "/account/identities/{id}/applications/{client_id}/attributes/{name}",
             delete(identities::withdraw_attribute),
         )
-        // The person's answer to an authorization request (ADR-005 §2),
+        // The person's answer to an authorization request (spec `protocol.md` §6),
         // from this server's own page.
         .route("/auth/authorize/{request}", get(authorize::request))
         .route(
@@ -270,7 +234,7 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .route("/auth/authorize/{request}/deny", post(authorize::deny))
         .route("/auth/authorize/{request}/silent", post(authorize::silent))
         // Account sessions live in a cookie: every request that changes
-        // something must come from this server's own pages (ADR-005 §1).
+        // something must come from this server's own pages (spec `protocol.md` §5).
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             session::require_same_origin,
@@ -325,14 +289,6 @@ pub fn build_router(state: Arc<AppState>, cors_origins: &[Url]) -> Router {
         .merge(token_routes)
         .merge(discovery_routes)
         .merge(health_routes)
-        // `cors` is added before `security_headers` so that `security_headers`
-        // becomes the outermost layer. `CorsLayer` short-circuits preflight
-        // OPTIONS requests with its own response *inside* the layer it wraps;
-        // if `security_headers` were inside `cors`, those preflight responses
-        // would bypass the security headers entirely. Wrapping the other way
-        // round guarantees every response — including CORS preflights and
-        // CORS-rejected requests — carries the full security header set.
-        .layer(cors)
         .layer(security_headers)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
