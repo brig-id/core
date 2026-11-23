@@ -65,6 +65,26 @@ pub struct ServerConfig {
     /// Path to the TLS private key PEM file. Required for HTTPS.
     pub tls_key: Option<PathBuf>,
 
+    /// Obtain and renew the certificate itself, with ACME (Let's Encrypt
+    /// unless `acme_directory` names another authority). The domain is
+    /// proved on this listener (TLS-ALPN-01): the authority must reach it on
+    /// port 443 under `domain`. Exclusive with `tls_cert`/`tls_key`.
+    #[serde(default)]
+    pub acme: bool,
+
+    /// The ACME directory URL. Default: Let's Encrypt's production one.
+    #[serde(default)]
+    pub acme_directory: Option<String>,
+
+    /// An e-mail address the authority may write to about the certificate.
+    #[serde(default)]
+    pub acme_contact: Option<String>,
+
+    /// A PEM file holding the authority's root certificate, for an
+    /// authority that is not publicly trusted (a private one, a test one).
+    #[serde(default)]
+    pub acme_ca: Option<PathBuf>,
+
     /// Path to the pre-built Qwik UI static files (e.g. `"ui/dist"`).
     ///
     /// When set, requests that do not match any API route are served from this

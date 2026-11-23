@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 use crate::{
     error::{Error, Result},
     model::{
-        Client, ClientList, ClientPolicy, Credential, Decision, Grant, Identity, LinkKind,
-        RecoveryStatus, StoredOidcKey, User,
+        AcmeSecret, Client, ClientList, ClientPolicy, Credential, Decision, Grant, Identity,
+        LinkKind, RecoveryStatus, StoredOidcKey, User,
     },
 };
 
@@ -737,6 +737,35 @@ impl EncryptedStore {
             .try_into()
             .map_err(|_| Error::InvalidBlob)?;
         Ok(Zeroizing::new(secret))
+    }
+
+    /// A secret the server keeps for its own certificate (ACME): `None` until
+    /// the first one is stored. Encrypted in `server_secrets` like the VSID
+    /// secret, and re-encrypted with it by a master key rotation.
+    pub async fn acme_secret(&self, which: AcmeSecret) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let key = server_secret_key(&self.master)?;
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = ?")
+                .bind(which.name())
+                .fetch_optional(&self.pool)
+                .await?;
+        stored
+            .map(|raw| dec(&key, &raw).map(Zeroizing::new))
+            .transpose()
+    }
+
+    /// Store (or replace) a secret of the server's certificate.
+    pub async fn set_acme_secret(&self, which: AcmeSecret, value: &[u8]) -> Result<()> {
+        let key = server_secret_key(&self.master)?;
+        sqlx::query(
+            "INSERT INTO server_secrets (name, value) VALUES (?, ?) \
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+        )
+        .bind(which.name())
+        .bind(enc(&key, value)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete keys retired before `before` (their grace period is over: every
@@ -2513,6 +2542,68 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!raw.windows(32).any(|w| w == first.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn acme_secrets_are_encrypted_replaced_and_survive_a_rotation() {
+        let mut store = EncryptedStore::new("sqlite::memory:", master())
+            .await
+            .unwrap();
+        let vsid = store.vsid_secret().await.unwrap();
+        assert!(
+            store
+                .acme_secret(AcmeSecret::Certificate)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let pem = b"-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----\n";
+        store
+            .set_acme_secret(AcmeSecret::Certificate, pem)
+            .await
+            .unwrap();
+        store
+            .set_acme_secret(AcmeSecret::Account, b"{\"id\":\"a\"}")
+            .await
+            .unwrap();
+        // Not stored in clear (core#75: keys encrypted at rest).
+        let raw: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = 'acme_certificate'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(
+            !raw.windows(b"PRIVATE KEY".len())
+                .any(|w| w == b"PRIVATE KEY")
+        );
+
+        // A renewal replaces it; the VSID secret is untouched.
+        store
+            .set_acme_secret(AcmeSecret::Certificate, b"renewed")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .acme_secret(AcmeSecret::Certificate)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"renewed"
+        );
+        assert_eq!(*store.vsid_secret().await.unwrap(), *vsid);
+
+        store.rotate_master_key(new_master()).await.unwrap();
+        assert_eq!(
+            store
+                .acme_secret(AcmeSecret::Account)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"{\"id\":\"a\"}"
+        );
     }
 
     #[tokio::test]

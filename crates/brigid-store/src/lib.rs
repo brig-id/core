@@ -10,9 +10,9 @@ pub mod store;
 
 pub use error::{Error, Result};
 pub use model::{
-    AccountStanding, AccountSummary, AdminAction, AdminLogEntry, ApplicationType, Client,
-    ClientAuth, ClientDocument, ClientList, ClientPolicy, Credential, Decision, Grant, Identity,
-    Link, LinkKind, RecoveryStatus, SignupPolicy, StoredOidcKey, User,
+    AccountStanding, AccountSummary, AcmeSecret, AdminAction, AdminLogEntry, ApplicationType,
+    Client, ClientAuth, ClientDocument, ClientList, ClientPolicy, Credential, Decision, Grant,
+    Identity, Link, LinkKind, RecoveryStatus, SignupPolicy, StoredOidcKey, User,
 };
 pub use store::{EncryptedStore, SessionInfo, fetch_user, fetch_user_by_username, store_user};
 

@@ -12,3 +12,68 @@ permissions:
 jobs:
   ci:
     uses: brig-id/.github/.github/workflows/ci-rust.yml@5e019131d735e4ed0bd3598b5a61137bdae7eff3
+
+  # The certificate obtained with ACME (core#75), end to end against Pebble,
+  # the test authority of Let's Encrypt, and its DNS server answering
+  # 127.0.0.1 for every name. Release binaries pinned by digest; the test
+  # certificates and configuration from the same tag of its repository.
+  acme:
+    name: ACME against Pebble
+    runs-on: ubuntu-latest
+    env:
+      PEBBLE_VERSION: v2.10.1
+      PEBBLE_SHA256: 4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed
+      CHALLTESTSRV_SHA256: e93a5aa25ecdf3af2f9fbb2de32b0173e64a2eae81002a4ccfe35fa6f4f60b92
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: letsencrypt/pebble
+          ref: b1e1ca4f3c30abb64111adaca4544bc5374cc306 # v2.10.1
+          path: pebble-src
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-08-05
+        with:
+          toolchain: stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: acme-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Pebble
+        run: |
+          set -euo pipefail
+          base="https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION"
+          curl -fsSLo pebble.tar.gz "$base/pebble-linux-amd64.tar.gz"
+          curl -fsSLo challtestsrv.tar.gz "$base/pebble-challtestsrv-linux-amd64.tar.gz"
+          echo "$PEBBLE_SHA256  pebble.tar.gz" | sha256sum -c -
+          echo "$CHALLTESTSRV_SHA256  challtestsrv.tar.gz" | sha256sum -c -
+          mkdir -p pebble-bin
+          tar xzf pebble.tar.gz -C pebble-bin
+          tar xzf challtestsrv.tar.gz -C pebble-bin
+          bin=pebble-bin/pebble-linux-amd64/linux/amd64/pebble
+          dns=pebble-bin/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
+          "$dns" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dns01 127.0.0.1:8053 \
+            -http01 "" -tlsalpn01 "" -https01 "" -doh "" -management 127.0.0.1:8055 \
+            > challtestsrv.log 2>&1 &
+          (cd pebble-src && PEBBLE_VA_NOSLEEP=1 "../$bin" -config test/config/pebble-config.json \
+            -dnsserver 127.0.0.1:8053 > ../pebble.log 2>&1 &)
+          for _ in $(seq 30); do
+            curl -fsk https://localhost:14000/dir > /dev/null && exit 0
+            sleep 1
+          done
+          cat pebble.log challtestsrv.log
+          exit 1
+      - name: Obtain, serve and renew a certificate
+        env:
+          BRIGID_PEBBLE_DIRECTORY: https://localhost:14000/dir
+          BRIGID_PEBBLE_CA: pebble-src/test/certs/pebble.minica.pem
+          BRIGID_PEBBLE_TLS_PORT: "5001"
+        run: |
+          export BRIGID_PEBBLE_CA="$GITHUB_WORKSPACE/$BRIGID_PEBBLE_CA"
+          cargo test -p brigid-server --test acme_pebble -- --nocapture
+      - name: Pebble's log
+        if: failure()
+        run: cat pebble.log challtestsrv.log

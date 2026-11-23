@@ -45,6 +45,25 @@ pub struct Identity {
     pub updated_at: OffsetDateTime,
 }
 
+/// What the server keeps to hold its own certificate (ACME).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeSecret {
+    /// The account at the certificate authority: its key and URL.
+    Account,
+    /// The current certificate chain and its private key.
+    Certificate,
+}
+
+impl AcmeSecret {
+    /// Its row in `server_secrets`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Account => "acme_account",
+            Self::Certificate => "acme_certificate",
+        }
+    }
+}
+
 /// A stored OIDC signing key: its `kid` and decrypted 32-byte seed.
 /// `retired_at` is `None` for the current key.
 pub struct StoredOidcKey {
