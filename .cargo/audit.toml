@@ -5,17 +5,12 @@
 # DB backends). This project uses SQLite only and does not use RSA or MySQL.
 # No upstream fix is available.
 #
-# RUSTSEC-2024-0436: paste crate marked unmaintained.
-# Transitive dependency via the Leptos / Tachys reactive stack (see
-# `cargo tree -i paste` — the path is `paste → tachys → leptos`, not via
-# `webauthn-rs-proto` which the previous comment incorrectly named). `paste`
-# is a proc-macro helper with no runtime security impact. No fix is available
-# upstream.
-#
 # RUSTSEC-2026-0387: timing variability in `crypto-bigint` 0.5.x (fixed in >=0.7.6).
 # Pulled in by elliptic-curve 0.13 -> ecdsa -> p256 -> jsonwebtoken, whose `rust_crypto`
-# feature compiles every algorithm. brigid-oidc only signs and verifies with
-# Algorithm::EdDSA (Ed25519), so the P-256 / ECDSA code path is never executed.
+# feature compiles every algorithm. ID tokens are EdDSA (Ed25519). P-256 runs in one place:
+# verifying the ES256 client assertions of sites that describe themselves (brigid-api,
+# routes/token.rs). A verification handles public data only (the site's public key, its
+# signature, the signed bytes): its timing has no secret to reveal.
 # Revisit when jsonwebtoken / p256 move to elliptic-curve 0.14 (crypto-bigint >= 0.7).
 #
 # RUSTSEC-2026-0459: SQLite < 3.54 can return stale page-cache bytes when it opens a
@@ -25,4 +20,4 @@
 # to plant the `-wal` file can already read and replace the database. Revisit when sqlx
 # moves to libsqlite3-sys >= 0.39.
 [advisories]
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2024-0436", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
