@@ -26,7 +26,7 @@ webauthn-rs = { version = "0.5", features = [
 webauthn-rs-proto = "0.5"
 
 [dev-dependencies]
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
   "sqlite",
   "runtime-tokio",
   "migrate",
