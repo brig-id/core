@@ -73,6 +73,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`client.host`), shown first since anyone can declare any name, and its
   logo (`client.logo`) only for a site the operator accepted.
 
+### Removed
+
+- **What the interface took over** (the app keeps its archetypes since app#94): the identity
+  templates (`brigid_identity::templates`, `GET /account/identity-templates`) and the
+  `template` field of `POST /account/identities`, which now needs a `name` and a `logo`.
+- **`username` at sign-up and sign-in**: the server always generates the username, and a
+  sign-in always asks a discoverable passkey (`POST /auth/login/begin` takes no body); only
+  tests sent one.
+- **`security.cors_origins`** and the CORS layer it configured, a remnant of an interface on
+  another origin with a bearer token. The account's routes answer no other origin; the token
+  endpoint, the keys and discovery still answer any. A deployment that still sets it starts
+  as before.
+- **`GET /admin/server`**: the interface reads `GET /auth/server`.
+- References to the removed decision records (ADR-003 to ADR-008) in comments now name the
+  sections of the specification.
+
 ### Changed
 
 - **The built-in TLS listener speaks TLS 1.3 only**, with certificate files as with ACME: every

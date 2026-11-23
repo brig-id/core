@@ -130,10 +130,6 @@ pub struct SecurityConfig {
     #[serde(default = "default_session_lifetime")]
     pub session_lifetime_seconds: u64,
 
-    /// Allowed CORS origins (e.g. `["https://example.com"]`).
-    #[serde(default)]
-    pub cors_origins: Vec<String>,
-
     /// Rate-limit per client IP taken from `X-Forwarded-For` instead of the
     /// TCP peer address.
     ///
@@ -164,7 +160,6 @@ impl Default for SecurityConfig {
         Self {
             session_ttl_seconds: default_session_ttl(),
             session_lifetime_seconds: default_session_lifetime(),
-            cors_origins: Vec::new(),
             trust_forwarded_for: false,
             admin_log_retention_days: default_admin_log_retention_days(),
             admin_confirmation_seconds: default_admin_confirmation_seconds(),
@@ -289,7 +284,6 @@ mod tests {
         assert_eq!(cfg.server.host, "0.0.0.0");
         assert_eq!(cfg.server.port, 8080);
         assert_eq!(cfg.security.session_ttl_seconds, 3600);
-        assert!(cfg.security.cors_origins.is_empty());
         assert!(!cfg.security.trust_forwarded_for);
         assert!(cfg.server.tls_cert.is_none());
         assert!(cfg.server.tls_key.is_none());
@@ -309,7 +303,6 @@ mod tests {
         assert_eq!(cfg.server.port, 8080);
         // Defaults must apply for the omitted sections just like for empty ones.
         assert_eq!(cfg.security.session_ttl_seconds, 3600);
-        assert!(cfg.security.cors_origins.is_empty());
         assert!(!cfg.database.path.is_empty());
     }
 
@@ -337,15 +330,13 @@ mod tests {
             },
             "database": { "path": "/data/brigid.db" },
             "security": {
-                "session_ttl_seconds": 7200,
-                "cors_origins": ["https://example.com"]
+                "session_ttl_seconds": 7200
             }
         }));
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 9090);
         assert_eq!(cfg.server.domain, "example.com");
         assert_eq!(cfg.security.session_ttl_seconds, 7200);
-        assert_eq!(cfg.security.cors_origins, ["https://example.com"]);
         assert!(cfg.server.tls_cert.is_some());
     }
 
@@ -399,29 +390,17 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail closure must return figment::Error.
-    fn cors_origins_can_be_set_via_env() {
-        // `cors_origins` is a `Vec<String>`. Figment's Env provider with
-        // `split("__")` accepts a TOML-array-literal-encoded string for
-        // sequence fields (e.g. `["https://a","https://b"]`); the
-        // `deploy/compose.yaml` template relies on this encoding to push the
-        // production origin list through `BRIGID_SECURITY__CORS_ORIGINS`.
+    fn a_setting_that_no_longer_exists_is_ignored() {
+        // `security.cors_origins` served an interface on another origin. The
+        // interface is the server's own now; a deployment that still sets it
+        // starts as before.
         figment::Jail::expect_with(|jail| {
-            jail.set_env(
-                "BRIGID_SECURITY__CORS_ORIGINS",
-                "[\"https://a.example\",\"https://b.example\"]",
-            );
+            jail.set_env("BRIGID_SECURITY__CORS_ORIGINS", "[\"https://a.example\"]");
             let cfg: Config = Figment::new()
                 .merge(Serialized::defaults(minimal()))
                 .merge(env_settings("BRIGID_"))
                 .extract()?;
-
-            assert_eq!(
-                cfg.security.cors_origins,
-                vec![
-                    "https://a.example".to_string(),
-                    "https://b.example".to_string(),
-                ]
-            );
+            assert_eq!(cfg.server.domain, "localhost");
             Ok(())
         });
     }

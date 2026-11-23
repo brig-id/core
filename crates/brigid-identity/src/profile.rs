@@ -2,7 +2,7 @@
 //! relying party.
 //!
 //! An identity belongs to a private account and is identified by its UUID
-//! (ADR-007): renaming it never changes the VSID derived from that id.
+//! (spec `protocol.md` §2): renaming it never changes the VSID derived from that id.
 
 use crate::{Error, Result};
 

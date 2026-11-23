@@ -1,4 +1,4 @@
-//! Account sessions (ADR-005 §1): a random token in an `HttpOnly` cookie, the
+//! Account sessions (spec `protocol.md` §5): a random token in an `HttpOnly` cookie, the
 //! account taken from the server-side session, and same-origin checks on
 //! requests that change something.
 
@@ -241,7 +241,7 @@ impl FromRequestParts<Arc<AppState>> for ConfirmedAdministrator {
 
 /// Refuses a request that changes something (any method but GET, HEAD,
 /// OPTIONS) unless its `Origin` is this server's: with `SameSite=Strict`, the
-/// second barrier against cross-site requests (ADR-005 §1). Browsers send
+/// second barrier against cross-site requests (spec `protocol.md` §5). Browsers send
 /// `Origin` on every such request; one without it is refused too.
 pub async fn require_same_origin(
     State(state): State<Arc<AppState>>,

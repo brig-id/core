@@ -7,12 +7,11 @@ use sha3::Sha3_256;
 use uuid::Uuid;
 
 /// A Virtual Stable Identifier (VSID): the `sub` a relying party sees for an
-/// identity ([ADR-007] in the spec). Stable per `(identity, client_id)`, and
+/// identity (spec `protocol.md` §2). Stable per `(identity, client_id)`, and
 /// different for every `client_id`, so two relying parties can't link their
 /// users. Computed from the identity's UUID: renaming the account, moving the
 /// server to another domain or rotating the master key changes no VSID.
 ///
-/// [ADR-007]: https://github.com/brig-id/spec/blob/main/decisions/007-identifiers.md
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vsid(String);
 
@@ -48,7 +47,7 @@ fn derive_subject(label: &[u8], id: Uuid, client_id: &str, secret: &[u8]) -> Vsi
 
 /// The VSID of identity `identity_id` at relying party `client_id`
 /// (`info` label `brigid-vsid-v2`). `secret` is the deployment's VSID secret
-/// (ADR-006).
+/// (spec `protocol.md` §2).
 pub fn identity_vsid(identity_id: Uuid, client_id: &str, secret: &[u8]) -> Vsid {
     derive_subject(b"brigid-vsid-v2", identity_id, client_id, secret)
 }

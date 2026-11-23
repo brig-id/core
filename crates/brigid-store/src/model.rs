@@ -73,7 +73,7 @@ pub struct StoredOidcKey {
     pub retired_at: Option<OffsetDateTime>,
 }
 
-/// Where an account stands with its recovery code (ADR-004).
+/// Where an account stands with its recovery code (spec `protocol.md` §7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryStatus {
     /// When the current code was generated; `None` when there is no usable code.
@@ -82,7 +82,7 @@ pub struct RecoveryStatus {
     pub last_used_at: Option<OffsetDateTime>,
 }
 
-/// A registered relying party (ADR-005 §2): a site that may ask this server to
+/// A registered relying party (spec `protocol.md` §6): a site that may ask this server to
 /// sign people in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
