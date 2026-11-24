@@ -22,7 +22,7 @@ helpers4 = { workspace = true, features = ["bytes", "hex", "random-entropy", "ti
 sha3 = { workspace = true }
 base64ct = { version = "1", features = ["alloc"] }
 
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "sqlite",
     "runtime-tokio",
     "migrate",
