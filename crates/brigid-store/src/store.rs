@@ -495,8 +495,13 @@ fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Resul
     })
 }
 
-const IDENTITY_COLUMNS: &str =
-    "id, account_id, name, logo, description, attributes, created_at, updated_at";
+/// The columns of an identity, in the order `identity_from_row` reads them.
+/// A macro, so that every query stays a string fixed at compile time.
+macro_rules! identity_columns {
+    () => {
+        "id, account_id, name, logo, description, attributes, created_at, updated_at"
+    };
+}
 
 /// Fetch one identity, only if it belongs to `account_id`.
 pub async fn fetch_identity(
@@ -505,8 +510,10 @@ pub async fn fetch_identity(
     account_id: Uuid,
     identity_id: Uuid,
 ) -> Result<Option<Identity>> {
-    let row = sqlx::query(&format!(
-        "SELECT {IDENTITY_COLUMNS} FROM identities WHERE id = ? AND account_id = ?"
+    let row = sqlx::query(concat!(
+        "SELECT ",
+        identity_columns!(),
+        " FROM identities WHERE id = ? AND account_id = ?"
     ))
     .bind(identity_id.to_string())
     .bind(account_id.to_string())
@@ -521,9 +528,10 @@ pub async fn fetch_identities(
     master: &MasterKey,
     account_id: Uuid,
 ) -> Result<Vec<Identity>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {IDENTITY_COLUMNS} FROM identities WHERE account_id = ? \
-         ORDER BY created_at, id"
+    let rows = sqlx::query(concat!(
+        "SELECT ",
+        identity_columns!(),
+        " FROM identities WHERE account_id = ? ORDER BY created_at, id"
     ))
     .bind(account_id.to_string())
     .fetch_all(pool)
@@ -3137,10 +3145,14 @@ mod tests {
     /// Raw bytes of every column of `table`, to look for plaintext in.
     async fn dump(store: &EncryptedStore, table: &str, columns: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        let rows = sqlx::query(&format!("SELECT {} FROM {table}", columns.join(", ")))
-            .fetch_all(&store.pool)
-            .await
-            .unwrap();
+        // The table and its columns are the test's own names, never input.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM {table}",
+            columns.join(", ")
+        )))
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
         for row in rows {
             for column in columns {
                 if let Ok(Some(blob)) = row.try_get::<Option<Vec<u8>>, _>(*column) {
@@ -3539,7 +3551,10 @@ mod tests {
                 ("grants", "identity_id", identity),
             ] {
                 let count: i64 =
-                    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
+                    // The test's own table and column names, never input.
+                    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                        "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
+                    )))
                         .bind(id.to_string())
                         .fetch_one(&store.pool)
                         .await

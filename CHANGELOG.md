@@ -91,6 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **sqlx 0.9** (with uuid, zeroize and clap, as Dependabot proposed in #124). sqlx 0.9 refuses
+  a query built at run time unless it is marked as audited: the two queries of identities are
+  now strings fixed at compile time; only two tests mark theirs (table names of their own).
 - **The built-in TLS listener speaks TLS 1.3 only**, with certificate files as with ACME: every
   browser that can use a passkey speaks it. A certificate file that cannot be read now stops
   the server with the reason, before it listens. A proxy in front (Caddy, nginx) is unchanged.
