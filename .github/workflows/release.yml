@@ -1,0 +1,37 @@
+name: Release
+
+# release-please keeps one pull request up to date with the next version and
+# its changelog entry, from the commits merged to main. Merging that pull
+# request is the release: this workflow then creates the tag `vX.Y.Z` and the
+# GitHub Release. Nobody tags by hand.
+#
+# The servers pin the core at a tag: a release here is what they pin.
+#
+# Needs, once, in the organisation's settings: Actions → General → "Allow
+# GitHub Actions to create and approve pull requests".
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release pull request, or the release itself
+    runs-on: ubuntu-latest
+    permissions:
+      # The tag and the GitHub Release.
+      contents: write
+      # The release pull request.
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
