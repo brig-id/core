@@ -1,0 +1,21 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>brig-id/.github"],
+  "packageRules": [
+    {
+      "description": "sha3 0.12 dropped the digest::core_api::CoreProxy impl, which breaks Hkdf<Sha3_256>/Hmac<Sha3_256>. Remove once hmac/hkdf follow.",
+      "matchPackageNames": ["sha3"],
+      "allowedVersions": "<0.12.0"
+    },
+    {
+      "description": "p256 0.14 belongs to the RustCrypto release that moves digest, signature and the rest together.",
+      "matchPackageNames": ["p256"],
+      "allowedVersions": "<0.14.0"
+    },
+    {
+      "description": "webauthn-rs 0.6 changes the server side of every ceremony; the server's tests follow it (brig-id/server-seedling).",
+      "matchPackageNames": ["webauthn-rs", "webauthn-rs-proto", "webauthn-authenticator-rs"],
+      "allowedVersions": "<0.6.0"
+    }
+  ]
+}

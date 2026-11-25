@@ -1,0 +1,29 @@
+name: Release
+
+# release-please keeps one pull request up to date with the next version and
+# its changelog entry, from the commits merged to main. Merging that pull
+# request is the release: the tag `vX.Y.Z` and the GitHub Release follow.
+# Nobody tags by hand. The shared workflow also starts CI on that pull
+# request. The servers pin a tag of this repository, and Renovate
+# proposes each new one to them.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: brig-id/.github/.github/workflows/release.yml@b5d01e58e844ef8c4fa8f1799ad56a2dbe9651a7
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      workflows: ci.yml

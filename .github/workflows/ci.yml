@@ -5,6 +5,8 @@ on:
     branches: [main, "dev/*"]
   pull_request:
     branches: [main, "dev/*"]
+  # Started by the release workflow on the release pull request.
+  workflow_dispatch:
 
 permissions:
   contents: read
