@@ -13,7 +13,7 @@ resolver = "2"
 [workspace.package]
 # The version of every crate here (`version.workspace = true`), written by release-please
 # with the crates' lines of Cargo.lock (release-please-config.json).
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
