@@ -61,6 +61,33 @@ pub enum Error {
     #[error("the last administrator cannot be removed")]
     LastAdministrator,
 
+    /// What an account or an address may create is used up: nothing was
+    /// written. Carries the limit and its value.
+    #[error("the limit {0} ({1}) is reached")]
+    LimitReached(crate::Limit, u32),
+
+    /// A limit was set below 1 or above its maximum.
+    #[error("{0} is 1 to {max}", max = crate::Limit::max(*.0))]
+    InvalidLimit(crate::Limit),
+
+    /// A file given as a backup is not a database of a brig·id server.
+    #[error("not a database of a brig·id server: {0}")]
+    NotABackup(String),
+
+    /// A backup made by a newer version of the server than this one: its
+    /// schema has steps this one does not know.
+    #[error("made by a newer version of the server (schema {found}; this one knows up to {known})")]
+    NewerSchema { found: i64, known: i64 },
+
+    /// A backup whose schema steps differ from this version's: made by
+    /// another build.
+    #[error("its schema step {0} differs from this version's: made by another build")]
+    SchemaMismatch(i64),
+
+    /// The master key opens nothing of a backup: it was made under another key.
+    #[error("the master key does not open it: it was made under another master key")]
+    WrongMasterKey,
+
     /// A `Credential` was handed to an atomic-registration entry point with
     /// a `user_id` that does not match the `User` being created. Returned
     /// by [`EncryptedStore::register_user_with_credential`](crate::EncryptedStore::register_user_with_credential)

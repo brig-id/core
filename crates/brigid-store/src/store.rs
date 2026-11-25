@@ -429,10 +429,18 @@ pub async fn store_identity(
     master: &MasterKey,
     identity: &Identity,
 ) -> Result<()> {
-    insert_identity(pool, master, identity).await
+    insert_identity(pool, master, identity, None).await
 }
 
-async fn insert_identity<'e, E>(executor: E, master: &MasterKey, identity: &Identity) -> Result<()>
+/// INSERTs `identity`; with `within`, only while its account has fewer
+/// identities than that ([`Error::LimitReached`] otherwise, nothing written).
+/// One statement: two requests at once cannot both pass the limit.
+async fn insert_identity<'e, E>(
+    executor: E,
+    master: &MasterKey,
+    identity: &Identity,
+    within: Option<u32>,
+) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
@@ -444,10 +452,11 @@ where
     };
 
     let key = user_key(master, &identity.account_id)?;
-    sqlx::query(
+    let done = sqlx::query(
         "INSERT INTO identities \
          (id, account_id, name, logo, description, attributes, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ?, ?, ? \
+         WHERE ? IS NULL OR (SELECT COUNT(*) FROM identities WHERE account_id = ?) < ?",
     )
     .bind(identity.id.to_string())
     .bind(identity.account_id.to_string())
@@ -457,9 +466,20 @@ where
     .bind(enc_attributes(&key, &identity.attributes)?)
     .bind(fmt_time(identity.created_at)?)
     .bind(fmt_time(identity.updated_at)?)
+    .bind(within.map(i64::from))
+    .bind(identity.account_id.to_string())
+    .bind(within.map(i64::from))
     .execute(executor)
     .await
     .map_err(map_sqlx_unique)?;
+    if let Some(limit) = within
+        && done.rows_affected() == 0
+    {
+        return Err(Error::LimitReached(
+            crate::Limit::IdentitiesPerAccount,
+            limit,
+        ));
+    }
     Ok(())
 }
 
@@ -793,6 +813,44 @@ impl EncryptedStore {
         store_identity(&self.pool, &self.master, identity).await
     }
 
+    /// One more identity for its account, within `identities_per_account`:
+    /// [`Error::LimitReached`] when the account has that many already (or
+    /// more, under a limit lowered since), and nothing is written.
+    pub async fn add_identity(&self, identity: &Identity) -> Result<()> {
+        let limit = self.limit(crate::Limit::IdentitiesPerAccount).await?;
+        insert_identity(&self.pool, &self.master, identity, Some(limit)).await
+    }
+
+    /// One more passkey for its account, within `passkeys_per_account`:
+    /// [`Error::LimitReached`] when the account has that many already, and
+    /// nothing is written. One statement, like [`Self::add_identity`].
+    pub async fn add_passkey(&self, cred: &Credential) -> Result<()> {
+        let limit = self.limit(crate::Limit::PasskeysPerAccount).await?;
+        let key = user_key(&self.master, &cred.user_id)?;
+        let done = sqlx::query(
+            "INSERT INTO webauthn_credentials (id, user_id, data) SELECT ?, ?, ? \
+             WHERE (SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?) < ?",
+        )
+        .bind(cred.id.to_string())
+        .bind(cred.user_id.to_string())
+        .bind(enc(&key, &cred.data)?)
+        .bind(cred.user_id.to_string())
+        .bind(i64::from(limit))
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(Error::LimitReached(crate::Limit::PasskeysPerAccount, limit));
+        }
+        Ok(())
+    }
+
+    /// Closes the connections to the database, waiting for them: the files
+    /// of the database are then left as SQLite leaves them at its last
+    /// close (no `-wal` file).
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn fetch_identity(
         &self,
         account_id: Uuid,
@@ -841,6 +899,20 @@ impl EncryptedStore {
         user: &User,
         cred: &Credential,
         link: Option<&str>,
+    ) -> Result<()> {
+        self.register_user_from(user, cred, link, None).await
+    }
+
+    /// As [`Self::register_user_with_credential`], for a sign-up from the
+    /// client address `from`: counted, in the same transaction, against
+    /// `sign_ups_per_ip_per_day`. [`Error::LimitReached`] creates nothing
+    /// and spends no link.
+    pub async fn register_user_from(
+        &self,
+        user: &User,
+        cred: &Credential,
+        link: Option<&str>,
+        from: Option<&str>,
     ) -> Result<()> {
         // Defend against a mismatched credential reaching the transaction:
         // the credential's `data` is encrypted under `cred.user_id`'s per-user
@@ -904,6 +976,9 @@ impl EncryptedStore {
                 // up creates nothing.
                 Some(LinkKind::Admin) | None => return Err(Error::LinkSpent),
             }
+        }
+        if let Some(address) = from {
+            crate::admin::count_sign_up(&mut tx, &self.master, address).await?;
         }
 
         tx.commit().await?;
