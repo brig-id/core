@@ -207,9 +207,14 @@ async fn exchange(
 
     // The code is taken out before anything else is checked: whatever the
     // outcome, it cannot be presented again.
-    let code = param("code")
-        .and_then(|code| state.redeem_code(code))
-        .ok_or_else(TokenError::invalid_grant)?;
+    let code = match param("code") {
+        Some(code) => state
+            .redeem_code(code)
+            .await
+            .map_err(TokenError::internal)?,
+        None => None,
+    }
+    .ok_or_else(TokenError::invalid_grant)?;
     let verified = code.client_id == client.client_id
         && param("redirect_uri") == Some(code.redirect_uri.as_str())
         && param("code_verifier")
@@ -368,9 +373,11 @@ async fn verify_assertion(
     if claims.exp - now > MAX_ASSERTION_LIFETIME_SECS {
         return Ok(false);
     }
-    Ok(state
-        .described
-        .first_use(&client.client_id, &jti, claims.exp, now))
+    state
+        .shared
+        .first_use(&client.client_id, &jti, claims.exp, now)
+        .await
+        .map_err(TokenError::internal)
 }
 
 /// The client id and secret of an `Authorization: Basic` header, each

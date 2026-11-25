@@ -1,6 +1,6 @@
 //! WebAuthn authentication and registration routes.
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, internal},
     session::{AccountSession, Onboarded, clear_cookie, open_session},
+    shared::Kind,
     state::{
         AppState, AuthenticationPurpose, PendingAuthentication, PendingLogin, PendingRegistration,
         RegistrationPurpose,
@@ -148,31 +149,19 @@ pub async fn register_begin(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
-    state.evict_expired_pending();
-    {
-        let mut map = state
-            .pending_registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
-            // Hard cap reached even after TTL eviction — reject with 429 so
-            // callers see backpressure instead of the server exhausting
-            // memory under a sustained `begin` flood.
-            return Err(ApiError::TooManyRequests);
-        }
-        map.insert(
-            session_id,
-            PendingRegistration {
-                purpose: RegistrationPurpose::Signup,
-                link: body.link.clone(),
-                user_id,
-                username: root_id.username.clone(),
-                server: root_id.server.clone(),
-                state: reg_state,
-                created_at: Instant::now(),
-            },
-        );
-    }
+    hold_registration(
+        &state,
+        session_id,
+        &PendingRegistration {
+            purpose: RegistrationPurpose::Signup,
+            link: body.link.clone(),
+            user_id,
+            username: root_id.username.clone(),
+            server: root_id.server.clone(),
+            state: reg_state,
+        },
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -188,16 +177,7 @@ pub async fn register_finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = take_pending_registration(&state, body.session_id, |p| {
-        matches!(p, RegistrationPurpose::Signup)
-    })?;
-
-    // Authoritative TTL check at finish time. `evict_expired_pending()` only
-    // runs opportunistically when a new challenge is created; in the absence
-    // of new traffic an expired pending session would otherwise remain valid.
-    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
-        return Err(ApiError::BadRequest("session expired".into()));
-    }
+    let pending = take_pending_registration(&state, body.session_id, Kind::Signup).await?;
 
     let passkey = state
         .webauthn
@@ -309,28 +289,19 @@ pub async fn add_credential_begin(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
-    state.evict_expired_pending();
-    {
-        let mut map = state
-            .pending_registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
-            return Err(ApiError::TooManyRequests);
-        }
-        map.insert(
-            session_id,
-            PendingRegistration {
-                purpose: RegistrationPurpose::AddPasskey,
-                link: None,
-                user_id: user.id,
-                username: user.username,
-                server: user.server,
-                state: reg_state,
-                created_at: Instant::now(),
-            },
-        );
-    }
+    hold_registration(
+        &state,
+        session_id,
+        &PendingRegistration {
+            purpose: RegistrationPurpose::AddPasskey,
+            link: None,
+            user_id: user.id,
+            username: user.username,
+            server: user.server,
+            state: reg_state,
+        },
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -351,13 +322,7 @@ pub async fn add_credential_finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = take_pending_registration(&state, body.session_id, |p| {
-        matches!(p, RegistrationPurpose::AddPasskey)
-    })?;
-
-    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
-        return Err(ApiError::BadRequest("session expired".into()));
-    }
+    let pending = take_pending_registration(&state, body.session_id, Kind::AddPasskey).await?;
 
     let passkey = state
         .webauthn
@@ -375,23 +340,53 @@ pub async fn add_credential_finish(
     Ok(StatusCode::OK)
 }
 
-/// Removes and returns the pending registration `session_id` if it was begun
-/// for the purpose `expected` accepts. A session of another kind is left in
-/// place and reported as unknown, as a missing one is.
-pub(crate) fn take_pending_registration(
+/// Keeps a registration ceremony until its `finish`. `429` when too many
+/// are in progress: callers see backpressure, instead of a sustained flood
+/// of `begin` filling what keeps them.
+pub(crate) async fn hold_registration(
     state: &AppState,
     session_id: Uuid,
-    expected: impl Fn(&RegistrationPurpose) -> bool,
-) -> Result<PendingRegistration, ApiError> {
-    let mut map = state
-        .pending_registrations
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match map.get(&session_id) {
-        Some(p) if expected(&p.purpose) => {}
-        _ => return Err(ApiError::BadRequest("unknown session".into())),
+    pending: &PendingRegistration,
+) -> Result<(), ApiError> {
+    if state
+        .hold(pending.purpose.kind(), &session_id.to_string(), pending)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::TooManyRequests)
     }
-    Ok(map.remove(&session_id).expect("checked above"))
+}
+
+/// Keeps an authentication ceremony until its `finish`; `429` as for
+/// [`hold_registration`].
+pub(crate) async fn hold_authentication(
+    state: &AppState,
+    session_id: Uuid,
+    pending: &PendingAuthentication,
+) -> Result<(), ApiError> {
+    if state
+        .hold(pending.purpose.kind(), &session_id.to_string(), pending)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::TooManyRequests)
+    }
+}
+
+/// Takes the pending registration `session_id` out if it was begun for
+/// `kind`: once, and within the ceremony's time. A session of another kind
+/// is left in place and reported as unknown, as a missing or expired one is.
+pub(crate) async fn take_pending_registration(
+    state: &AppState,
+    session_id: Uuid,
+    kind: Kind,
+) -> Result<PendingRegistration, ApiError> {
+    state
+        .take(kind, &session_id.to_string())
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("unknown session".into()))
 }
 
 pub(crate) async fn apply_label(
@@ -447,24 +442,15 @@ pub async fn login_begin(
     let login = PendingLogin::Discoverable(auth_state);
 
     let session_id = Uuid::new_v4();
-    state.evict_expired_pending();
-    {
-        let mut map = state
-            .pending_authentications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
-            return Err(ApiError::TooManyRequests);
-        }
-        map.insert(
-            session_id,
-            PendingAuthentication {
-                purpose: AuthenticationPurpose::SignIn,
-                login,
-                created_at: Instant::now(),
-            },
-        );
-    }
+    hold_authentication(
+        &state,
+        session_id,
+        &PendingAuthentication {
+            purpose: AuthenticationPurpose::SignIn,
+            login,
+        },
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -519,22 +505,10 @@ pub(crate) async fn finish_authentication(
     body: &FinishLoginRequest,
     purpose: AuthenticationPurpose,
 ) -> Result<Uuid, ApiError> {
-    let pending = {
-        let mut map = state
-            .pending_authentications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match map.get(&body.session_id) {
-            Some(p) if p.purpose == purpose => {}
-            _ => return Err(ApiError::BadRequest("unknown session".into())),
-        }
-        map.remove(&body.session_id).expect("checked above")
-    };
-
-    // Authoritative TTL check at finish time — see `register_finish`.
-    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
-        return Err(ApiError::BadRequest("session expired".into()));
-    }
+    let pending: PendingAuthentication = state
+        .take(purpose.kind(), &body.session_id.to_string())
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("unknown session".into()))?;
 
     let (user_id, passkeys, auth_result) = match pending.login {
         PendingLogin::Named {

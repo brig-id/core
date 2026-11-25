@@ -15,7 +15,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Instant,
 };
 
 use axum::{
@@ -158,21 +157,26 @@ async fn begin(state: &AppState, params: &HashMap<String, String>) -> Response {
         Some(_) => return refuse("invalid_request", "max_age must be a number of seconds"),
     };
 
-    let held = state.hold_authorization(PendingAuthorization {
-        client_id: client.client_id,
-        redirect_uri: redirect_uri.to_owned(),
-        state: request_state.map(str::to_owned),
-        nonce: param("nonce").map(str::to_owned),
-        code_challenge: code_challenge.to_owned(),
-        prompt,
-        asked,
-        max_age,
-        created_at: Instant::now(),
-        created_unix: now_unix(),
-    });
+    let held = state
+        .hold_authorization(&PendingAuthorization {
+            client_id: client.client_id,
+            redirect_uri: redirect_uri.to_owned(),
+            state: request_state.map(str::to_owned),
+            nonce: param("nonce").map(str::to_owned),
+            code_challenge: code_challenge.to_owned(),
+            prompt,
+            asked,
+            max_age,
+            created_unix: now_unix(),
+        })
+        .await;
     match held {
-        Some(id) => see_other(&format!("{UI_PATH}?request={id}")),
-        None => refuse("temporarily_unavailable", "too many requests are waiting"),
+        Ok(Some(id)) => see_other(&format!("{UI_PATH}?request={id}")),
+        Ok(None) => refuse("temporarily_unavailable", "too many requests are waiting"),
+        Err(e) => {
+            tracing::error!(error = %e, "the authorization request could not be kept");
+            refuse("server_error", "internal server error")
+        }
     }
 }
 
@@ -259,7 +263,10 @@ pub async fn request(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<RequestView>, ApiError> {
-    let pending = state.pending_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .pending_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let client = state
         .store
         .fetch_client(&pending.client_id)
@@ -363,7 +370,10 @@ pub async fn approve(
     Onboarded(session): Onboarded,
     Json(body): Json<ApproveRequest>,
 ) -> Result<Json<Answer>, ApiError> {
-    let pending = state.pending_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .pending_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if must_sign_in(&pending, Some(&session)) {
         return Err(ApiError::Unauthorized);
     }
@@ -405,7 +415,10 @@ pub async fn approve(
     }
 
     // Answered once: a second call finds nothing.
-    let pending = state.take_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .take_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     match state
         .store
         .set_chosen_identity(account_id, &pending.client_id, identity.id)
@@ -423,7 +436,7 @@ pub async fn approve(
     // What is sent is read back from what was recorded, not from the body.
     let standing = standing(&pending.asked, &identity, Some(&recorded));
     Ok(Json(Answer {
-        redirect_to: grant(&state, &pending, &session, identity.id, standing.share)?,
+        redirect_to: grant(&state, &pending, &session, identity.id, standing.share).await?,
     }))
 }
 
@@ -433,7 +446,10 @@ pub async fn deny(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Answer>, ApiError> {
-    let pending = state.take_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .take_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(Answer {
         redirect_to: error_redirect(
             &state,
@@ -455,13 +471,19 @@ pub async fn silent(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Answer>, ApiError> {
-    let pending = state.pending_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .pending_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     if pending.prompt != Prompt::None {
         return Err(ApiError::BadRequest(
             "this request asked for an interactive answer".into(),
         ));
     }
-    let pending = state.take_authorization(&id).ok_or(ApiError::NotFound)?;
+    let pending = state
+        .take_authorization(&id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let refuse = |error: &str, description: &str| {
         Json(Answer {
             redirect_to: error_redirect(
@@ -528,7 +550,7 @@ pub async fn silent(
         .await
         .map_err(|e| internal!(e))?;
     Ok(Json(Answer {
-        redirect_to: grant(&state, &pending, &session, identity.id, standing.share)?,
+        redirect_to: grant(&state, &pending, &session, identity.id, standing.share).await?,
     }))
 }
 
@@ -576,7 +598,7 @@ fn standing(
 /// Issue a code for `identity_id`, which will give a token carrying
 /// `attributes`, and build the address that takes it back to the relying
 /// party.
-fn grant(
+async fn grant(
     state: &AppState,
     pending: &PendingAuthorization,
     session: &AccountSession,
@@ -584,7 +606,7 @@ fn grant(
     attributes: Attributes,
 ) -> Result<String, ApiError> {
     let code = state
-        .issue_code(IssuedCode {
+        .issue_code(&IssuedCode {
             client_id: pending.client_id.clone(),
             redirect_uri: pending.redirect_uri.clone(),
             code_challenge: pending.code_challenge.clone(),
@@ -593,8 +615,8 @@ fn grant(
             identity_id,
             attributes,
             auth_time: session.auth_time,
-            created_at: Instant::now(),
         })
+        .await?
         .ok_or(ApiError::TooManyRequests)?;
     let mut pairs = vec![("code", code.as_str())];
     if let Some(s) = pending.state.as_deref() {

@@ -11,7 +11,7 @@
 //! applies.
 //!
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -28,9 +28,11 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, internal},
     routes::auth::{
-        BeginRegisterResponse, FinishRegisterRequest, apply_label, take_pending_registration,
+        BeginRegisterResponse, FinishRegisterRequest, apply_label, hold_registration,
+        take_pending_registration,
     },
     session::{AccountSession, open_session},
+    shared::Kind,
     state::{AppState, PendingRegistration, RegistrationPurpose},
 };
 
@@ -147,30 +149,21 @@ pub async fn begin(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
-    state.evict_expired_pending();
-    {
-        let mut map = state
-            .pending_registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
-            return Err(ApiError::TooManyRequests);
-        }
-        map.insert(
-            session_id,
-            PendingRegistration {
-                purpose: RegistrationPurpose::Recovery {
-                    recovery_id: code.recovery_id,
-                },
-                link: None,
-                user_id: user.id,
-                username: user.username,
-                server: user.server,
-                state: reg_state,
-                created_at: Instant::now(),
+    hold_registration(
+        &state,
+        session_id,
+        &PendingRegistration {
+            purpose: RegistrationPurpose::Recovery {
+                recovery_id: code.recovery_id,
             },
-        );
-    }
+            link: None,
+            user_id: user.id,
+            username: user.username,
+            server: user.server,
+            state: reg_state,
+        },
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -188,14 +181,10 @@ pub async fn finish(
     State(state): State<Arc<AppState>>,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pending = take_pending_registration(&state, body.session_id, |p| {
-        matches!(p, RegistrationPurpose::Recovery { .. })
-    })?;
-    if pending.created_at.elapsed() > crate::state::PENDING_SESSION_TTL {
-        return Err(ApiError::BadRequest("session expired".into()));
-    }
+    let pending = take_pending_registration(&state, body.session_id, Kind::Recovery).await?;
     let RegistrationPurpose::Recovery { recovery_id } = pending.purpose else {
-        unreachable!("checked by take_pending_registration");
+        // Kept under another kind by mistake: refused, as an unknown one.
+        return Err(ApiError::BadRequest("unknown session".into()));
     };
 
     let passkey = state

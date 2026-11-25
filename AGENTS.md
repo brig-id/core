@@ -52,8 +52,12 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
   relying party receives a VSID. The labels of an identity (name, logo, description) never
   leave the server. An attribute (`brigid-identity/src/attributes.rs`) reaches a relying
   party only if its registration lets it ask, the request asks, and the person accepted the
-  value the identity has now (`standing` in `brigid-api/src/routes/authorize.rs`). Pending
-  requests and codes are held in memory with a TTL and a cap.
+  value the identity has now (`standing` in `brigid-api/src/routes/authorize.rs`).
+- **What lives minutes** (`brigid-api/src/shared.rs`) — passkey ceremonies in progress,
+  pending requests, codes and the assertions of clients already used are kept behind the
+  `Shared` trait, with an expiry and a cap, and taken once. `Memory` keeps them in the
+  process: enough for one node. Never keep such state anywhere else: an edition made of
+  several nodes gives `AppState` another `Shared` (spec `forest.md` §2–§3).
 - **Sites that describe themselves** (`brigid-api/src/described.rs`) — the server fetches
   a document at a URL anyone chooses: keep every rule of the module (https and a domain
   name, the resolver that drops special-use addresses, no redirect, no proxy, 5 KiB, 10 s,
