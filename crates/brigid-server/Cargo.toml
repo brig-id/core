@@ -49,6 +49,9 @@ time.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+# The backup tests build accounts and identities.
+uuid.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 figment = { version = "0.10", features = ["test"] }
 http-body-util = "0.1"
 tempfile = "3"

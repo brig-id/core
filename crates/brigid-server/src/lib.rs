@@ -17,7 +17,9 @@
 //! 7. Await graceful shutdown on `SIGTERM` / `CTRL-C`.
 
 pub mod acme;
+pub mod backup;
 pub mod config;
+pub mod lock;
 pub mod metrics;
 pub mod owner;
 pub mod probe;
@@ -128,6 +130,39 @@ pub enum Command {
         policy: Option<String>,
     },
 
+    /// Set what one account, or one address, can create on this server.
+    /// Without arguments, prints each limit as
+    /// `name<TAB>value<TAB>default<TAB>max`. An administrator sets the same
+    /// from the interface.
+    ///
+    /// The limits: `identities_per_account`, `passkeys_per_account`,
+    /// `sign_ups_per_ip_per_day`. An account above a lowered limit keeps
+    /// what it has and adds nothing.
+    Limits {
+        #[command(subcommand)]
+        action: Option<LimitsCommand>,
+    },
+
+    /// Write a copy of the database to FILE, consistent while the server
+    /// runs. It is encrypted under the same master key: keep the key with
+    /// it, apart. FILE is created with mode 0600 and never written over.
+    /// Prints the path written on standard output.
+    Backup {
+        /// The file to create.
+        file: PathBuf,
+    },
+
+    /// Put a backup in place of the database. Stop the server first: this
+    /// refuses while the server, or anything else, uses the database. The
+    /// backup must open with the master key, belong to this server's
+    /// domain and have a schema this version knows. The database it
+    /// replaces is kept as `<database>.before-restore-<time>`, whose path is
+    /// printed on standard output.
+    Restore {
+        /// A file written by `backup`.
+        file: PathBuf,
+    },
+
     /// Liveness probe for Docker's HEALTHCHECK: GET the local `/health`,
     /// exit 0 on 200, 1 otherwise. Reads only `BRIGID_SERVER__PORT` (default
     /// 8080), so it needs neither the config file nor the master key.
@@ -135,6 +170,18 @@ pub enum Command {
         /// Port of the plain-HTTP listener to probe.
         #[arg(long, env = "BRIGID_SERVER__PORT", default_value_t = 8080)]
         port: u16,
+    },
+}
+
+/// `limits …`
+#[derive(Subcommand)]
+pub enum LimitsCommand {
+    /// Set a limit, from 1 to its maximum.
+    Set {
+        /// `identities_per_account`, `passkeys_per_account` or
+        /// `sign_ups_per_ip_per_day`.
+        name: String,
+        value: String,
     },
 }
 
@@ -663,6 +710,124 @@ async fn signup_command(edition: &Edition, db: &config::DatabaseConfig, policy: 
     println!("{}", current.as_str());
 }
 
+/// Handles `limits [set <name> <value>]`. One limit per line on standard
+/// output: `name<TAB>value<TAB>default<TAB>max`.
+async fn limits_command(
+    edition: &Edition,
+    db: &config::DatabaseConfig,
+    action: Option<LimitsCommand>,
+) {
+    use brigid_store::Limit;
+    let store = EncryptedStore::new(&db_url(&db.path), load_master_key(edition))
+        .await
+        .expect("failed to open or migrate database");
+    if let Some(LimitsCommand::Set { name, value }) = action {
+        let limit = Limit::parse(&name).unwrap_or_else(|| {
+            let known: Vec<&str> = Limit::ALL.into_iter().map(Limit::name).collect();
+            fail(&format!(
+                "{name} is not a limit. They are: {}.",
+                known.join(", ")
+            ))
+        });
+        let value = value
+            .parse::<u32>()
+            .ok()
+            .filter(|v| (1..=limit.max()).contains(v))
+            .unwrap_or_else(|| {
+                fail(&format!(
+                    "{name} is a whole number from 1 to {}.",
+                    limit.max()
+                ))
+            });
+        store
+            .set_limit(limit, value)
+            .await
+            .expect("failed to set the limit");
+        store
+            .log_admin_action(&brigid_store::AdminAction {
+                action: "limit.set".into(),
+                actor: None,
+                account: None,
+                detail: Some(format!("{limit}={value}")),
+            })
+            .await
+            .expect("failed to log the change");
+        eprintln!("✓ {limit} is {value}.");
+    }
+    for (limit, value) in store.limits().await.expect("failed to read the limits") {
+        println!(
+            "{limit}\t{value}\t{}\t{}",
+            limit.default_value(),
+            limit.max()
+        );
+    }
+}
+
+/// Handles `backup <file>`: `out` is the file, created before this process
+/// became the database's owner.
+async fn backup_command(db: &config::DatabaseConfig, out: std::fs::File, path: &Path) {
+    let database = Path::new(&db.path);
+    if let Err(e) = backup::backup(database, out, path).await {
+        fail(&e);
+    }
+    let written = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    println!("{}", written.display());
+    eprintln!(
+        "✓ {} copied. It opens only with this server's master key: keep the key too, apart.",
+        database.display()
+    );
+}
+
+/// Handles `restore <file>`: `source` is the backup, opened before this
+/// process became the database's owner.
+async fn restore_command(edition: &Edition, cfg: &config::Config, source: std::fs::File) {
+    let database = Path::new(&cfg.database.path);
+    let base = public_url(cfg);
+    let domain = base.host_str().unwrap_or(&cfg.server.domain).to_owned();
+    let restored = match backup::restore(database, source, &load_master_key(edition), &domain).await
+    {
+        Ok(restored) => restored,
+        Err(e) => fail(&e),
+    };
+    let inspection = &restored.inspection;
+    if let Some(aside) = &restored.aside {
+        println!("{}", aside.display());
+    }
+    eprintln!(
+        "✓ Restored: {} accounts, {} identities.",
+        inspection.accounts, inspection.identities
+    );
+    if inspection.domains.is_empty() {
+        eprintln!("  It has no account: nothing said which domain it was made for.");
+    }
+    if inspection.schema < inspection.known_schema {
+        eprintln!(
+            "  It was made by an earlier version: its schema is brought up to date at the next start."
+        );
+    }
+    match &restored.aside {
+        Some(aside) => eprintln!("  The database it replaced is kept at {}.", aside.display()),
+        None => eprintln!("  There was no database before it."),
+    }
+    eprintln!("  Start {} again.", edition.name);
+}
+
+/// Holds the lock of the database shared for as long as the value lives
+/// (`lock`). A lock that cannot be made is said, and nothing is refused for
+/// it: the server runs as it did before locks existed.
+fn hold_database(database: &str) -> Option<std::fs::File> {
+    if database == ":memory:" {
+        return None;
+    }
+    match lock::shared(Path::new(database)) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            tracing::warn!(error = %e, "the database lock cannot be held: a restore cannot see this process");
+            None
+        }
+    }
+}
+
 /// Says what is wrong on standard error and ends with the status of a
 /// refused command.
 fn fail(message: &str) -> ! {
@@ -920,14 +1085,57 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
         let new_master = MasterKey::from_file(&new)
             .expect("failed to read the new master key file (64 hex chars expected)");
         as_owner_of_database(edition, Path::new(&db.path), false);
+        let _lock = hold_database(&db.path);
         rotate_key(edition, &db, old_master, new_master).await;
         return;
     }
+    // `backup` and `restore` name a file of the operator's: opened as
+    // whoever runs this, who may be the only one allowed to.
+    let operator_file = match &cli.command {
+        Some(Command::Backup { file }) => {
+            Some(backup::create_output(file).unwrap_or_else(|e| fail(&e)))
+        }
+        Some(Command::Restore { file }) => Some(
+            std::fs::File::open(file).unwrap_or_else(|e| fail(&format!("{}: {e}", file.display()))),
+        ),
+        _ => None,
+    };
+    // `restore` reads the domain from the whole configuration.
+    let restore_config = match &cli.command {
+        Some(Command::Restore { .. }) => {
+            Some(config::load(cli.config.as_deref()).expect("configuration error"))
+        }
+        _ => None,
+    };
     // Every other command works on the database: as root, it reads the key
-    // first, then becomes the database's owner.
-    if cli.command.is_some() {
+    // first (a backup needs none), then becomes the database's owner. It
+    // holds the database's lock while it runs; `backup` and `restore` take
+    // it themselves.
+    let mut _lock = None;
+    if let Some(command) = &cli.command {
         let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-        as_owner_of_database(edition, Path::new(&db.path), true);
+        let needs_key = !matches!(command, Command::Backup { .. });
+        as_owner_of_database(edition, Path::new(&db.path), needs_key);
+        if !matches!(command, Command::Backup { .. } | Command::Restore { .. }) {
+            _lock = hold_database(&db.path);
+        }
+    }
+    match (&cli.command, operator_file, restore_config.as_ref()) {
+        (Some(Command::Backup { file }), Some(out), _) => {
+            let db = config::load_database(cli.config.as_deref()).expect("configuration error");
+            backup_command(&db, out, file).await;
+            return;
+        }
+        (Some(Command::Restore { .. }), Some(source), Some(cfg)) => {
+            restore_command(edition, cfg, source).await;
+            return;
+        }
+        _ => {}
+    }
+    if let Some(Command::Limits { action }) = cli.command {
+        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
+        limits_command(edition, &db, action).await;
+        return;
     }
     if let Some(Command::RotateOidcKey) = cli.command {
         let db = config::load_database(cli.config.as_deref()).expect("configuration error");
@@ -984,6 +1192,8 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     let master = load_master_key(edition);
 
     // -- Database ------------------------------------------------------------
+    // Held while the server runs: `restore` refuses while it is.
+    let _database_lock = hold_database(&cfg.database.path);
     let store = EncryptedStore::new(&db_url(&cfg.database.path), master)
         .await
         .expect("failed to open or migrate database");
