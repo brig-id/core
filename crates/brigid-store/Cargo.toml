@@ -22,11 +22,22 @@ helpers4 = { workspace = true, features = ["bytes", "hex", "random-entropy", "ti
 sha3 = { workspace = true }
 base64ct = { version = "1", features = ["alloc"] }
 
+# One set of statements for the two databases: the driver is chosen from the
+# address at run time (`any`). SQLite is always there; PostgreSQL is the
+# feature `postgres`, which only the edition made of several nodes turns on.
 sqlx = { version = "0.9", features = [
     "sqlite",
+    "any",
     "runtime-tokio",
     "migrate",
     "macros",
 ] }
+
+[features]
+# The PostgreSQL driver and schema: for forest. seedling and grove do not
+# carry them.
+postgres = ["sqlx/postgres"]
+# `brigid_store::testing`, for the tests of the crates built on the store.
+testing = []
 
 [dev-dependencies]

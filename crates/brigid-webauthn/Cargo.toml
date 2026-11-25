@@ -26,6 +26,8 @@ webauthn-rs = { version = "0.5", features = [
 webauthn-rs-proto = "0.5"
 
 [dev-dependencies]
+# `brigid_store::testing::url`: the tests run on SQLite or on PostgreSQL.
+brigid-store = { workspace = true, features = ["testing"] }
 sqlx = { version = "0.9", features = [
   "sqlite",
   "runtime-tokio",

@@ -477,7 +477,7 @@ mod tests {
         let user_id = Uuid::new_v4();
 
         // EncryptedStore::new runs migrations automatically.
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&brigid_store::testing::url().await, master())
             .await
             .unwrap();
 
