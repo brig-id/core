@@ -537,14 +537,12 @@ struct Cached<T> {
     fresh_for: Duration,
 }
 
-/// Valid documents and key sets read lately, and the `jti` of the client
-/// assertions already used.
+/// Valid documents and key sets read lately. A cache: each node of a server
+/// has its own, and the last valid document of a client is in the store.
 pub struct Described {
     pub fetcher: Arc<dyn Fetch>,
     documents: Mutex<HashMap<String, Cached<Client>>>,
     key_sets: Mutex<HashMap<String, Cached<JwkSet>>>,
-    /// (`client_id`, `jti`) → Unix time the assertion expires.
-    used_assertions: Mutex<HashMap<(String, String), i64>>,
 }
 
 impl Described {
@@ -553,7 +551,6 @@ impl Described {
             fetcher,
             documents: Mutex::new(HashMap::new()),
             key_sets: Mutex::new(HashMap::new()),
-            used_assertions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -594,22 +591,6 @@ impl Described {
             .map_err(|e| format!("{jwks_uri} is not a key set: {e}"))?;
         keep(&self.key_sets, jwks_uri, set.clone(), fetched.max_age);
         Ok(set)
-    }
-
-    /// Record that the assertion `jti` of `client_id`, valid until
-    /// `expires` (Unix seconds), was used. `false` when it was already.
-    pub fn first_use(&self, client_id: &str, jti: &str, expires: i64, now: i64) -> bool {
-        let mut used = self
-            .used_assertions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        used.retain(|_, until| *until >= now);
-        if used.len() >= 100_000 {
-            // Assertions live minutes; this many at once is a flood.
-            return false;
-        }
-        used.insert((client_id.to_owned(), jti.to_owned()), expires)
-            .is_none()
     }
 }
 
@@ -912,21 +893,5 @@ mod tests {
         let fetched = fetcher.fetch(&url).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&fetched.body).unwrap();
         assert_eq!(json["issuer"], "https://helm.brig.id");
-    }
-
-    #[test]
-    fn an_assertion_is_used_once() {
-        struct Nothing;
-        impl Fetch for Nothing {
-            fn fetch<'a>(&'a self, _: &'a Url) -> FetchFuture<'a> {
-                Box::pin(async { Err("offline".into()) })
-            }
-        }
-        let described = Described::new(Arc::new(Nothing));
-        assert!(described.first_use("c", "j1", 100, 50));
-        assert!(!described.first_use("c", "j1", 100, 60));
-        assert!(described.first_use("other", "j1", 100, 60));
-        // Expired entries are forgotten.
-        assert!(described.first_use("c", "j1", 300, 200));
     }
 }

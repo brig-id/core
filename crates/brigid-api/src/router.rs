@@ -114,7 +114,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Two rate limits, each per client IP.
     //
     // The WebAuthn ceremonies are open to anyone and each one costs a
-    // challenge held in memory or a signature check: 20 requests per minute,
+    // challenge kept for minutes or a signature check: 20 requests per minute,
     // in bursts of 5 (a sign-up followed by a sign-in is 4).
     //
     // The account routes need a session and are what the UI calls on every

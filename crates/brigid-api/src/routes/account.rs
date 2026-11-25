@@ -6,7 +6,7 @@
 //! ceremony is begun for the session's account and for nothing else; `finish`
 //! accepts only an answer from one of that account's passkeys.
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::{
     Json,
@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, internal},
-    routes::auth::{BeginLoginResponse, FinishLoginRequest, finish_authentication},
+    routes::auth::{
+        BeginLoginResponse, FinishLoginRequest, finish_authentication, hold_authentication,
+    },
     session::{AccountSession, clear_cookie},
     state::{AppState, AuthenticationPurpose, PendingAuthentication, PendingLogin},
 };
@@ -76,27 +78,18 @@ async fn begin_ceremony(
         .map_err(|e| internal!(e))?;
 
     let session_id = Uuid::new_v4();
-    state.evict_expired_pending();
-    {
-        let mut map = state
-            .pending_authentications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if map.len() >= crate::state::PENDING_SESSION_MAX_CAPACITY {
-            return Err(ApiError::TooManyRequests);
-        }
-        map.insert(
-            session_id,
-            PendingAuthentication {
-                purpose,
-                login: PendingLogin::Named {
-                    user_id: session.account.id,
-                    state: auth_state,
-                },
-                created_at: Instant::now(),
+    hold_authentication(
+        state,
+        session_id,
+        &PendingAuthentication {
+            purpose,
+            login: PendingLogin::Named {
+                user_id: session.account.id,
+                state: auth_state,
             },
-        );
-    }
+        },
+    )
+    .await?;
     Ok((
         StatusCode::OK,
         Json(BeginLoginResponse {

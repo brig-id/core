@@ -4,6 +4,7 @@ pub mod described;
 pub mod error;
 pub mod router;
 pub mod session;
+pub mod shared;
 pub mod state;
 
 pub mod routes;
