@@ -68,7 +68,7 @@ fn master() -> MasterKey {
 async fn fresh_app_state() -> AppState {
     let master = master();
     let vsid_salt = [0x5a; 32];
-    let store = EncryptedStore::new("sqlite::memory:", master)
+    let store = EncryptedStore::new(&brigid_store::testing::url().await, master)
         .await
         .unwrap();
     let rp_origin = Url::parse("http://localhost:8080").unwrap();

@@ -25,12 +25,12 @@ use crate::{
 /// caller's transaction. `None` when the link is unknown, expired or used
 /// up: nothing is spent then.
 pub(crate) async fn spend_link(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     token: &str,
 ) -> Result<Option<LinkKind>> {
     let kind: Option<String> = sqlx::query_scalar(
         "UPDATE links SET uses_left = uses_left - 1 \
-         WHERE token_hash = ? AND uses_left > 0 AND expires_at > ? RETURNING kind",
+         WHERE token_hash = $1 AND uses_left > 0 AND expires_at > $2 RETURNING kind",
     )
     .bind(session_hash(token))
     .bind(now_unix())
@@ -45,7 +45,7 @@ impl EncryptedStore {
     /// The role of an account and whether it is suspended. `None` when the
     /// account does not exist.
     pub async fn account_standing(&self, account_id: Uuid) -> Result<Option<AccountStanding>> {
-        let row = sqlx::query("SELECT admin, suspended_at FROM users WHERE id = ?")
+        let row = sqlx::query("SELECT admin, suspended_at FROM users WHERE id = $1")
             .bind(account_id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -79,7 +79,7 @@ impl EncryptedStore {
     /// would leave nobody to administer the server.
     pub async fn set_administrator(&self, account_id: Uuid, admin: bool) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let done = sqlx::query("UPDATE users SET admin = ? WHERE id = ?")
+        let done = sqlx::query("UPDATE users SET admin = $1 WHERE id = $2")
             .bind(i64::from(admin))
             .bind(account_id.to_string())
             .execute(&mut *tx)
@@ -100,7 +100,7 @@ impl EncryptedStore {
     pub async fn suspend_account(&self, account_id: Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let done =
-            sqlx::query("UPDATE users SET suspended_at = COALESCE(suspended_at, ?) WHERE id = ?")
+            sqlx::query("UPDATE users SET suspended_at = COALESCE(suspended_at, $1) WHERE id = $2")
                 .bind(now_unix())
                 .bind(account_id.to_string())
                 .execute(&mut *tx)
@@ -109,7 +109,7 @@ impl EncryptedStore {
             return Err(Error::NotFound);
         }
         keep_an_administrator(&mut tx).await?;
-        sqlx::query("DELETE FROM sessions WHERE account_id = ?")
+        sqlx::query("DELETE FROM sessions WHERE account_id = $1")
             .bind(account_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -119,7 +119,7 @@ impl EncryptedStore {
 
     /// Lift a suspension. [`Error::NotFound`] for an unknown account.
     pub async fn unsuspend_account(&self, account_id: Uuid) -> Result<()> {
-        let done = sqlx::query("UPDATE users SET suspended_at = NULL WHERE id = ?")
+        let done = sqlx::query("UPDATE users SET suspended_at = NULL WHERE id = $1")
             .bind(account_id.to_string())
             .execute(&self.pool)
             .await?;
@@ -135,7 +135,7 @@ impl EncryptedStore {
     pub async fn remove_account(&self, account_id: Uuid) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let had_one = administrators(&mut tx).await? > 0;
-        let done = sqlx::query("DELETE FROM users WHERE id = ?")
+        let done = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(account_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -151,8 +151,9 @@ impl EncryptedStore {
         let rows = sqlx::query(
             "SELECT u.id, u.username, u.created_at, u.admin, u.suspended_at, u.last_sign_in_at, \
                (SELECT COUNT(*) FROM webauthn_credentials c WHERE c.user_id = u.id) AS passkeys, \
-               EXISTS (SELECT 1 FROM account_recovery r \
-                       WHERE r.user_id = u.id AND r.recovery_index IS NOT NULL) AS recovery_code \
+               CASE WHEN EXISTS (SELECT 1 FROM account_recovery r \
+                       WHERE r.user_id = u.id AND r.recovery_index IS NOT NULL) \
+                    THEN 1 ELSE 0 END AS recovery_code \
              FROM users u ORDER BY u.created_at, u.id",
         )
         .fetch_all(&self.pool)
@@ -207,7 +208,7 @@ impl EncryptedStore {
         };
         sqlx::query(
             "INSERT INTO links (id, token_hash, kind, uses_left, created_at, expires_at, created_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(link.id.to_string())
         .bind(session_hash(&token))
@@ -224,7 +225,7 @@ impl EncryptedStore {
     /// What the link `token` is for, if it can still be used. Spends nothing.
     pub async fn link_kind(&self, token: &str) -> Result<Option<LinkKind>> {
         let kind: Option<String> = sqlx::query_scalar(
-            "SELECT kind FROM links WHERE token_hash = ? AND uses_left > 0 AND expires_at > ?",
+            "SELECT kind FROM links WHERE token_hash = $1 AND uses_left > 0 AND expires_at > $2",
         )
         .bind(session_hash(token))
         .bind(now_unix())
@@ -242,7 +243,7 @@ impl EncryptedStore {
         if spend_link(&mut tx, token).await? != Some(LinkKind::Admin) {
             return Err(Error::LinkSpent);
         }
-        let done = sqlx::query("UPDATE users SET admin = 1 WHERE id = ?")
+        let done = sqlx::query("UPDATE users SET admin = 1 WHERE id = $1")
             .bind(account_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -256,13 +257,13 @@ impl EncryptedStore {
     /// The links of `kind` that can still be used, oldest first. Expired and
     /// used-up ones are deleted on the way.
     pub async fn list_links(&self, kind: LinkKind) -> Result<Vec<Link>> {
-        sqlx::query("DELETE FROM links WHERE uses_left <= 0 OR expires_at <= ?")
+        sqlx::query("DELETE FROM links WHERE uses_left <= 0 OR expires_at <= $1")
             .bind(now_unix())
             .execute(&self.pool)
             .await?;
         let rows = sqlx::query(
             "SELECT id, kind, uses_left, created_at, expires_at FROM links \
-             WHERE kind = ? ORDER BY created_at, id",
+             WHERE kind = $1 ORDER BY created_at, id",
         )
         .bind(kind.as_str())
         .fetch_all(&self.pool)
@@ -282,7 +283,7 @@ impl EncryptedStore {
 
     /// Revoke the link `id` of `kind`. Returns whether it existed.
     pub async fn revoke_link(&self, kind: LinkKind, id: Uuid) -> Result<bool> {
-        let done = sqlx::query("DELETE FROM links WHERE id = ? AND kind = ?")
+        let done = sqlx::query("DELETE FROM links WHERE id = $1 AND kind = $2")
             .bind(id.to_string())
             .bind(kind.as_str())
             .execute(&self.pool)
@@ -292,7 +293,7 @@ impl EncryptedStore {
 
     /// Revoke every link of `kind`: a new setup link replaces the earlier one.
     pub async fn revoke_links(&self, kind: LinkKind) -> Result<()> {
-        sqlx::query("DELETE FROM links WHERE kind = ?")
+        sqlx::query("DELETE FROM links WHERE kind = $1")
             .bind(kind.as_str())
             .execute(&self.pool)
             .await?;
@@ -316,7 +317,7 @@ impl EncryptedStore {
 
     pub async fn set_signup_policy(&self, policy: SignupPolicy) -> Result<()> {
         sqlx::query(
-            "INSERT INTO settings (name, value) VALUES ('signup', ?) \
+            "INSERT INTO settings (name, value) VALUES ('signup', $1) \
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(policy.as_str())
@@ -330,7 +331,7 @@ impl EncryptedStore {
     /// Write an administrative action to the log.
     pub async fn log_admin_action(&self, action: &AdminAction) -> Result<()> {
         let key = server_secret_key(&self.master)?;
-        sqlx::query("INSERT INTO admin_log (at, entry) VALUES (?, ?)")
+        sqlx::query("INSERT INTO admin_log (at, entry) VALUES ($1, $2)")
             .bind(now_unix())
             .bind(enc_json(&key, action)?)
             .execute(&self.pool)
@@ -341,7 +342,7 @@ impl EncryptedStore {
     /// The latest `limit` entries of the log, the newest first.
     pub async fn admin_log(&self, limit: u32) -> Result<Vec<AdminLogEntry>> {
         let key = server_secret_key(&self.master)?;
-        let rows = sqlx::query("SELECT at, entry FROM admin_log ORDER BY id DESC LIMIT ?")
+        let rows = sqlx::query("SELECT at, entry FROM admin_log ORDER BY id DESC LIMIT $1")
             .bind(i64::from(limit))
             .fetch_all(&self.pool)
             .await?;
@@ -359,7 +360,7 @@ impl EncryptedStore {
     /// Returns how many were deleted. The server calls it with its retention
     /// period: the log is not kept for ever.
     pub async fn purge_admin_log(&self, before: i64) -> Result<u64> {
-        let done = sqlx::query("DELETE FROM admin_log WHERE at < ?")
+        let done = sqlx::query("DELETE FROM admin_log WHERE at < $1")
             .bind(before)
             .execute(&self.pool)
             .await?;
@@ -373,7 +374,7 @@ impl EncryptedStore {
         let mut names = Vec::new();
         for id in accounts {
             let raw: Option<Vec<u8>> =
-                sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+                sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
                     .bind(id.to_string())
                     .fetch_optional(&self.pool)
                     .await?;
@@ -386,7 +387,7 @@ impl EncryptedStore {
     }
 }
 
-async fn administrators(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<i64> {
+async fn administrators(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<i64> {
     Ok(
         sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE admin = 1 AND suspended_at IS NULL")
             .fetch_one(&mut **tx)
@@ -396,7 +397,7 @@ async fn administrators(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<
 
 /// Fails the transaction when the change it holds leaves no administrator
 /// who can sign in, on a server that had one.
-async fn keep_an_administrator(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
+async fn keep_an_administrator(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
     if administrators(tx).await? == 0 {
         return Err(Error::LastAdministrator);
     }
@@ -417,7 +418,7 @@ mod tests {
     }
 
     async fn store() -> EncryptedStore {
-        EncryptedStore::new("sqlite::memory:", master())
+        EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap()
     }
@@ -666,13 +667,13 @@ mod tests {
         assert!(store.fetch_user(person).await.unwrap().is_some());
         assert_eq!(store.fetch_credentials(person).await.unwrap().len(), 1);
         // Suspending again keeps the date; lifting it clears it.
-        let since: i64 = sqlx::query_scalar("SELECT suspended_at FROM users WHERE id = ?")
+        let since: i64 = sqlx::query_scalar("SELECT suspended_at FROM users WHERE id = $1")
             .bind(person.to_string())
             .fetch_one(&store.pool)
             .await
             .unwrap();
         store.suspend_account(person).await.unwrap();
-        let again: i64 = sqlx::query_scalar("SELECT suspended_at FROM users WHERE id = ?")
+        let again: i64 = sqlx::query_scalar("SELECT suspended_at FROM users WHERE id = $1")
             .bind(person.to_string())
             .fetch_one(&store.pool)
             .await
