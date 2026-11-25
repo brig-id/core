@@ -485,21 +485,21 @@ dependencies = [
 
 [[package]]
 name = "brigid-crypto"
-version = "0.0.1"
-source = "git+https://github.com/brig-id/crypto?tag=v0.1.0#d7cd6ab9c16e9a4c9823b898c1f17e0017281723"
+version = "0.2.0"
+source = "git+https://github.com/brig-id/crypto?tag=v0.2.0#0f78de89cba0b302b6d5c7bfb328226c3bf1bdf8"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
  "getrandom 0.4.3",
- "hex",
+ "helpers4",
  "hkdf",
  "ml-dsa",
- "ml-kem",
  "rand_core 0.10.1",
  "secrecy",
+ "sha2 0.11.1",
  "sha3 0.11.0",
  "thiserror 2.0.21",
- "x25519-dalek",
+ "x-wing",
  "zeroize",
 ]
 
@@ -2265,7 +2265,6 @@ dependencies = [
  "hybrid-array",
  "kem",
  "module-lattice",
- "pkcs8 0.11.0",
  "rand_core 0.10.1",
  "sha3 0.12.0",
  "shake",
@@ -4744,6 +4743,20 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x-wing"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01576e56599d01d75c5efcd5b30fa5de29e776f5a225e43fbf8c92c7302d4c8b"
+dependencies = [
+ "kem",
+ "ml-kem",
+ "sha3 0.12.0",
+ "shake",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "x25519-dalek"

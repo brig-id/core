@@ -20,7 +20,7 @@ publish = false
 rust-version = "1.94"
 
 [workspace.dependencies]
-brigid-crypto = { git = "https://github.com/brig-id/crypto", tag = "v0.1.0" }
+brigid-crypto = { git = "https://github.com/brig-id/crypto", tag = "v0.2.0" }
 brigid-store = { path = "crates/brigid-store" }
 brigid-identity = { path = "crates/brigid-identity" }
 brigid-webauthn = { path = "crates/brigid-webauthn" }
