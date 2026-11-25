@@ -508,7 +508,6 @@ name = "brigid-identity"
 version = "0.3.0"
 dependencies = [
  "base64ct",
- "brigid-crypto",
  "helpers4",
  "hkdf",
  "serde",
