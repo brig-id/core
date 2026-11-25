@@ -6,6 +6,7 @@
       "release-type": "simple",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
       "pull-request-title-pattern": "chore(release): 🔖 release v${version}",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
