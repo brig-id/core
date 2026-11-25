@@ -5,7 +5,7 @@
       "release-type": "simple",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
-      "pull-request-title-pattern": "chore(core): 🔖 release v${version}",
+      "pull-request-title-pattern": "chore: 🔖 release v${version}",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         {
