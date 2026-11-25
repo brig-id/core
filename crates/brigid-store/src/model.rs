@@ -330,6 +330,75 @@ impl SignupPolicy {
     }
 }
 
+/// A limit an administrator sets for this server, open to others: what one
+/// account, or one address, can create. Each has a default and a maximum
+/// fixed here; the value set is stored like the sign-up policy.
+///
+/// An account above a lowered limit keeps what it has, and adds nothing
+/// until it is below it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Limit {
+    /// How many identities one account can have.
+    IdentitiesPerAccount,
+    /// How many passkeys one account can have. A passkey enrolled with the
+    /// recovery code is always accepted: it is how a person gets back in.
+    PasskeysPerAccount,
+    /// How many accounts can be created from one client address in a day
+    /// (UTC), whatever the sign-up policy.
+    SignUpsPerIpPerDay,
+}
+
+impl Limit {
+    /// Every limit, in the order the administration lists them.
+    pub const ALL: [Limit; 3] = [
+        Limit::IdentitiesPerAccount,
+        Limit::PasskeysPerAccount,
+        Limit::SignUpsPerIpPerDay,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IdentitiesPerAccount => "identities_per_account",
+            Self::PasskeysPerAccount => "passkeys_per_account",
+            Self::SignUpsPerIpPerDay => "sign_ups_per_ip_per_day",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|limit| limit.name() == name)
+    }
+
+    /// The value until an administrator sets another.
+    pub fn default_value(self) -> u32 {
+        match self {
+            Self::IdentitiesPerAccount => 20,
+            Self::PasskeysPerAccount => 10,
+            Self::SignUpsPerIpPerDay => 5,
+        }
+    }
+
+    /// The highest value an administrator can set.
+    pub fn max(self) -> u32 {
+        match self {
+            Self::IdentitiesPerAccount => 200,
+            Self::PasskeysPerAccount => 50,
+            Self::SignUpsPerIpPerDay => 1000,
+        }
+    }
+
+    /// The setting the value is stored under.
+    pub(crate) fn setting(self) -> String {
+        format!("limit.{}", self.name())
+    }
+}
+
+impl std::fmt::Display for Limit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// What an administrator sees of an account: enough to run the server,
 /// nothing of what the person does with it. No identity, no label, no
 /// attribute, no application.

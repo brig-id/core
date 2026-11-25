@@ -13,7 +13,8 @@ use zeroize::Zeroizing;
 use crate::{
     error::{Error, Result},
     model::{
-        AccountStanding, AccountSummary, AdminAction, AdminLogEntry, Link, LinkKind, SignupPolicy,
+        AccountStanding, AccountSummary, AdminAction, AdminLogEntry, Limit, Link, LinkKind,
+        SignupPolicy,
     },
     store::{
         EncryptedStore, base64_url, dec, dec_json, enc_json, now_unix, server_secret_key,
@@ -325,6 +326,51 @@ impl EncryptedStore {
         Ok(())
     }
 
+    // -- Limits --------------------------------------------------------------------
+
+    /// The value of `limit`: what an administrator set, or its default.
+    pub async fn limit(&self, limit: Limit) -> Result<u32> {
+        read_limit(&self.pool, limit).await
+    }
+
+    /// Every limit with its value, in the order of [`Limit::ALL`].
+    pub async fn limits(&self) -> Result<Vec<(Limit, u32)>> {
+        let mut values = Vec::with_capacity(Limit::ALL.len());
+        for limit in Limit::ALL {
+            values.push((limit, self.limit(limit).await?));
+        }
+        Ok(values)
+    }
+
+    /// Set `limit` to `value`. [`Error::InvalidLimit`] below 1 or above the
+    /// limit's maximum: nothing changes then.
+    pub async fn set_limit(&self, limit: Limit, value: u32) -> Result<()> {
+        if !(1..=limit.max()).contains(&value) {
+            return Err(Error::InvalidLimit(limit));
+        }
+        sqlx::query(
+            "INSERT INTO settings (name, value) VALUES (?, ?) \
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+        )
+        .bind(limit.setting())
+        .bind(value.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many accounts were created today (UTC) from `address`.
+    pub async fn sign_ups_today(&self, address: &str) -> Result<i64> {
+        let day = today();
+        let count: Option<i64> =
+            sqlx::query_scalar("SELECT count FROM sign_up_counts WHERE key = ? AND day = ?")
+                .bind(sign_up_key(&self.master, day, address)?)
+                .bind(day)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(count.unwrap_or(0))
+    }
+
     // -- The log of administrative actions -----------------------------------------
 
     /// Write an administrative action to the log.
@@ -384,6 +430,68 @@ impl EncryptedStore {
         }
         Ok(names)
     }
+}
+
+/// The value of `limit` as stored, read with `executor`: its default when
+/// none is, and at most its maximum (a value set by a version that allowed
+/// more counts as this version's maximum).
+pub(crate) async fn read_limit<'e, E>(executor: E, limit: Limit) -> Result<u32>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let value: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE name = ?")
+        .bind(limit.setting())
+        .fetch_optional(executor)
+        .await?;
+    Ok(value
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+        .map_or(limit.default_value(), |v| v.min(limit.max())))
+}
+
+/// Days since 1970-01-01, UTC.
+fn today() -> i64 {
+    now_unix().div_euclid(24 * 3600)
+}
+
+/// The key a sign-up from `address` on `day` is counted under: a keyed hash,
+/// so that the table never holds an address, and one that changes every day,
+/// so that two days of counts cannot be linked.
+fn sign_up_key(master: &brigid_crypto::MasterKey, day: i64, address: &str) -> Result<String> {
+    let mut input = Vec::with_capacity(8 + address.len());
+    input.extend_from_slice(&day.to_be_bytes());
+    input.extend_from_slice(address.as_bytes());
+    let key = brigid_crypto::hkdf::derive_user_key(master, &input, b"sign-up-count")?;
+    Ok(helpers4::hex::encode(&*key))
+}
+
+/// Counts a sign-up from `address`, inside the transaction that creates the
+/// account: [`Error::LimitReached`] when the day's count would pass
+/// `sign_ups_per_ip_per_day`, and the transaction, dropped, creates nothing.
+/// The counts of earlier days are deleted on the way.
+pub(crate) async fn count_sign_up(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    master: &brigid_crypto::MasterKey,
+    address: &str,
+) -> Result<()> {
+    let day = today();
+    sqlx::query("DELETE FROM sign_up_counts WHERE day < ?")
+        .bind(day)
+        .execute(&mut **tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar(
+        "INSERT INTO sign_up_counts (key, day, count) VALUES (?, ?, 1) \
+         ON CONFLICT (key) DO UPDATE SET count = count + 1 RETURNING count",
+    )
+    .bind(sign_up_key(master, day, address)?)
+    .bind(day)
+    .fetch_one(&mut **tx)
+    .await?;
+    let limit = read_limit(&mut **tx, Limit::SignUpsPerIpPerDay).await?;
+    if count > i64::from(limit) {
+        return Err(Error::LimitReached(Limit::SignUpsPerIpPerDay, limit));
+    }
+    Ok(())
 }
 
 async fn administrators(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<i64> {
@@ -808,5 +916,152 @@ mod tests {
         let log = store.admin_log(10).await.unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].action, policy);
+    }
+
+    #[tokio::test]
+    async fn limits_have_defaults_a_maximum_and_keep_what_is_set() {
+        let store = store().await;
+        let listed: Vec<(&str, u32)> = store
+            .limits()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(l, v)| (l.name(), v))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("identities_per_account", 20),
+                ("passkeys_per_account", 10),
+                ("sign_ups_per_ip_per_day", 5)
+            ]
+        );
+        for limit in Limit::ALL {
+            assert!(matches!(
+                store.set_limit(limit, 0).await,
+                Err(Error::InvalidLimit(l)) if l == limit
+            ));
+            assert!(matches!(
+                store.set_limit(limit, limit.max() + 1).await,
+                Err(Error::InvalidLimit(_))
+            ));
+            store.set_limit(limit, limit.max()).await.unwrap();
+            assert_eq!(store.limit(limit).await.unwrap(), limit.max());
+        }
+        assert_eq!(Limit::IdentitiesPerAccount.max(), 200);
+        assert_eq!(Limit::PasskeysPerAccount.max(), 50);
+        assert_eq!(Limit::SignUpsPerIpPerDay.max(), 1000);
+        // A value beyond this version's maximum counts as the maximum.
+        sqlx::query("UPDATE settings SET value = '5000' WHERE name = 'limit.passkeys_per_account'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.limit(Limit::PasskeysPerAccount).await.unwrap(), 50);
+    }
+
+    #[tokio::test]
+    async fn sign_ups_from_one_address_are_counted_without_keeping_it() {
+        let store = store().await;
+        store.set_limit(Limit::SignUpsPerIpPerDay, 2).await.unwrap();
+        async fn from(store: &EncryptedStore, name: &str, address: &str) -> Result<()> {
+            let (user, credential) = account(name);
+            store
+                .register_user_from(&user, &credential, None, Some(address))
+                .await
+        }
+        from(&store, "one-otter-0001", "203.0.113.7").await.unwrap();
+        from(&store, "two-otter-0002", "203.0.113.7").await.unwrap();
+        assert_eq!(store.sign_ups_today("203.0.113.7").await.unwrap(), 2);
+        assert!(matches!(
+            from(&store, "six-otter-0006", "203.0.113.7").await,
+            Err(Error::LimitReached(Limit::SignUpsPerIpPerDay, 2))
+        ));
+        // Refused, it created nothing.
+        assert_eq!(store.count_accounts().await.unwrap(), 2);
+        assert_eq!(store.sign_ups_today("203.0.113.7").await.unwrap(), 2);
+        // Another address has its own count.
+        from(&store, "ten-otter-0010", "2001:db8::1").await.unwrap();
+        assert_eq!(store.sign_ups_today("2001:db8::1").await.unwrap(), 1);
+
+        // No address is in the table, and yesterday's counts go at the next
+        // sign-up.
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT key, day FROM sign_up_counts")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(key, _)| !key.contains("203.0.113")
+            && !key.contains("2001:db8")
+            && key.len() == 64));
+        sqlx::query("UPDATE sign_up_counts SET day = day - 1")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.sign_ups_today("203.0.113.7").await.unwrap(), 0);
+        from(&store, "new-otter-0011", "198.51.100.1")
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sign_up_counts")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[tokio::test]
+    async fn an_account_adds_identities_and_passkeys_up_to_its_limits() {
+        use crate::model::Identity;
+        let store = store().await;
+        let id = register(&store, "full-otter-0001", None).await.unwrap();
+        store
+            .set_limit(Limit::IdentitiesPerAccount, 2)
+            .await
+            .unwrap();
+        store.set_limit(Limit::PasskeysPerAccount, 2).await.unwrap();
+        let identity = || {
+            let now = OffsetDateTime::now_utc();
+            Identity {
+                id: Uuid::new_v4(),
+                account_id: id,
+                name: "Work".into(),
+                logo: "icon:ph:briefcase".into(),
+                description: None,
+                attributes: Default::default(),
+                created_at: now,
+                updated_at: now,
+            }
+        };
+        store.add_identity(&identity()).await.unwrap();
+        store.add_identity(&identity()).await.unwrap();
+        assert!(matches!(
+            store.add_identity(&identity()).await,
+            Err(Error::LimitReached(Limit::IdentitiesPerAccount, 2))
+        ));
+        assert_eq!(store.fetch_identities(id).await.unwrap().len(), 2);
+
+        let passkey = || Credential {
+            id: Uuid::new_v4(),
+            user_id: id,
+            data: vec![7; 32],
+        };
+        // The first one came with the account.
+        store.add_passkey(&passkey()).await.unwrap();
+        assert!(matches!(
+            store.add_passkey(&passkey()).await,
+            Err(Error::LimitReached(Limit::PasskeysPerAccount, 2))
+        ));
+        assert_eq!(store.fetch_credentials(id).await.unwrap().len(), 2);
+
+        // Lowered below what the account has: it keeps everything, and adds
+        // nothing.
+        store
+            .set_limit(Limit::IdentitiesPerAccount, 1)
+            .await
+            .unwrap();
+        assert_eq!(store.fetch_identities(id).await.unwrap().len(), 2);
+        assert!(matches!(
+            store.add_identity(&identity()).await,
+            Err(Error::LimitReached(Limit::IdentitiesPerAccount, 1))
+        ));
     }
 }

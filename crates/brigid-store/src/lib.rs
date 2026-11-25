@@ -4,6 +4,7 @@
 //! A raw SQLite dump must never reveal readable secrets.
 
 pub mod admin;
+pub mod backup;
 pub mod error;
 pub mod model;
 pub mod store;
@@ -12,7 +13,7 @@ pub use error::{Error, Result};
 pub use model::{
     AccountStanding, AccountSummary, AcmeSecret, AdminAction, AdminLogEntry, ApplicationType,
     Client, ClientAuth, ClientDocument, ClientList, ClientPolicy, Credential, Decision, Grant,
-    Identity, Link, LinkKind, RecoveryStatus, SignupPolicy, StoredOidcKey, User,
+    Identity, Limit, Link, LinkKind, RecoveryStatus, SignupPolicy, StoredOidcKey, User,
 };
 pub use store::{EncryptedStore, SessionInfo, fetch_user, fetch_user_by_username, store_user};
 
