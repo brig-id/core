@@ -1,17 +1,13 @@
 //! Zero-trust storage operations and the [`EncryptedStore`] wrapper.
 //!
 //! Every sensitive field is encrypted with a per-user HKDF-derived key
-//! before writing to SQLite. A raw DB dump must never expose readable secrets.
+//! before writing to the database. A raw DB dump must never expose readable secrets.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use brigid_crypto::{EncryptedBlob, MasterKey};
 use brigid_identity::{Attribute, Attributes, Need};
-use sqlx::{
-    Row as _, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::str::FromStr;
+use sqlx::{AnyPool, Row as _, any::AnyPoolOptions};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -117,7 +113,7 @@ pub(crate) fn dec(key: &[u8; 32], raw: &[u8]) -> Result<Vec<u8>> {
 /// `username` and `server` are encrypted with a per-user
 /// HKDF-derived key before storage. A deterministic `username_index` is
 /// computed and stored to enable lookups without exposing plaintext.
-pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> Result<()> {
+pub async fn store_user(pool: &AnyPool, master: &MasterKey, user: &User) -> Result<()> {
     let key = user_key(master, &user.id)?;
     let username_enc = enc(&key, user.username.as_bytes())?;
     let server_enc = enc(&key, user.server.as_bytes())?;
@@ -129,7 +125,7 @@ pub async fn store_user(pool: &SqlitePool, master: &MasterKey, user: &User) -> R
 
     sqlx::query(
         "INSERT INTO users (id, username, server, created_at, username_index) \
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(user.id.to_string())
     .bind(username_enc)
@@ -160,7 +156,7 @@ fn map_sqlx_unique(e: sqlx::Error) -> Error {
 ///
 /// Returns `None` if no matching user exists.
 pub async fn fetch_user_by_username(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     username: &str,
     server: &str,
@@ -168,7 +164,7 @@ pub async fn fetch_user_by_username(
     let idx = username_index(master, username, server)?;
 
     let row =
-        sqlx::query("SELECT id, username, server, created_at FROM users WHERE username_index = ?")
+        sqlx::query("SELECT id, username, server, created_at FROM users WHERE username_index = $1")
             .bind(&idx)
             .fetch_optional(pool)
             .await?;
@@ -197,12 +193,8 @@ pub async fn fetch_user_by_username(
 }
 
 /// Fetch a [`User`] by ID, decrypting sensitive fields on read.
-pub async fn fetch_user(
-    pool: &SqlitePool,
-    master: &MasterKey,
-    user_id: Uuid,
-) -> Result<Option<User>> {
-    let row = sqlx::query("SELECT id, username, server, created_at FROM users WHERE id = ?")
+pub async fn fetch_user(pool: &AnyPool, master: &MasterKey, user_id: Uuid) -> Result<Option<User>> {
+    let row = sqlx::query("SELECT id, username, server, created_at FROM users WHERE id = $1")
         .bind(user_id.to_string())
         .fetch_optional(pool)
         .await?;
@@ -231,15 +223,11 @@ pub async fn fetch_user(
 }
 
 /// Encrypt and INSERT a [`Credential`] into the database.
-pub async fn store_credential(
-    pool: &SqlitePool,
-    master: &MasterKey,
-    cred: &Credential,
-) -> Result<()> {
+pub async fn store_credential(pool: &AnyPool, master: &MasterKey, cred: &Credential) -> Result<()> {
     let key = user_key(master, &cred.user_id)?;
     let data_enc = enc(&key, &cred.data)?;
 
-    sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES ($1, $2, $3)")
         .bind(cred.id.to_string())
         .bind(cred.user_id.to_string())
         .bind(data_enc)
@@ -255,7 +243,7 @@ pub async fn store_credential(
 /// authentication — the credential's serialised `Passkey` state is updated
 /// in-place rather than inserting a duplicate row.
 pub async fn update_credential(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     cred: &Credential,
 ) -> Result<()> {
@@ -269,7 +257,7 @@ pub async fn update_credential(
     // under a different user's key, corrupting that credential beyond
     // recovery. The extra predicate makes the mismatch a clean `NotFound`.
     let result =
-        sqlx::query("UPDATE webauthn_credentials SET data = ? WHERE id = ? AND user_id = ?")
+        sqlx::query("UPDATE webauthn_credentials SET data = $1 WHERE id = $2 AND user_id = $3")
             .bind(data_enc)
             .bind(cred.id.to_string())
             .bind(cred.user_id.to_string())
@@ -293,8 +281,8 @@ pub async fn update_credential(
 /// [`Error::NotFound`] when zero rows are affected (credential absent or
 /// `user_id` mismatch), letting callers distinguish a legitimate 404 from an
 /// authorisation failure without leaking whether the ID exists at all.
-pub async fn delete_credential(pool: &SqlitePool, user_id: Uuid, cred_id: Uuid) -> Result<()> {
-    let result = sqlx::query("DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?")
+pub async fn delete_credential(pool: &AnyPool, user_id: Uuid, cred_id: Uuid) -> Result<()> {
+    let result = sqlx::query("DELETE FROM webauthn_credentials WHERE id = $1 AND user_id = $2")
         .bind(cred_id.to_string())
         .bind(user_id.to_string())
         .execute(pool)
@@ -309,11 +297,11 @@ pub async fn delete_credential(pool: &SqlitePool, user_id: Uuid, cred_id: Uuid) 
 
 /// Fetch all [`Credential`]s for a user, decrypting `data` on read.
 pub async fn fetch_credentials(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     user_id: Uuid,
 ) -> Result<Vec<Credential>> {
-    let rows = sqlx::query("SELECT id, user_id, data FROM webauthn_credentials WHERE user_id = ?")
+    let rows = sqlx::query("SELECT id, user_id, data FROM webauthn_credentials WHERE user_id = $1")
         .bind(user_id.to_string())
         .fetch_all(pool)
         .await?;
@@ -338,7 +326,7 @@ pub const CREDENTIAL_LABEL_MAX_CHARS: usize = 64;
 /// Name a passkey of `user_id` (trimmed; empty clears the label).
 /// [`Error::NotFound`] when the passkey is not the user's.
 pub async fn set_credential_label(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     user_id: Uuid,
     cred_id: Uuid,
@@ -355,7 +343,7 @@ pub async fn set_credential_label(
         Some(enc(&key, label.as_bytes())?)
     };
     let result =
-        sqlx::query("UPDATE webauthn_credentials SET label = ? WHERE id = ? AND user_id = ?")
+        sqlx::query("UPDATE webauthn_credentials SET label = $1 WHERE id = $2 AND user_id = $3")
             .bind(label_enc)
             .bind(cred_id.to_string())
             .bind(user_id.to_string())
@@ -369,12 +357,12 @@ pub async fn set_credential_label(
 
 /// The labels of `user_id`'s named passkeys, by credential id.
 pub async fn fetch_credential_labels(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     user_id: Uuid,
 ) -> Result<std::collections::HashMap<Uuid, String>> {
     let rows = sqlx::query(
-        "SELECT id, label FROM webauthn_credentials WHERE user_id = ? AND label IS NOT NULL",
+        "SELECT id, label FROM webauthn_credentials WHERE user_id = $1 AND label IS NOT NULL",
     )
     .bind(user_id.to_string())
     .fetch_all(pool)
@@ -424,11 +412,7 @@ fn fmt_time(t: OffsetDateTime) -> Result<String> {
 ///
 /// The name is trimmed and the fields validated (`brigid_identity::profile`);
 /// the stored values are the validated ones.
-pub async fn store_identity(
-    pool: &SqlitePool,
-    master: &MasterKey,
-    identity: &Identity,
-) -> Result<()> {
+pub async fn store_identity(pool: &AnyPool, master: &MasterKey, identity: &Identity) -> Result<()> {
     insert_identity(pool, master, identity, None).await
 }
 
@@ -442,7 +426,7 @@ async fn insert_identity<'e, E>(
     within: Option<u32>,
 ) -> Result<()>
 where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
     let name = brigid_identity::validate_name(&identity.name)?;
     brigid_identity::validate_logo(&identity.logo)?;
@@ -455,8 +439,9 @@ where
     let done = sqlx::query(
         "INSERT INTO identities \
          (id, account_id, name, logo, description, attributes, created_at, updated_at) \
-         SELECT ?, ?, ?, ?, ?, ?, ?, ? \
-         WHERE ? IS NULL OR (SELECT COUNT(*) FROM identities WHERE account_id = ?) < ?",
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+         WHERE CAST($9 AS BIGINT) IS NULL \
+            OR (SELECT COUNT(*) FROM identities WHERE account_id = $10) < CAST($11 AS BIGINT)",
     )
     .bind(identity.id.to_string())
     .bind(identity.account_id.to_string())
@@ -483,7 +468,7 @@ where
     Ok(())
 }
 
-fn identity_from_row(master: &MasterKey, row: &sqlx::sqlite::SqliteRow) -> Result<Identity> {
+fn identity_from_row(master: &MasterKey, row: &sqlx::any::AnyRow) -> Result<Identity> {
     let id: Uuid = row.try_get::<String, _>("id")?.parse()?;
     let account_id: Uuid = row.try_get::<String, _>("account_id")?.parse()?;
     let key = user_key(master, &account_id)?;
@@ -525,7 +510,7 @@ macro_rules! identity_columns {
 
 /// Fetch one identity, only if it belongs to `account_id`.
 pub async fn fetch_identity(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     account_id: Uuid,
     identity_id: Uuid,
@@ -533,7 +518,7 @@ pub async fn fetch_identity(
     let row = sqlx::query(concat!(
         "SELECT ",
         identity_columns!(),
-        " FROM identities WHERE id = ? AND account_id = ?"
+        " FROM identities WHERE id = $1 AND account_id = $2"
     ))
     .bind(identity_id.to_string())
     .bind(account_id.to_string())
@@ -544,14 +529,14 @@ pub async fn fetch_identity(
 
 /// All identities of an account, oldest first.
 pub async fn fetch_identities(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     account_id: Uuid,
 ) -> Result<Vec<Identity>> {
     let rows = sqlx::query(concat!(
         "SELECT ",
         identity_columns!(),
-        " FROM identities WHERE account_id = ? ORDER BY created_at, id"
+        " FROM identities WHERE account_id = $1 ORDER BY created_at, id"
     ))
     .bind(account_id.to_string())
     .fetch_all(pool)
@@ -563,7 +548,7 @@ pub async fn fetch_identities(
 /// and bump `updated_at`. [`Error::NotFound`] when the identity does not
 /// exist or belongs to another account.
 pub async fn update_identity(
-    pool: &SqlitePool,
+    pool: &AnyPool,
     master: &MasterKey,
     identity: &Identity,
 ) -> Result<()> {
@@ -576,8 +561,8 @@ pub async fn update_identity(
 
     let key = user_key(master, &identity.account_id)?;
     let result = sqlx::query(
-        "UPDATE identities SET name = ?, logo = ?, description = ?, attributes = ?, \
-         updated_at = ? WHERE id = ? AND account_id = ?",
+        "UPDATE identities SET name = $1, logo = $2, description = $3, attributes = $4, \
+         updated_at = $5 WHERE id = $6 AND account_id = $7",
     )
     .bind(enc(&key, name.as_bytes())?)
     .bind(&identity.logo)
@@ -595,8 +580,8 @@ pub async fn update_identity(
 }
 
 /// Delete an identity of `account_id`. [`Error::NotFound`] when absent.
-pub async fn delete_identity(pool: &SqlitePool, account_id: Uuid, identity_id: Uuid) -> Result<()> {
-    let result = sqlx::query("DELETE FROM identities WHERE id = ? AND account_id = ?")
+pub async fn delete_identity(pool: &AnyPool, account_id: Uuid, identity_id: Uuid) -> Result<()> {
+    let result = sqlx::query("DELETE FROM identities WHERE id = $1 AND account_id = $2")
         .bind(identity_id.to_string())
         .bind(account_id.to_string())
         .execute(pool)
@@ -614,30 +599,54 @@ pub async fn delete_identity(pool: &SqlitePool, account_id: Uuid, identity_id: U
 /// Owns a connection pool and a master key; enforces zero-trust storage on all
 /// operations.
 pub struct EncryptedStore {
-    pub(crate) pool: SqlitePool,
+    pub(crate) pool: AnyPool,
     pub(crate) master: MasterKey,
 }
 
 impl EncryptedStore {
-    /// Open (or create) the SQLite database at `database_url`, run migrations,
-    /// and return an `EncryptedStore`.
+    /// Open the database at `database_url`, bring its schema up to date, and
+    /// return an `EncryptedStore`. A SQLite file is created when missing; a
+    /// PostgreSQL database must exist, and needs the feature `postgres`.
     pub async fn new(database_url: &str, master: MasterKey) -> Result<Self> {
-        let opts = SqliteConnectOptions::from_str(database_url)?
-            .foreign_keys(true)
-            .create_if_missing(true);
-        // For in-memory SQLite each connection gets its own empty database.
-        // Restrict the pool to a single connection so all operations share the
-        // same in-memory database (used in tests; does not affect file-backed DBs).
-        let pool = if database_url.contains(":memory:") {
-            SqlitePoolOptions::new()
+        sqlx::any::install_default_drivers();
+        let postgres = crate::is_postgres(database_url);
+        let pool = if postgres {
+            AnyPoolOptions::new().connect(database_url).await?
+        } else if database_url.contains(":memory:") {
+            // For in-memory SQLite each connection gets its own empty database.
+            // Restrict the pool to a single connection so all operations share the
+            // same in-memory database (used in tests; does not affect file-backed DBs).
+            AnyPoolOptions::new()
                 .max_connections(1)
-                .connect_with(opts)
+                .connect(database_url)
                 .await?
+        } else if database_url.contains('?') {
+            AnyPoolOptions::new().connect(database_url).await?
         } else {
-            SqlitePool::connect_with(opts).await?
+            // The file is created when it is missing.
+            AnyPoolOptions::new()
+                .connect(&format!("{database_url}?mode=rwc"))
+                .await?
         };
-        crate::MIGRATOR.run(&pool).await?;
+        Self::migrate(&pool, postgres).await?;
         Ok(Self { pool, master })
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn migrate(pool: &AnyPool, postgres: bool) -> Result<()> {
+        if postgres {
+            crate::MIGRATOR_POSTGRES.run(pool).await?;
+        } else {
+            crate::MIGRATOR.run(pool).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn migrate(pool: &AnyPool, _postgres: bool) -> Result<()> {
+        // Without the driver, a PostgreSQL address failed to connect above.
+        crate::MIGRATOR.run(pool).await?;
+        Ok(())
     }
 
     pub async fn store_user(&self, user: &User) -> Result<()> {
@@ -720,11 +729,11 @@ impl EncryptedStore {
         let key = oidc_seed_key(&self.master)?;
         let now = fmt_time(OffsetDateTime::now_utc())?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE oidc_keys SET retired_at = ? WHERE retired_at IS NULL")
+        sqlx::query("UPDATE oidc_keys SET retired_at = $1 WHERE retired_at IS NULL")
             .bind(&now)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO oidc_keys (kid, seed, created_at) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO oidc_keys (kid, seed, created_at) VALUES ($1, $2, $3)")
             .bind(kid)
             .bind(enc(&key, seed)?)
             .bind(&now)
@@ -752,7 +761,7 @@ impl EncryptedStore {
             Some(raw) => Zeroizing::new(dec(&key, &raw)?),
             None => {
                 let secret = Zeroizing::new(helpers4::random::random_bytes(32)?);
-                sqlx::query("INSERT INTO server_secrets (name, value) VALUES ('vsid', ?)")
+                sqlx::query("INSERT INTO server_secrets (name, value) VALUES ('vsid', $1)")
                     .bind(enc(&key, &secret)?)
                     .execute(&mut *tx)
                     .await?;
@@ -773,7 +782,7 @@ impl EncryptedStore {
     pub async fn acme_secret(&self, which: AcmeSecret) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let key = server_secret_key(&self.master)?;
         let stored: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = ?")
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = $1")
                 .bind(which.name())
                 .fetch_optional(&self.pool)
                 .await?;
@@ -786,7 +795,7 @@ impl EncryptedStore {
     pub async fn set_acme_secret(&self, which: AcmeSecret, value: &[u8]) -> Result<()> {
         let key = server_secret_key(&self.master)?;
         sqlx::query(
-            "INSERT INTO server_secrets (name, value) VALUES (?, ?) \
+            "INSERT INTO server_secrets (name, value) VALUES ($1, $2) \
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(which.name())
@@ -802,7 +811,7 @@ impl EncryptedStore {
         // RFC 3339 UTC timestamps written by this store compare correctly as
         // text: same format, same offset.
         let result =
-            sqlx::query("DELETE FROM oidc_keys WHERE retired_at IS NOT NULL AND retired_at < ?")
+            sqlx::query("DELETE FROM oidc_keys WHERE retired_at IS NOT NULL AND retired_at < $1")
                 .bind(fmt_time(before)?)
                 .execute(&self.pool)
                 .await?;
@@ -942,7 +951,7 @@ impl EncryptedStore {
 
         sqlx::query(
             "INSERT INTO users (id, username, server, created_at, username_index) \
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(user.id.to_string())
         .bind(username_enc)
@@ -953,7 +962,7 @@ impl EncryptedStore {
         .await
         .map_err(map_sqlx_unique)?;
 
-        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES ($1, $2, $3)")
             .bind(cred.id.to_string())
             .bind(cred.user_id.to_string())
             .bind(cred_data_enc)
@@ -965,7 +974,7 @@ impl EncryptedStore {
         if let Some(token) = link {
             match crate::admin::spend_link(&mut tx, token).await? {
                 Some(LinkKind::Setup) => {
-                    sqlx::query("UPDATE users SET admin = 1 WHERE id = ?")
+                    sqlx::query("UPDATE users SET admin = 1 WHERE id = $1")
                         .bind(user.id.to_string())
                         .execute(&mut *tx)
                         .await?;
@@ -992,7 +1001,7 @@ impl EncryptedStore {
     ///
     /// Nothing is kept: no tombstone, no log of who it was.
     pub async fn delete_account(&self, account_id: Uuid) -> Result<bool> {
-        let done = sqlx::query("DELETE FROM users WHERE id = ?")
+        let done = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(account_id.to_string())
             .execute(&self.pool)
             .await?;
@@ -1012,7 +1021,7 @@ impl EncryptedStore {
         let key = user_key(&self.master, &user_id)?;
         sqlx::query(
             "INSERT INTO account_recovery (user_id, recovery_index, recovery_id, verifier, created_at) \
-             VALUES (?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT(user_id) DO UPDATE SET recovery_index = excluded.recovery_index, \
              recovery_id = excluded.recovery_id, verifier = excluded.verifier, \
              created_at = excluded.created_at",
@@ -1031,8 +1040,8 @@ impl EncryptedStore {
     /// Whether the account has a usable code, and when one was last used.
     pub async fn recovery_status(&self, user_id: Uuid) -> Result<RecoveryStatus> {
         let row = sqlx::query(
-            "SELECT created_at, used_at, recovery_index IS NOT NULL AS usable \
-             FROM account_recovery WHERE user_id = ?",
+            "SELECT created_at, used_at, CASE WHEN recovery_index IS NOT NULL THEN 1 ELSE 0 END AS usable \
+             FROM account_recovery WHERE user_id = $1",
         )
         .bind(user_id.to_string())
         .fetch_optional(&self.pool)
@@ -1044,7 +1053,7 @@ impl EncryptedStore {
             s.map(|s| OffsetDateTime::parse(&s, &Rfc3339).map_err(|e| Error::Time(e.to_string())))
                 .transpose()
         };
-        let usable: bool = row.try_get("usable")?;
+        let usable = row.try_get::<i64, _>("usable")? != 0;
         Ok(RecoveryStatus {
             code_created_at: if usable {
                 parse(row.try_get("created_at")?)?
@@ -1058,7 +1067,7 @@ impl EncryptedStore {
     /// The account and stored verifier of a usable code with `recovery_id`.
     pub async fn find_recovery(&self, recovery_id: &[u8]) -> Result<Option<(Uuid, Vec<u8>)>> {
         let row =
-            sqlx::query("SELECT user_id, verifier FROM account_recovery WHERE recovery_index = ?")
+            sqlx::query("SELECT user_id, verifier FROM account_recovery WHERE recovery_index = $1")
                 .bind(recovery_index(&self.master, recovery_id)?)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -1082,7 +1091,7 @@ impl EncryptedStore {
         let mut tx = self.pool.begin().await?;
         let consumed = sqlx::query(
             "UPDATE account_recovery SET recovery_index = NULL, recovery_id = NULL, \
-             verifier = NULL, used_at = ? WHERE user_id = ? AND recovery_index = ?",
+             verifier = NULL, used_at = $1 WHERE user_id = $2 AND recovery_index = $3",
         )
         .bind(fmt_time(OffsetDateTime::now_utc())?)
         .bind(cred.user_id.to_string())
@@ -1093,7 +1102,7 @@ impl EncryptedStore {
         if consumed != 1 {
             return Ok(false);
         }
-        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES ($1, $2, $3)")
             .bind(cred.id.to_string())
             .bind(cred.user_id.to_string())
             .bind(enc(&key, &cred.data)?)
@@ -1144,7 +1153,7 @@ impl EncryptedStore {
             let new_idx = username_index(&new_master, &username_str, &server_str)?;
 
             sqlx::query(
-                "UPDATE users SET username = ?, server = ?, username_index = ? WHERE id = ?",
+                "UPDATE users SET username = $1, server = $2, username_index = $3 WHERE id = $4",
             )
             .bind(username_enc)
             .bind(server_enc)
@@ -1173,7 +1182,7 @@ impl EncryptedStore {
                 .map(|raw| dec(&old_key, &raw).and_then(|plain| enc(&new_key, &plain)))
                 .transpose()?;
 
-            sqlx::query("UPDATE webauthn_credentials SET data = ?, label = ? WHERE id = ?")
+            sqlx::query("UPDATE webauthn_credentials SET data = $1, label = $2 WHERE id = $3")
                 .bind(data_enc)
                 .bind(label_enc)
                 .bind(cred_id)
@@ -1208,7 +1217,7 @@ impl EncryptedStore {
                 .transpose()?;
 
             sqlx::query(
-                "UPDATE identities SET name = ?, description = ?, attributes = ? WHERE id = ?",
+                "UPDATE identities SET name = $1, description = $2, attributes = $3 WHERE id = $4",
             )
             .bind(name)
             .bind(description)
@@ -1232,12 +1241,14 @@ impl EncryptedStore {
             let new_key = user_key(&new_master, &account_id)?;
             let decisions =
                 Zeroizing::new(dec(&old_key, &row.try_get::<Vec<u8>, _>("decisions")?)?);
-            sqlx::query("UPDATE grants SET decisions = ? WHERE identity_id = ? AND client_id = ?")
-                .bind(enc(&new_key, &decisions)?)
-                .bind(identity_id)
-                .bind(client_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE grants SET decisions = $1 WHERE identity_id = $2 AND client_id = $3",
+            )
+            .bind(enc(&new_key, &decisions)?)
+            .bind(identity_id)
+            .bind(client_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         let oidc_rows = sqlx::query("SELECT kid, seed FROM oidc_keys")
@@ -1248,7 +1259,7 @@ impl EncryptedStore {
         for row in oidc_rows {
             let kid: String = row.try_get("kid")?;
             let seed = Zeroizing::new(dec(&old_oidc, &row.try_get::<Vec<u8>, _>("seed")?)?);
-            sqlx::query("UPDATE oidc_keys SET seed = ? WHERE kid = ?")
+            sqlx::query("UPDATE oidc_keys SET seed = $1 WHERE kid = $2")
                 .bind(enc(&new_oidc, &seed)?)
                 .bind(kid)
                 .execute(&mut *tx)
@@ -1263,7 +1274,7 @@ impl EncryptedStore {
         for row in secret_rows {
             let name: String = row.try_get("name")?;
             let value = Zeroizing::new(dec(&old_secrets, &row.try_get::<Vec<u8>, _>("value")?)?);
-            sqlx::query("UPDATE server_secrets SET value = ? WHERE name = ?")
+            sqlx::query("UPDATE server_secrets SET value = $1 WHERE name = $2")
                 .bind(enc(&new_secrets, &value)?)
                 .bind(name)
                 .execute(&mut *tx)
@@ -1276,7 +1287,7 @@ impl EncryptedStore {
         for row in log_rows {
             let id: i64 = row.try_get("id")?;
             let entry = Zeroizing::new(dec(&old_secrets, &row.try_get::<Vec<u8>, _>("entry")?)?);
-            sqlx::query("UPDATE admin_log SET entry = ? WHERE id = ?")
+            sqlx::query("UPDATE admin_log SET entry = $1 WHERE id = $2")
                 .bind(enc(&new_secrets, &entry)?)
                 .bind(id)
                 .execute(&mut *tx)
@@ -1297,8 +1308,8 @@ impl EncryptedStore {
             let recovery_id = dec(&old_key, &row.try_get::<Vec<u8>, _>("recovery_id")?)?;
             let verifier = dec(&old_key, &row.try_get::<Vec<u8>, _>("verifier")?)?;
             sqlx::query(
-                "UPDATE account_recovery SET recovery_index = ?, recovery_id = ?, verifier = ? \
-                 WHERE user_id = ?",
+                "UPDATE account_recovery SET recovery_index = $1, recovery_id = $2, verifier = $3 \
+                 WHERE user_id = $4",
             )
             .bind(recovery_index(&new_master, &recovery_id)?)
             .bind(enc(&new_key, &recovery_id)?)
@@ -1330,14 +1341,14 @@ impl EncryptedStore {
         let now = now_unix();
         let expires_at = now + lifetime.as_secs() as i64;
         let idle_expires_at = (now + idle.as_secs() as i64).min(expires_at);
-        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1 OR idle_expires_at <= ?1")
+        sqlx::query("DELETE FROM sessions WHERE expires_at <= $1 OR idle_expires_at <= $1")
             .bind(now)
             .execute(&self.pool)
             .await?;
         sqlx::query(
             "INSERT INTO sessions \
              (token_hash, account_id, created_at, idle_expires_at, expires_at, confirmed_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(session_hash(&token))
         .bind(account_id.to_string())
@@ -1348,7 +1359,7 @@ impl EncryptedStore {
         .execute(&self.pool)
         .await?;
         // A passkey just opened a session: that is the account's last sign-in.
-        sqlx::query("UPDATE users SET last_sign_in_at = ? WHERE id = ?")
+        sqlx::query("UPDATE users SET last_sign_in_at = $1 WHERE id = $2")
             .bind(now)
             .bind(account_id.to_string())
             .execute(&self.pool)
@@ -1365,8 +1376,8 @@ impl EncryptedStore {
     ) -> Result<Option<SessionInfo>> {
         let now = now_unix();
         let row = sqlx::query(
-            "UPDATE sessions SET idle_expires_at = MIN(?1 + ?2, expires_at) \
-             WHERE token_hash = ?3 AND idle_expires_at > ?1 AND expires_at > ?1 \
+            "UPDATE sessions SET idle_expires_at = CASE WHEN $1 + $2 < expires_at THEN $1 + $2 ELSE expires_at END \
+             WHERE token_hash = $3 AND idle_expires_at > $1 AND expires_at > $1 \
              RETURNING account_id, created_at, idle_expires_at, expires_at, confirmed_at",
         )
         .bind(now)
@@ -1389,7 +1400,7 @@ impl EncryptedStore {
     /// Record that a passkey ceremony was just done in the session behind
     /// `token`. Returns whether the session exists.
     pub async fn confirm_session(&self, token: &str) -> Result<bool> {
-        let done = sqlx::query("UPDATE sessions SET confirmed_at = ? WHERE token_hash = ?")
+        let done = sqlx::query("UPDATE sessions SET confirmed_at = $1 WHERE token_hash = $2")
             .bind(now_unix())
             .bind(session_hash(token))
             .execute(&self.pool)
@@ -1399,7 +1410,7 @@ impl EncryptedStore {
 
     /// End the session behind `token` (sign out). Unknown tokens are ignored.
     pub async fn delete_session(&self, token: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(session_hash(token))
             .execute(&self.pool)
             .await?;
@@ -1451,7 +1462,7 @@ impl EncryptedStore {
         };
         sqlx::query(
             "INSERT INTO clients (client_id, name, redirect_uris, secret_hash, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&client.client_id)
         .bind(&client.name)
@@ -1466,8 +1477,8 @@ impl EncryptedStore {
     /// The relying party registered as `client_id`, if any.
     pub async fn fetch_client(&self, client_id: &str) -> Result<Option<Client>> {
         let row = sqlx::query(
-            "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
-             attributes, created_at, document FROM clients WHERE client_id = ?",
+            "SELECT client_id, name, redirect_uris, CASE WHEN secret_hash IS NOT NULL THEN 1 ELSE 0 END AS confidential, \
+             attributes, created_at, document FROM clients WHERE client_id = $1",
         )
         .bind(client_id)
         .fetch_optional(&self.pool)
@@ -1478,7 +1489,7 @@ impl EncryptedStore {
     /// Every registered relying party, oldest first.
     pub async fn list_clients(&self) -> Result<Vec<Client>> {
         sqlx::query(
-            "SELECT client_id, name, redirect_uris, secret_hash IS NOT NULL AS confidential, \
+            "SELECT client_id, name, redirect_uris, CASE WHEN secret_hash IS NOT NULL THEN 1 ELSE 0 END AS confidential, \
              attributes, created_at, document FROM clients ORDER BY created_at, client_id",
         )
         .fetch_all(&self.pool)
@@ -1499,7 +1510,7 @@ impl EncryptedStore {
         client_id: &str,
         attributes: &BTreeMap<Attribute, Need>,
     ) -> Result<bool> {
-        let done = sqlx::query("UPDATE clients SET attributes = ? WHERE client_id = ?")
+        let done = sqlx::query("UPDATE clients SET attributes = $1 WHERE client_id = $2")
             .bind(serde_json::to_string(attributes).map_err(|_| Error::InvalidBlob)?)
             .bind(client_id)
             .execute(&self.pool)
@@ -1510,7 +1521,7 @@ impl EncryptedStore {
     /// Remove a relying party, the identity choices made for it and what was
     /// recorded as shared with it. Returns whether it existed.
     pub async fn delete_client(&self, client_id: &str) -> Result<bool> {
-        let done = sqlx::query("DELETE FROM clients WHERE client_id = ?")
+        let done = sqlx::query("DELETE FROM clients WHERE client_id = $1")
             .bind(client_id)
             .execute(&self.pool)
             .await?;
@@ -1530,7 +1541,7 @@ impl EncryptedStore {
         };
         sqlx::query(
             "INSERT INTO clients (client_id, name, redirect_uris, secret_hash, created_at, \
-             attributes, document) VALUES (?, ?, ?, NULL, ?, ?, ?) \
+             attributes, document) VALUES ($1, $2, $3, NULL, $4, $5, $6) \
              ON CONFLICT (client_id) DO UPDATE SET name = excluded.name, \
              redirect_uris = excluded.redirect_uris, attributes = excluded.attributes, \
              document = excluded.document WHERE clients.document IS NOT NULL",
@@ -1561,7 +1572,7 @@ impl EncryptedStore {
 
     pub async fn set_client_policy(&self, policy: ClientPolicy) -> Result<()> {
         sqlx::query(
-            "INSERT INTO settings (name, value) VALUES ('clients', ?) \
+            "INSERT INTO settings (name, value) VALUES ('clients', $1) \
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(policy.as_str())
@@ -1586,7 +1597,7 @@ impl EncryptedStore {
 
     pub async fn set_described_attributes(&self, attributes: &BTreeSet<Attribute>) -> Result<()> {
         sqlx::query(
-            "INSERT INTO settings (name, value) VALUES ('described_attributes', ?) \
+            "INSERT INTO settings (name, value) VALUES ('described_attributes', $1) \
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(serde_json::to_string(attributes).map_err(|_| Error::InvalidBlob)?)
@@ -1598,7 +1609,7 @@ impl EncryptedStore {
     /// The operator's list `client_id` is on, if any.
     pub async fn client_list(&self, client_id: &str) -> Result<Option<ClientList>> {
         let value: Option<String> =
-            sqlx::query_scalar("SELECT list FROM client_lists WHERE client_id = ?")
+            sqlx::query_scalar("SELECT list FROM client_lists WHERE client_id = $1")
                 .bind(client_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -1608,10 +1619,10 @@ impl EncryptedStore {
     /// Put `client_id` on a list (it leaves the other one), or on none.
     /// Returns whether something changed.
     pub async fn set_client_list(&self, client_id: &str, list: Option<ClientList>) -> Result<bool> {
-        let done = match list {
-            Some(list) => {
-                sqlx::query(
-                    "INSERT INTO client_lists (client_id, list, created_at) VALUES (?, ?, ?) \
+        let done =
+            match list {
+                Some(list) => sqlx::query(
+                    "INSERT INTO client_lists (client_id, list, created_at) VALUES ($1, $2, $3) \
                      ON CONFLICT (client_id) DO UPDATE SET list = excluded.list, \
                      created_at = excluded.created_at WHERE client_lists.list != excluded.list",
                 )
@@ -1619,15 +1630,14 @@ impl EncryptedStore {
                 .bind(list.as_str())
                 .bind(now_unix())
                 .execute(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query("DELETE FROM client_lists WHERE client_id = ?")
-                    .bind(client_id)
-                    .execute(&self.pool)
-                    .await?
-            }
-        };
+                .await?,
+                None => {
+                    sqlx::query("DELETE FROM client_lists WHERE client_id = $1")
+                        .bind(client_id)
+                        .execute(&self.pool)
+                        .await?
+                }
+            };
         Ok(done.rows_affected() > 0)
     }
 
@@ -1647,7 +1657,7 @@ impl EncryptedStore {
     /// `false` for an unknown client and for a public one.
     pub async fn verify_client_secret(&self, client_id: &str, secret: &str) -> Result<bool> {
         let stored: Option<Option<String>> =
-            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = ?")
+            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = $1")
                 .bind(client_id)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -1664,7 +1674,7 @@ impl EncryptedStore {
     /// exists.
     pub async fn chosen_identity(&self, account_id: Uuid, client_id: &str) -> Result<Option<Uuid>> {
         let id: Option<String> = sqlx::query_scalar(
-            "SELECT identity_id FROM client_identities WHERE account_id = ? AND client_id = ?",
+            "SELECT identity_id FROM client_identities WHERE account_id = $1 AND client_id = $2",
         )
         .bind(account_id.to_string())
         .bind(client_id)
@@ -1683,8 +1693,8 @@ impl EncryptedStore {
     ) -> Result<()> {
         let done = sqlx::query(
             "INSERT INTO client_identities (account_id, client_id, identity_id, updated_at) \
-             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS \
-               (SELECT 1 FROM identities WHERE id = ?3 AND account_id = ?1) \
+             SELECT $1, $2, $3, $4 WHERE EXISTS \
+               (SELECT 1 FROM identities WHERE id = $3 AND account_id = $1) \
              ON CONFLICT (account_id, client_id) DO UPDATE SET \
                identity_id = excluded.identity_id, updated_at = excluded.updated_at",
         )
@@ -1708,7 +1718,7 @@ impl EncryptedStore {
         sqlx::query(
             "SELECT g.identity_id, g.client_id, g.decisions, g.created_at, g.last_used_at \
              FROM grants g JOIN identities i ON i.id = g.identity_id \
-             WHERE i.account_id = ? AND g.client_id = ?",
+             WHERE i.account_id = $1 AND g.client_id = $2",
         )
         .bind(account_id.to_string())
         .bind(client_id)
@@ -1733,7 +1743,7 @@ impl EncryptedStore {
              c.name FROM grants g \
              JOIN identities i ON i.id = g.identity_id \
              JOIN clients c ON c.client_id = g.client_id \
-             WHERE i.account_id = ? AND g.identity_id = ? \
+             WHERE i.account_id = $1 AND g.identity_id = $2 \
              ORDER BY g.last_used_at DESC, g.client_id",
         )
         .bind(account_id.to_string())
@@ -1765,7 +1775,7 @@ impl EncryptedStore {
         let mut tx = self.pool.begin().await?;
 
         let owned: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM identities WHERE id = ? AND account_id = ?")
+            sqlx::query_scalar("SELECT 1 FROM identities WHERE id = $1 AND account_id = $2")
                 .bind(identity_id.to_string())
                 .bind(account_id.to_string())
                 .fetch_optional(&mut *tx)
@@ -1776,7 +1786,7 @@ impl EncryptedStore {
 
         let row = sqlx::query(
             "SELECT identity_id, client_id, decisions, created_at, last_used_at FROM grants \
-             WHERE identity_id = ? AND client_id = ?",
+             WHERE identity_id = $1 AND client_id = $2",
         )
         .bind(identity_id.to_string())
         .bind(client_id)
@@ -1808,7 +1818,7 @@ impl EncryptedStore {
 
         sqlx::query(
             "INSERT INTO grants (identity_id, client_id, decisions, created_at, last_used_at) \
-             VALUES (?, ?, ?, ?, ?) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (identity_id, client_id) DO UPDATE SET \
                decisions = excluded.decisions, last_used_at = excluded.last_used_at",
         )
@@ -1846,7 +1856,7 @@ impl EncryptedStore {
         let row = sqlx::query(
             "SELECT g.identity_id, g.client_id, g.decisions, g.created_at, g.last_used_at \
              FROM grants g JOIN identities i ON i.id = g.identity_id \
-             WHERE i.account_id = ? AND g.identity_id = ? AND g.client_id = ?",
+             WHERE i.account_id = $1 AND g.identity_id = $2 AND g.client_id = $3",
         )
         .bind(account_id.to_string())
         .bind(identity_id.to_string())
@@ -1862,7 +1872,7 @@ impl EncryptedStore {
                     return Err(Error::NotFound);
                 }
                 sqlx::query(
-                    "UPDATE grants SET decisions = ? WHERE identity_id = ? AND client_id = ?",
+                    "UPDATE grants SET decisions = $1 WHERE identity_id = $2 AND client_id = $3",
                 )
                 .bind(enc_json(&key, &grant.decisions)?)
                 .bind(identity_id.to_string())
@@ -1871,14 +1881,14 @@ impl EncryptedStore {
                 .await?;
             }
             None => {
-                sqlx::query("DELETE FROM grants WHERE identity_id = ? AND client_id = ?")
+                sqlx::query("DELETE FROM grants WHERE identity_id = $1 AND client_id = $2")
                     .bind(identity_id.to_string())
                     .bind(client_id)
                     .execute(&mut *tx)
                     .await?;
                 sqlx::query(
                     "DELETE FROM client_identities \
-                     WHERE account_id = ? AND client_id = ? AND identity_id = ?",
+                     WHERE account_id = $1 AND client_id = $2 AND identity_id = $3",
                 )
                 .bind(account_id.to_string())
                 .bind(client_id)
@@ -1892,7 +1902,7 @@ impl EncryptedStore {
     }
 }
 
-fn grant_from_row(key: &[u8; 32], row: &sqlx::sqlite::SqliteRow) -> Result<Grant> {
+fn grant_from_row(key: &[u8; 32], row: &sqlx::any::AnyRow) -> Result<Grant> {
     Ok(Grant {
         identity_id: row.try_get::<String, _>("identity_id")?.parse()?,
         client_id: row.try_get("client_id")?,
@@ -1902,13 +1912,13 @@ fn grant_from_row(key: &[u8; 32], row: &sqlx::sqlite::SqliteRow) -> Result<Grant
     })
 }
 
-fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Client> {
+fn client_from_row(row: &sqlx::any::AnyRow) -> Result<Client> {
     let uris: String = row.try_get("redirect_uris")?;
     Ok(Client {
         client_id: row.try_get("client_id")?,
         name: row.try_get("name")?,
         redirect_uris: serde_json::from_str(&uris).map_err(|_| Error::InvalidBlob)?,
-        confidential: row.try_get("confidential")?,
+        confidential: row.try_get::<i64, _>("confidential")? != 0,
         attributes: serde_json::from_str(&row.try_get::<String, _>("attributes")?)
             .map_err(|_| Error::InvalidBlob)?,
         created_at: row.try_get("created_at")?,
@@ -1981,6 +1991,63 @@ mod tests {
         MasterKey::from_hex(&"ab".repeat(32)).unwrap()
     }
 
+    /// A migration as PostgreSQL holds it: three type names change, and
+    /// nothing else.
+    fn for_postgres(sqlite: &str) -> String {
+        let counter = sqlite.replace(
+            "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT",
+            "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+        );
+        let mut out = String::with_capacity(counter.len());
+        let mut word = String::new();
+        for c in counter.chars().chain(std::iter::once('\n')) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+                continue;
+            }
+            out.push_str(match word.as_str() {
+                "BLOB" => "BYTEA",
+                "INTEGER" => "BIGINT",
+                other => other,
+            });
+            word.clear();
+            out.push(c);
+        }
+        out.pop();
+        out
+    }
+
+    /// The schema is the one thing written twice. The second writing is
+    /// held to the first: same files, same text but for three type names.
+    #[test]
+    fn the_postgresql_schema_is_the_sqlite_one_with_three_type_names_changed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let names = |dir: &str| {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let migrations = names("migrations");
+        assert_eq!(migrations, names("migrations-postgres"));
+        for name in migrations {
+            let sqlite = std::fs::read_to_string(root.join("migrations").join(&name)).unwrap();
+            let postgres =
+                std::fs::read_to_string(root.join("migrations-postgres").join(&name)).unwrap();
+            assert_eq!(postgres, for_postgres(&sqlite), "{name}");
+        }
+    }
+
+    /// The pool of a store on an empty database (`crate::testing::url`).
+    async fn test_pool() -> AnyPool {
+        EncryptedStore::new(&crate::testing::url().await, master())
+            .await
+            .unwrap()
+            .pool
+    }
+
     fn sample_user() -> User {
         User {
             id: Uuid::new_v4(),
@@ -1990,8 +2057,9 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn store_and_fetch_user(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn store_and_fetch_user() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         let id = user.id;
@@ -2005,15 +2073,17 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fetch_missing_user_returns_none(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn fetch_missing_user_returns_none() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let result = fetch_user(&pool, &master(), Uuid::new_v4()).await.unwrap();
         assert!(result.is_none());
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn store_and_fetch_credential(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn store_and_fetch_credential() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         let user_id = user.id;
@@ -2033,8 +2103,9 @@ mod tests {
     }
 
     /// A raw SQLite dump must not expose readable secrets.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn dump_contains_no_plaintext(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn dump_contains_no_plaintext() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2077,8 +2148,9 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn identity_roundtrip_and_listing(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn identity_roundtrip_and_listing() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2115,8 +2187,9 @@ mod tests {
     }
 
     /// An identity is only reachable through its own account.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn identity_is_scoped_to_its_account(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn identity_is_scoped_to_its_account() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let owner = sample_user();
         let mut other = sample_user();
@@ -2152,8 +2225,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_changes_display_fields(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn update_changes_display_fields() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2176,8 +2250,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn invalid_identity_is_rejected_before_any_write(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn invalid_identity_is_rejected_before_any_write() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2202,8 +2277,9 @@ mod tests {
     }
 
     /// A raw dump must not expose the name, the DID or the description.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn identity_dump_contains_no_plaintext(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn identity_dump_contains_no_plaintext() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2224,8 +2300,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn identities_follow_their_account_on_delete(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn identities_follow_their_account_on_delete() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2233,7 +2310,7 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("DELETE FROM users WHERE id = ?")
+        sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user.id.to_string())
             .execute(&pool)
             .await?;
@@ -2244,8 +2321,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn credential_labels_are_encrypted_and_scoped(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn credential_labels_are_encrypted_and_scoped() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2295,8 +2373,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn wrong_master_key_fails_decryption(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn wrong_master_key_fails_decryption() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         let id = user.id;
@@ -2311,8 +2390,9 @@ mod tests {
     /// Inject a malformed (too-short) blob directly into the DB and verify that
     /// `fetch_user` returns `Error::InvalidBlob`, exercising the
     /// `EncryptedBlob::from_bytes` error path inside `dec`.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fetch_user_with_malformed_blob_returns_error(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn fetch_user_with_malformed_blob_returns_error() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         use time::format_description::well_known::Rfc3339;
 
         let id = Uuid::new_v4();
@@ -2326,7 +2406,7 @@ mod tests {
         let dummy_index = "0".repeat(64);
         sqlx::query(
             "INSERT INTO users (id, username, server, created_at, username_index) \
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(id.to_string())
         .bind(&garbage)
@@ -2348,19 +2428,7 @@ mod tests {
     /// database so that every delegate method is covered.
     #[tokio::test]
     async fn encrypted_store_wrapper_methods() {
-        use sqlx::sqlite::SqlitePoolOptions;
-
-        // Single-connection pool keeps the :memory: database alive for the
-        // duration of the test.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        crate::MIGRATOR.run(&pool).await.unwrap();
-        drop(pool); // EncryptedStore::new will create its own pool
-
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
 
@@ -2401,8 +2469,9 @@ mod tests {
         assert!(missing.is_none());
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_credential_removes_row(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn delete_credential_removes_row() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         let user_id = user.id;
@@ -2422,8 +2491,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_credential_wrong_user_returns_not_found(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn delete_credential_wrong_user_returns_not_found() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         let user_id = user.id;
@@ -2458,8 +2528,9 @@ mod tests {
     /// 4-digit year, so the call fails with `Format::InvalidComponent("year")`.
     /// This exercises the `|e| Error::Time(e.to_string())` closure on the
     /// `format(&Rfc3339)?` line inside `store_user`.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn store_user_with_bc_date_returns_time_error(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn store_user_with_bc_date_returns_time_error() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         use time::{Date, Month, Time};
 
         let date = Date::from_calendar_date(-1, Month::June, 15)
@@ -2483,17 +2554,16 @@ mod tests {
     /// Insert a row with a malformed `created_at` string to exercise the
     /// `OffsetDateTime::parse` error path in `fetch_user` (the
     /// `|e| Error::Time(e.to_string())` closure on the `parse(&Rfc3339)?` line).
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fetch_user_with_malformed_date_returns_time_error(
-        pool: SqlitePool,
-    ) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn fetch_user_with_malformed_date_returns_time_error() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         // Store a valid user so the encrypted fields are correct.
         let user = sample_user();
         let id = user.id;
         store_user(&pool, &master(), &user).await.unwrap();
 
         // Corrupt the created_at column so that parsing it as RFC 3339 fails.
-        sqlx::query("UPDATE users SET created_at = 'not-a-valid-date' WHERE id = ?")
+        sqlx::query("UPDATE users SET created_at = 'not-a-valid-date' WHERE id = $1")
             .bind(id.to_string())
             .execute(&pool)
             .await?;
@@ -2506,8 +2576,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fetch_user_by_username_found(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn fetch_user_by_username_found() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user(); // username="alice", server="example.com"
         let id = user.id;
@@ -2523,8 +2594,9 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fetch_user_by_username_not_found(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn fetch_user_by_username_not_found() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let result = fetch_user_by_username(&pool, &master(), "nobody", "example.com")
             .await
             .unwrap();
@@ -2534,8 +2606,9 @@ mod tests {
 
     /// Verify that different master keys produce different username indexes,
     /// so a lookup with the wrong key returns None instead of the wrong user.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn wrong_master_returns_none_for_username_lookup(pool: SqlitePool) -> sqlx::Result<()> {
+    #[tokio::test]
+    async fn wrong_master_returns_none_for_username_lookup() -> sqlx::Result<()> {
+        let pool = test_pool().await;
         let master = master();
         let user = sample_user();
         store_user(&pool, &master, &user).await.unwrap();
@@ -2557,7 +2630,7 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_keys_rotate_retire_prune_and_survive_master_rotation() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         assert!(store.oidc_signing_keys().await.unwrap().is_empty());
@@ -2600,7 +2673,7 @@ mod tests {
 
     #[tokio::test]
     async fn vsid_secret_is_random_and_stable() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
 
@@ -2609,7 +2682,7 @@ mod tests {
         let again = store.vsid_secret().await.unwrap();
         assert_eq!(*first, *again, "stored once, then only read");
 
-        let other = EncryptedStore::new("sqlite::memory:", master())
+        let other = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         assert_ne!(
@@ -2629,7 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn acme_secrets_are_encrypted_replaced_and_survive_a_rotation() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let vsid = store.vsid_secret().await.unwrap();
@@ -2691,7 +2764,7 @@ mod tests {
 
     #[tokio::test]
     async fn vsid_secret_survives_a_master_key_rotation() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let before = store.vsid_secret().await.unwrap();
@@ -2704,7 +2777,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_code_lifecycle_and_master_rotation() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let user = sample_user();
@@ -2781,7 +2854,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_expire_idle_and_absolute_and_end_on_sign_out() {
         use std::time::Duration;
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let user = sample_user();
@@ -2883,7 +2956,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("DELETE FROM users WHERE id = ?")
+        sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user.id.to_string())
             .execute(&store.pool)
             .await
@@ -2899,7 +2972,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_master_key_round_trip() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
 
@@ -2962,7 +3035,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_master_key_old_key_can_no_longer_decrypt() {
         let old_master = master();
-        let mut store = EncryptedStore::new("sqlite::memory:", old_master)
+        let mut store = EncryptedStore::new(&crate::testing::url().await, old_master)
             .await
             .unwrap();
 
@@ -2987,7 +3060,7 @@ mod tests {
     #[tokio::test]
     async fn rotate_master_key_rolls_back_entirely_on_partial_failure() {
         let old_master = master();
-        let mut store = EncryptedStore::new("sqlite::memory:", old_master)
+        let mut store = EncryptedStore::new(&crate::testing::url().await, old_master)
             .await
             .unwrap();
 
@@ -3003,7 +3076,7 @@ mod tests {
         // via raw SQL, bypassing `store_credential`'s normal encryption, so
         // rotation's `dec()` call on it fails.
         let cred_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO webauthn_credentials (id, user_id, data) VALUES ($1, $2, $3)")
             .bind(cred_id.to_string())
             .bind(user_id.to_string())
             .bind(vec![0xde, 0xad, 0xbe])
@@ -3026,7 +3099,7 @@ mod tests {
         // the old key must still be the one on disk — if the `users` UPDATE
         // had actually committed before the credential failure, it wouldn't.
         let old_idx = username_index(&master(), "alice", "example.com").unwrap();
-        let row = sqlx::query("SELECT username_index FROM users WHERE id = ?")
+        let row = sqlx::query("SELECT username_index FROM users WHERE id = $1")
             .bind(user_id.to_string())
             .fetch_one(&store.pool)
             .await
@@ -3037,7 +3110,7 @@ mod tests {
 
     #[tokio::test]
     async fn clients_are_registered_listed_authenticated_and_removed() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let uris = vec!["https://shop.example/callback".to_string()];
@@ -3089,7 +3162,7 @@ mod tests {
 
         // The secret itself is nowhere in the database.
         let stored: String =
-            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = ?")
+            sqlx::query_scalar("SELECT secret_hash FROM clients WHERE client_id = $1")
                 .bind(&site.client_id)
                 .fetch_one(&store.pool)
                 .await
@@ -3103,7 +3176,7 @@ mod tests {
 
     #[tokio::test]
     async fn clients_need_a_name_and_safe_redirect_uris() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let ok = vec!["https://shop.example/cb".to_string()];
@@ -3136,7 +3209,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_identity_chosen_for_a_client_is_remembered_per_account() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let user = sample_user();
@@ -3246,7 +3319,7 @@ mod tests {
 
     #[tokio::test]
     async fn attributes_are_stored_validated_and_unreadable_in_a_dump() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let user = sample_user();
@@ -3303,7 +3376,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_may_ask_for_what_its_registration_lists() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let (site, _) = store
@@ -3336,7 +3409,7 @@ mod tests {
 
     #[tokio::test]
     async fn grants_record_what_was_decided_and_are_withdrawn() {
-        let mut store = EncryptedStore::new("sqlite::memory:", master())
+        let mut store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let user = sample_user();
@@ -3566,7 +3639,7 @@ mod tests {
     /// and of it only.
     #[tokio::test]
     async fn deleting_an_account_leaves_no_row_about_it() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let (site, _) = store
@@ -3628,7 +3701,7 @@ mod tests {
                 let count: i64 =
                     // The test's own table and column names, never input.
                     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                        "SELECT COUNT(*) FROM {table} WHERE {column} = ?"
+                        "SELECT COUNT(*) FROM {table} WHERE {column} = $1"
                     )))
                         .bind(id.to_string())
                         .fetch_one(&store.pool)
@@ -3677,7 +3750,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_described_client_is_kept_and_replaced_by_its_latest_document() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         store
@@ -3720,7 +3793,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_client_policy_is_open_until_set_and_lists_are_exclusive() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         let url = "https://shop.example/oauth-client-metadata.json";
@@ -3767,7 +3840,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_cap_on_described_clients_is_every_attribute_until_set() {
-        let store = EncryptedStore::new("sqlite::memory:", master())
+        let store = EncryptedStore::new(&crate::testing::url().await, master())
             .await
             .unwrap();
         assert_eq!(
