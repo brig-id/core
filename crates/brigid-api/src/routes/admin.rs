@@ -28,7 +28,7 @@ use axum::{
 };
 use brigid_identity::{Attribute, Need};
 use brigid_store::{
-    AdminAction, Client, ClientList, ClientPolicy, Error as StoreError, Link, LinkKind,
+    AdminAction, Client, ClientList, ClientPolicy, Error as StoreError, Limit, Link, LinkKind,
     SignupPolicy,
 };
 use serde::{Deserialize, Serialize};
@@ -820,6 +820,111 @@ pub async fn revoke_invitation(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// -- Limits ------------------------------------------------------------------------
+
+/// A limit as an administrator sees it.
+#[derive(Debug, Serialize)]
+pub struct LimitView {
+    /// `identities_per_account`, `passkeys_per_account`,
+    /// `sign_ups_per_ip_per_day`.
+    pub name: &'static str,
+    pub value: u32,
+    /// The value until an administrator sets another.
+    pub default: u32,
+    /// The highest value that can be set.
+    pub max: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LimitsView {
+    /// Always in the same order.
+    pub limits: Vec<LimitView>,
+}
+
+async fn limits_view(state: &AppState) -> Result<LimitsView, ApiError> {
+    Ok(LimitsView {
+        limits: state
+            .store
+            .limits()
+            .await
+            .map_err(|e| internal!(e))?
+            .into_iter()
+            .map(|(limit, value)| LimitView {
+                name: limit.name(),
+                value,
+                default: limit.default_value(),
+                max: limit.max(),
+            })
+            .collect(),
+    })
+}
+
+/// `GET /admin/limits`
+pub async fn limits(
+    State(state): State<Arc<AppState>>,
+    Administrator(_): Administrator,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(limits_view(&state).await?))
+}
+
+/// The limits a change names, checked: each known, each from 1 to its
+/// maximum. `400 invalid_limit` names the first that is not.
+pub fn parse_limits(
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<(Limit, u32)>, ApiError> {
+    let mut changes = Vec::with_capacity(body.len());
+    for (name, value) in body {
+        let Some(limit) = Limit::parse(name) else {
+            let known: Vec<&str> = Limit::ALL.into_iter().map(Limit::name).collect();
+            return Err(ApiError::InvalidLimit {
+                limit: name.clone(),
+                max: None,
+                message: format!("{name} is not a limit. They are: {}", known.join(", ")),
+            });
+        };
+        match value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| (1..=limit.max()).contains(v))
+        {
+            Some(value) => changes.push((limit, value)),
+            None => {
+                return Err(ApiError::InvalidLimit {
+                    limit: name.clone(),
+                    max: Some(limit.max()),
+                    message: format!("{name} is a whole number from 1 to {}", limit.max()),
+                });
+            }
+        }
+    }
+    Ok(changes)
+}
+
+/// `PUT /admin/limits`: any of them, by name. Every value is checked before
+/// any is set; each one set is logged. Answers what `GET` does.
+pub async fn set_limits(
+    State(state): State<Arc<AppState>>,
+    ConfirmedAdministrator(session): ConfirmedAdministrator,
+    Json(body): Json<serde_json::Map<String, serde_json::Value>>,
+) -> Result<impl IntoResponse, ApiError> {
+    for (limit, value) in parse_limits(&body)? {
+        state
+            .store
+            .set_limit(limit, value)
+            .await
+            .map_err(|e| internal!(e))?;
+        log(
+            &state,
+            "limit.set",
+            Some(session.account.id),
+            None,
+            Some(format!("{limit}={value}")),
+        )
+        .await;
+    }
+    Ok(Json(limits_view(&state).await?))
 }
 
 // -- The log -----------------------------------------------------------------------

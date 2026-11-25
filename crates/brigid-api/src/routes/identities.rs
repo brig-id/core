@@ -19,11 +19,7 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{
-    error::{ApiError, internal},
-    session::Onboarded,
-    state::AppState,
-};
+use crate::{error::ApiError, session::Onboarded, state::AppState};
 
 /// An identity as its own account sees it.
 #[derive(Debug, Serialize)]
@@ -128,7 +124,7 @@ fn map_store(e: StoreError) -> ApiError {
     match e {
         StoreError::InvalidIdentity(err) => ApiError::BadRequest(err.to_string()),
         StoreError::NotFound => ApiError::NotFound,
-        other => internal!(other),
+        other => crate::error::from_store(other),
     }
 }
 
@@ -165,9 +161,11 @@ pub async fn create_identity(
     apply_attributes(&mut attributes, body.attributes)?;
     let identity = new_identity(account_id, name, logo, description, attributes);
     let id = identity.id;
+    // Within `identities_per_account`: an account above a limit lowered
+    // since keeps what it has, and adds nothing.
     state
         .store
-        .store_identity(&identity)
+        .add_identity(&identity)
         .await
         .map_err(map_store)?;
 
