@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   release:
-    uses: brig-id/.github/.github/workflows/release.yml@b5d01e58e844ef8c4fa8f1799ad56a2dbe9651a7
+    uses: brig-id/.github/.github/workflows/release.yml@d1410b72508f07b7e105b527e8432c328f7c2636
     permissions:
       contents: write
       pull-requests: write
