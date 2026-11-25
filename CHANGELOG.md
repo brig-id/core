@@ -9,6 +9,14 @@ Conventional Commits of the release; the entries up to 0.2.0 were written by han
 the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0](https://github.com/brig-id/core/compare/v0.2.0...v0.3.0) (2026-11-25)
+
+
+### Features
+
+* **api:** ✨ what lives minutes is kept behind one interface, taken once ([e4cc835](https://github.com/brig-id/core/commit/e4cc835563324894cf34aa1bfbe8dd11e1feda76))
+* **deps:** ✨ bring in rust crate brigid-crypto to v0.2.0 ([ad49907](https://github.com/brig-id/core/commit/ad4990737822ac93369902598926572c53831e0f))
+
 ## [0.2.0] - 2026-11-25
 
 ### Added
