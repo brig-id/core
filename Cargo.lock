@@ -563,6 +563,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "time",
  "tokio",
@@ -571,6 +572,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "x509-parser 0.16.0",
 ]
 
