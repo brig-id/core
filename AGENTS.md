@@ -132,6 +132,7 @@ Format: `type(scope): <emoji> description`
 | `workspace` | Root `Cargo.toml`, workspace-level changes |
 | `ci` | `.github/workflows/` |
 | `deps` | Dependency bumps |
+| `release` | A release pull request (release-please) |
 
 **Do not use a scope outside this list.** If a new crate is added, update this table,
 `.vscode/settings.json`, and `.github/workflows/conventional-commits.yml`.
@@ -143,6 +144,23 @@ test(webauthn): ✅ add softpasskey registration roundtrip
 chore(deps): 📦 bump uuid from 1.23.1 to 1.23.2
 ci(ci): 👷 add conventional commit check
 ```
+
+## Releases
+
+Nobody tags by hand. `.github/workflows/release.yml` (release-please, through the
+shared workflow of brig-id/.github) keeps a release pull request up to date: the next
+version of every crate of the workspace (they share it, from the commit types since the
+last release) and its `CHANGELOG.md` entry. **Merging that pull request is the
+release**: the tag `vX.Y.Z` and the GitHub Release follow, and Renovate proposes the new
+tag to the servers, which pin the core by `tag`. So:
+
+- the commit type decides the version: `feat` is a minor, `fix` a patch, a `!` or a
+  `BREAKING CHANGE:` footer a minor too while the version is 0.x;
+- the commit subject is the changelog line: write it for someone reading the release;
+- a new release of brig-id/crypto comes from Renovate as `feat(deps)` or `fix(deps)`,
+  and so makes a release of the core;
+- do not edit `CHANGELOG.md`, `.release-please-manifest.json` or the crates' versions
+  by hand.
 
 ## Commands
 
