@@ -72,7 +72,11 @@ in the code; an administrator sets a value from 1 to the maximum.
 | `passkeys_per_account` | 10 | 50 | The passkeys of one account. A passkey enrolled with the recovery code is always accepted: it is how a person gets back in |
 | `sign_ups_per_ip_per_day` | 5 | 1000 | The accounts created from one client address in a day (UTC), whatever the sign-up policy, a setup link or an invitation included |
 
+- A change applies at once, on a running server too: every request reads the value. No
+  restart. `<server> limits set` works with the server stopped or running.
 - An account above a lowered limit keeps what it has, and adds nothing until it is below it.
+- A test suite that creates many accounts from one address (127.0.0.1) raises the daily
+  count first: `<server> limits set sign_ups_per_ip_per_day 1000`.
 - The client address is the one the rate limits use: the TCP peer, or the first address of
   `X-Forwarded-For` when `security.trust_forwarded_for` is set. An IPv6 address counts as
   itself, not by its prefix.
