@@ -65,6 +65,17 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
   once) or PKCE alone. The linking page shows its host, never only its declared name.
 - **CSP header** — `brigid-api` must emit a strict `Content-Security-Policy`
   (`default-src 'self'`, no `unsafe-inline`).
+- **Limits** (`brigid_store::Limit`, `docs/operations.md`) — identities and passkeys per
+  account, sign-ups per client address and day: a default and a maximum in the code, the
+  value in `settings`, set from `/admin/limits` or `<server> limits`. Enforced where the
+  row is written (one statement, or the sign-up's transaction), never only before. Sign-ups
+  are counted under a keyed hash of the day and the address (`sign_up_counts`): never store
+  an address.
+- **Backups** (`brigid-server/src/backup.rs`, `docs/operations.md`) — `backup` copies the
+  database while the server runs (`VACUUM INTO`); `restore` refuses while anything holds
+  `<database>.lock` or keeps the database open in WAL mode, and checks the backup's schema,
+  master key and domain before it replaces the database in one rename. Every process that
+  opens the database holds that lock shared (`lock.rs`).
 - **Rate limiting** — per client IP via `tower-governor`: the WebAuthn ceremonies
   (register, login, add-passkey finish) 20 req/min in bursts of 5; the routes that need a
   session 60 req/min in bursts of 30.
@@ -80,7 +91,7 @@ POST /auth/login/finish    → account session (HttpOnly cookie), no token
 POST /account/recovery-code            → the recovery code; until it exists, identities and applications answer 403
 POST /account/delete/begin, /finish    → a passkey ceremony of its own, then the account and all about it are gone
 
-GET  /admin/accounts, /admin/applications, /admin/sign-up, /admin/log → an administrator's session
+GET  /admin/accounts, /admin/applications, /admin/sign-up, /admin/limits, /admin/log → an administrator's session
 POST|PUT|DELETE /admin/…               → also a passkey ceremony at most 5 minutes old (/auth/confirm/begin|finish), logged
 POST /admin/claim                      → the role, for a link made on the machine
 
