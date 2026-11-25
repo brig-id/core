@@ -57,8 +57,47 @@ pub enum ApiError {
     #[error("too many requests")]
     TooManyRequests,
 
+    /// What an account, or an address, may create on this server is used
+    /// up (`limit` is its name, `value` its value). `409` for what belongs
+    /// to an account, `429` for sign-ups from one address.
+    #[error("{}", limit_sentence(*.limit, *.value))]
+    LimitReached {
+        limit: brigid_store::Limit,
+        value: u32,
+    },
+
+    /// A limit an administrator set is unknown, or outside 1 to its maximum.
+    #[error("{message}")]
+    InvalidLimit {
+        /// The name given.
+        limit: String,
+        /// The limit's maximum, when the name is known.
+        max: Option<u32>,
+        message: String,
+    },
+
     #[error("service unavailable")]
     ServiceUnavailable,
+}
+
+/// "This server allows at most 20 identities per account."
+fn limit_sentence(limit: brigid_store::Limit, value: u32) -> String {
+    use brigid_store::Limit;
+    let what = match limit {
+        Limit::IdentitiesPerAccount => "identities per account",
+        Limit::PasskeysPerAccount => "passkeys per account",
+        Limit::SignUpsPerIpPerDay => "new accounts per day from one address",
+    };
+    format!("this server allows at most {value} {what}")
+}
+
+/// A store error as the API answers it: a limit reached is said so, any
+/// other failure is internal.
+pub(crate) fn from_store(e: brigid_store::Error) -> ApiError {
+    match e {
+        brigid_store::Error::LimitReached(limit, value) => ApiError::LimitReached { limit, value },
+        other => ApiError::Internal(Box::new(other)),
+    }
 }
 
 impl ApiError {
@@ -71,6 +110,8 @@ impl ApiError {
             ApiError::Suspended => "suspended",
             ApiError::ConfirmationRequired => "confirmation_required",
             ApiError::RecoveryCodeRequired => "recovery_code_required",
+            ApiError::LimitReached { .. } => "limit_reached",
+            ApiError::InvalidLimit { .. } => "invalid_limit",
             _ => return None,
         })
     }
@@ -91,6 +132,15 @@ impl IntoResponse for ApiError {
             | ApiError::ConfirmationRequired
             | ApiError::RecoveryCodeRequired => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            ApiError::LimitReached { limit, .. } => (
+                if *limit == brigid_store::Limit::SignUpsPerIpPerDay {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::CONFLICT
+                },
+                self.to_string(),
+            ),
+            ApiError::InvalidLimit { .. } => (StatusCode::BAD_REQUEST, self.to_string()),
             ApiError::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             ApiError::Internal(cause) => {
                 // The cause goes to the log only; the client gets a fixed message.
@@ -104,10 +154,32 @@ impl IntoResponse for ApiError {
         // `code` tells the interface which refusal this is, so that it can
         // act on it (run a ceremony, send the person somewhere) without
         // reading the sentence.
-        let body = match self.code() {
+        let mut body = match self.code() {
             Some(code) => json!({ "error": message, "code": code }),
             None => json!({ "error": message }),
         };
+        // Which limit, so that the interface can say it in its own words.
+        match &self {
+            ApiError::LimitReached { limit, value } => {
+                body["limit"] = json!(limit.name());
+                body["value"] = json!(value);
+            }
+            ApiError::InvalidLimit {
+                limit,
+                max,
+                message,
+            } => {
+                // `error` is the code here, as the administration's
+                // contract says; the sentence is `message`.
+                body["error"] = json!("invalid_limit");
+                body["message"] = json!(message);
+                body["limit"] = json!(limit);
+                if let Some(max) = max {
+                    body["max"] = json!(max);
+                }
+            }
+            _ => {}
+        }
         (status, Json(body)).into_response()
     }
 }

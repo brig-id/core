@@ -4731,6 +4731,12 @@ fn administration(
             None,
         ),
         ("GET", "/admin/log".into(), None),
+        ("GET", "/admin/limits".into(), None),
+        (
+            "PUT",
+            "/admin/limits".into(),
+            Some(serde_json::json!({ "identities_per_account": 30 })),
+        ),
     ]
 }
 
@@ -4886,7 +4892,8 @@ async fn no_administration_response_holds_anything_of_an_identity() {
     }
     // The account is there, by its generated handle.
     assert!(said.contains("\"own\":false"), "{said}");
-    let said = said.to_lowercase();
+    // The name of a limit says the word, and nothing of anyone's.
+    let said = said.to_lowercase().replace("identities_per_account", "");
     for theirs in [
         "zanzibar",
         "nightshift",
@@ -6030,4 +6037,330 @@ async fn administrators_decide_which_sites_that_describe_themselves_are_accepted
     for action in ["described.policy", "described.attributes", "described.list"] {
         assert!(text.contains(action), "{action} missing from {text}");
     }
+}
+
+// -- Limits (grove#7) ----------------------------------------------------------
+
+/// core#94: the limits an administrator reads and sets, as the interface
+/// shows them: in a fixed order, with their default and their maximum.
+#[tokio::test]
+async fn administrators_read_and_set_the_limits() {
+    let (state, app, admin, _) = administered(fresh_app_state().await).await;
+    let xff = Addresses::new("10.120");
+    let expected = |identities: u32| {
+        serde_json::json!({ "limits": [
+            { "name": "identities_per_account", "value": identities, "default": 20, "max": 200 },
+            { "name": "passkeys_per_account", "value": 10, "default": 10, "max": 50 },
+            { "name": "sign_ups_per_ip_per_day", "value": 5, "default": 5, "max": 1000 },
+        ]})
+    };
+    let (status, j) = identity_request(
+        &app,
+        "GET",
+        "/admin/limits",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j, expected(20));
+
+    let (status, j) = identity_request(
+        &app,
+        "PUT",
+        "/admin/limits",
+        Some(&admin),
+        &xff.next(),
+        Some(serde_json::json!({ "identities_per_account": 30 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    assert_eq!(j, expected(30));
+    let log = state.store.admin_log(1).await.unwrap();
+    assert_eq!(log[0].action.action, "limit.set");
+    assert_eq!(
+        log[0].action.detail.as_deref(),
+        Some("identities_per_account=30")
+    );
+    assert!(log[0].action.actor.is_some());
+
+    // Out of range, unknown, not a number: refused, and nothing changes,
+    // even for the valid value sent along.
+    for (body, limit, max) in [
+        (
+            serde_json::json!({ "identities_per_account": 0 }),
+            "identities_per_account",
+            Some(200),
+        ),
+        (
+            serde_json::json!({ "passkeys_per_account": 51 }),
+            "passkeys_per_account",
+            Some(50),
+        ),
+        (
+            serde_json::json!({ "sign_ups_per_ip_per_day": "5" }),
+            "sign_ups_per_ip_per_day",
+            Some(1000),
+        ),
+        (serde_json::json!({ "accounts": 3 }), "accounts", None),
+        (
+            serde_json::json!({ "identities_per_account": 40, "passkeys_per_account": -1 }),
+            "passkeys_per_account",
+            Some(50),
+        ),
+    ] {
+        let (status, j) = identity_request(
+            &app,
+            "PUT",
+            "/admin/limits",
+            Some(&admin),
+            &xff.next(),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {j}");
+        assert_eq!(j["error"], "invalid_limit", "{body}");
+        assert_eq!(j["code"], "invalid_limit", "{body}");
+        assert_eq!(j["limit"], limit, "{body}");
+        match max {
+            Some(max) => assert_eq!(j["max"], max, "{body}"),
+            None => assert!(j.get("max").is_none(), "{body}"),
+        }
+        assert!(j["message"].as_str().unwrap().contains(limit), "{body}");
+    }
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/admin/limits",
+        Some(&admin),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j, expected(30));
+}
+
+/// grove#7: an account has at most `identities_per_account` identities; one
+/// above a lowered limit keeps what it has and adds nothing.
+#[tokio::test]
+async fn an_account_creates_identities_up_to_the_limit() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state));
+    let xff = Addresses::new("10.121");
+    state
+        .store
+        .set_limit(brigid_store::Limit::IdentitiesPerAccount, 2)
+        .await
+        .unwrap();
+    let person = sign_up_with(&app, None, &mut new_key(), &xff)
+        .await
+        .unwrap();
+    take_recovery_code(&app, &person, &xff).await;
+    let create = |n: u32| {
+        let body =
+            serde_json::json!({ "name": format!("Persona {n}"), "logo": "icon:ph:mask-happy" });
+        let (app, person, address) = (app.clone(), person.clone(), xff.next());
+        async move {
+            identity_request(
+                &app,
+                "POST",
+                "/account/identities",
+                Some(&person),
+                &address,
+                Some(body),
+            )
+            .await
+        }
+    };
+    for n in 0..2 {
+        let (status, j) = create(n).await;
+        assert_eq!(status, StatusCode::CREATED, "{j}");
+    }
+    let (status, j) = create(2).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "limit_reached");
+    assert_eq!(j["limit"], "identities_per_account");
+    assert_eq!(j["value"], 2);
+    assert_eq!(
+        j["error"],
+        "this server allows at most 2 identities per account"
+    );
+
+    state
+        .store
+        .set_limit(brigid_store::Limit::IdentitiesPerAccount, 1)
+        .await
+        .unwrap();
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/account/identities",
+        Some(&person),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j.as_array().unwrap().len(), 2, "what it had stays");
+    let (status, j) = create(3).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["value"], 1);
+}
+
+/// grove#7: an account has at most `passkeys_per_account` passkeys: said
+/// before the ceremony, and checked again when the passkey is stored.
+#[tokio::test]
+async fn an_account_adds_passkeys_up_to_the_limit() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state));
+    let xff = Addresses::new("10.122");
+    let person = sign_up_with(&app, None, &mut new_key(), &xff)
+        .await
+        .unwrap();
+    state
+        .store
+        .set_limit(brigid_store::Limit::PasskeysPerAccount, 1)
+        .await
+        .unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/begin",
+        Some(&person),
+        &xff.next(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "limit_reached");
+    assert_eq!(j["limit"], "passkeys_per_account");
+    assert_eq!(j["value"], 1);
+
+    // Begun under a limit of 2, finished after it was lowered to 1.
+    state
+        .store
+        .set_limit(brigid_store::Limit::PasskeysPerAccount, 2)
+        .await
+        .unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/begin",
+        Some(&person),
+        &xff.next(),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = new_key()
+        .do_registration(
+            url::Url::parse(ORIGIN).unwrap(),
+            for_soft_passkey(challenge),
+        )
+        .unwrap();
+    state
+        .store
+        .set_limit(brigid_store::Limit::PasskeysPerAccount, 1)
+        .await
+        .unwrap();
+    let (status, j) = identity_request(
+        &app,
+        "POST",
+        "/auth/passkeys/add/finish",
+        None,
+        &xff.next(),
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{j}");
+    assert_eq!(j["code"], "limit_reached");
+    let (_, j) = identity_request(
+        &app,
+        "GET",
+        "/auth/passkeys",
+        Some(&person),
+        &xff.next(),
+        None,
+    )
+    .await;
+    assert_eq!(j.as_array().unwrap().len(), 1);
+}
+
+/// A sign-up whose ceremony begins from `begin` and finishes from `finish`.
+async fn sign_up_between(
+    app: &axum::Router,
+    begin: &str,
+    finish: &str,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/auth/register/begin",
+        None,
+        begin,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    if status != StatusCode::OK {
+        return Err((status, j));
+    }
+    let challenge: webauthn_rs::prelude::CreationChallengeResponse =
+        serde_json::from_value(j["challenge"].clone()).unwrap();
+    let credential = new_key()
+        .do_registration(
+            url::Url::parse(ORIGIN).unwrap(),
+            for_soft_passkey(challenge),
+        )
+        .unwrap();
+    let (status, j) = identity_request(
+        app,
+        "POST",
+        "/auth/register/finish",
+        None,
+        finish,
+        Some(serde_json::json!({ "session_id": j["session_id"], "credential": credential })),
+    )
+    .await;
+    if status != StatusCode::NO_CONTENT {
+        return Err((status, j));
+    }
+    Ok(())
+}
+
+/// grove#7: at most `sign_ups_per_ip_per_day` accounts a day from one
+/// client address, the one the rate limits see. Said at `begin`, counted
+/// when the account is created.
+#[tokio::test]
+async fn sign_ups_from_one_address_are_limited_per_day() {
+    let state = make_state().await;
+    let app = build_router(Arc::clone(&state));
+    state
+        .store
+        .set_limit(brigid_store::Limit::SignUpsPerIpPerDay, 1)
+        .await
+        .unwrap();
+    sign_up_between(&app, "10.123.0.1", "10.123.0.1")
+        .await
+        .unwrap();
+    let refused = sign_up_between(&app, "10.123.0.1", "10.123.0.1")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.0, StatusCode::TOO_MANY_REQUESTS, "{}", refused.1);
+    assert_eq!(refused.1["code"], "limit_reached");
+    assert_eq!(refused.1["limit"], "sign_ups_per_ip_per_day");
+    assert_eq!(refused.1["value"], 1);
+    // A ceremony begun elsewhere and finished from that address is counted
+    // there, and creates nothing.
+    let refused = sign_up_between(&app, "10.123.0.2", "10.123.0.1")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.1["code"], "limit_reached", "{}", refused.1);
+    assert_eq!(state.store.count_accounts().await.unwrap(), 1);
+    // Another address has its own count.
+    sign_up_between(&app, "10.123.0.3", "10.123.0.3")
+        .await
+        .unwrap();
+    assert_eq!(state.store.count_accounts().await.unwrap(), 2);
 }

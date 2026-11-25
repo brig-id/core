@@ -9,14 +9,15 @@ use axum::{
     response::IntoResponse,
 };
 use brigid_identity::RootId;
-use brigid_store::{LinkKind, SignupPolicy, User};
+use brigid_store::{Limit, LinkKind, SignupPolicy, User};
 use brigid_webauthn::{load_passkeys, passkey_to_credential, update_passkey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    error::{ApiError, internal},
+    address::ClientAddress,
+    error::{ApiError, from_store, internal},
     session::{AccountSession, Onboarded, clear_cookie, open_session},
     shared::Kind,
     state::{
@@ -134,9 +135,29 @@ async fn may_sign_up(state: &AppState, link: Option<&str>) -> Result<(), ApiErro
 /// `POST /auth/register/begin`
 pub async fn register_begin(
     State(state): State<Arc<AppState>>,
+    ClientAddress(address): ClientAddress,
     Json(body): Json<BeginRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     may_sign_up(&state, body.link.as_deref()).await?;
+    // Said before the ceremony, so that nobody makes a passkey for nothing;
+    // counted when the account is created (`register_finish`).
+    let limit = state
+        .store
+        .limit(Limit::SignUpsPerIpPerDay)
+        .await
+        .map_err(|e| internal!(e))?;
+    if state
+        .store
+        .sign_ups_today(&address)
+        .await
+        .map_err(|e| internal!(e))?
+        >= i64::from(limit)
+    {
+        return Err(ApiError::LimitReached {
+            limit: Limit::SignUpsPerIpPerDay,
+            value: limit,
+        });
+    }
     let host = state.host()?.to_string();
     // The username is generated: a hidden handle, never typed.
     let root_id = generated_root_id(&state, &host).await?;
@@ -175,6 +196,7 @@ pub async fn register_begin(
 /// `POST /auth/register/finish`
 pub async fn register_finish(
     State(state): State<Arc<AppState>>,
+    ClientAddress(address): ClientAddress,
     Json(body): Json<FinishRegisterRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let pending = take_pending_registration(&state, body.session_id, Kind::Signup).await?;
@@ -205,16 +227,18 @@ pub async fn register_finish(
     // No identity is created here: the onboarding proposes some, and the
     // browser creates the ones the person keeps. The link that allowed the
     // sign-up is spent with it: used up in the meantime, nothing is created.
+    // So is one of the day's sign-ups from this address
+    // (`sign_ups_per_ip_per_day`): past the limit, nothing is created.
     state
         .store
-        .register_user_with_credential(&user, &cred, pending.link.as_deref())
+        .register_user_from(&user, &cred, pending.link.as_deref(), Some(&address))
         .await
         .map_err(|e| match e {
             brigid_store::Error::Duplicate => {
                 ApiError::Conflict(format!("user {} already exists", user.username))
             }
             brigid_store::Error::LinkSpent => ApiError::LinkInvalid,
-            other => internal!(other),
+            other => from_store(other),
         })?;
     if state
         .store
@@ -277,6 +301,18 @@ pub async fn add_credential_begin(
     let existing = load_passkeys(&state.store, user.id)
         .await
         .map_err(|e| internal!(e))?;
+    // Said before the ceremony; `finish` checks again as it stores it.
+    let limit = state
+        .store
+        .limit(Limit::PasskeysPerAccount)
+        .await
+        .map_err(|e| internal!(e))?;
+    if existing.len() >= limit as usize {
+        return Err(ApiError::LimitReached {
+            limit: Limit::PasskeysPerAccount,
+            value: limit,
+        });
+    }
     let exclude_credentials = existing.iter().map(|p| p.cred_id().clone()).collect();
 
     let (ccr, reg_state) = state
@@ -330,11 +366,7 @@ pub async fn add_credential_finish(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let cred = passkey_to_credential(pending.user_id, &passkey).map_err(|e| internal!(e))?;
-    state
-        .store
-        .store_credential(&cred)
-        .await
-        .map_err(|e| internal!(e))?;
+    state.store.add_passkey(&cred).await.map_err(from_store)?;
     apply_label(&state, pending.user_id, cred.id, body.label.as_deref()).await?;
 
     Ok(StatusCode::OK)

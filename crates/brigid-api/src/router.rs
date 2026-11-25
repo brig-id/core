@@ -3,11 +3,10 @@
 //! Assembles all routes, middleware, and security headers into a single
 //! [`axum::Router`].
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    extract::ConnectInfo,
     http::{HeaderName, HeaderValue, Request, header::ACCESS_CONTROL_ALLOW_ORIGIN},
     routing::{delete, get, patch, post, put},
 };
@@ -26,7 +25,7 @@ use crate::{
 /// deployment topology trusts a reverse proxy to set that header. Otherwise
 /// it ignores client-supplied headers and keys solely on the TCP peer address.
 ///
-/// Falls back to the real TCP peer address (via [`ConnectInfo`]) when the
+/// Falls back to the real TCP peer address (via `ConnectInfo`) when the
 /// header is absent or untrusted (e.g. direct connections, tests). This
 /// ensures each distinct client gets its own rate-limit bucket and prevents
 /// header-forgery rate-limit bypass.
@@ -39,24 +38,11 @@ impl KeyExtractor for ForwardedForExtractor {
     type Key = String;
 
     fn extract<T>(&self, req: &Request<T>) -> Result<Self::Key, GovernorError> {
-        // Only consult x-forwarded-for when a trusted reverse proxy is known to
-        // set it (see `AppState::trust_forwarded_for`). Otherwise an attacker
-        // could forge the header to evade rate limits.
-        if self.trust_header
-            && let Some(ip) = req
-                .headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+        // The same address sign-ups are counted by (`crate::address`).
+        if let Some(address) =
+            crate::address::client_address(req.headers(), req.extensions(), self.trust_header)
         {
-            return Ok(ip);
-        }
-        // Real TCP peer address injected by
-        // `into_make_service_with_connect_info::<SocketAddr>()`.
-        if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-            return Ok(addr.0.ip().to_string());
+            return Ok(address);
         }
         // No identifying information for this request. In production the
         // server wires `ConnectInfo<SocketAddr>` via
@@ -73,7 +59,7 @@ impl KeyExtractor for ForwardedForExtractor {
              shared rate-limit bucket. Wire `into_make_service_with_connect_info` \
              in the server to restore per-IP rate limiting."
         );
-        Ok("0.0.0.0".to_string())
+        Ok(crate::address::UNKNOWN.to_string())
     }
 }
 
@@ -197,6 +183,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/described/list", put(admin::set_described_list))
         .route("/admin/sign-up", get(admin::signup).put(admin::set_signup))
+        .route("/admin/limits", get(admin::limits).put(admin::set_limits))
         .route("/admin/invitations", post(admin::invite))
         .route("/admin/invitations/{id}", delete(admin::revoke_invitation))
         .route("/admin/log", get(admin::read_log))
