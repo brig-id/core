@@ -122,7 +122,7 @@ Format: `type(scope): <emoji> description`
 | Type | Emoji | When |
 | --- | --- | --- |
 | `feat` | ✨ | New feature |
-| `fix` | 🐛 | Bug fix |
+| `fix` | 🐛 (🔒️ for security) | Bug fix, security fix or hardening |
 | `docs` | 📝 | Documentation only |
 | `chore` | 🔧 | Maintenance, config |
 | `test` | ✅ | Tests |
@@ -130,7 +130,6 @@ Format: `type(scope): <emoji> description`
 | `perf` | ⚡️ | Performance |
 | `style` | 🎨 | Formatting only |
 | `ci` | 👷 | CI/CD |
-| `security` | 🔒 | Security fix or hardening |
 | `build` | 📦 | Build system, dependencies |
 | `revert` | ⏪ | Reverts a previous commit |
 
@@ -169,11 +168,13 @@ last release) and its `CHANGELOG.md` entry. **Merging that pull request is the
 release**: the tag `vX.Y.Z` and the GitHub Release follow, and Renovate proposes the new
 tag to the servers, which pin the core by `tag`. So:
 
-- the commit type decides the version: `feat` is a minor, `fix` a patch, a `!` or a
-  `BREAKING CHANGE:` footer a minor too while the version is 0.x;
+- the commit type decides the version: while it is 0.x, `feat` and `fix` are a patch,
+  a `!` or a `BREAKING CHANGE:` footer a minor; `build`, `ci`, `chore`, `docs`, `test`
+  and `refactor` alone make no release;
 - the commit subject is the changelog line: write it for someone reading the release;
-- a new release of brig-id/crypto comes from Renovate as `feat(deps)` or `fix(deps)`,
-  and so makes a release of the core;
+- a new release of brig-id/crypto comes from Renovate as `fix(deps)`, on a Monday, and
+  so opens a release pull request of the core; an update from outside the project
+  comes as `build(deps)` and waits for the next release;
 - do not edit `CHANGELOG.md`, `.release-please-manifest.json` or the crates' versions
   by hand.
 
