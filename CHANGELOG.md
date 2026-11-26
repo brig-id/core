@@ -9,6 +9,20 @@ Conventional Commits of the release; the entries up to 0.2.0 were written by han
 the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1](https://github.com/brig-id/core/compare/v0.3.0...v0.3.1) (2026-11-26)
+
+
+### Features
+
+* **api:** ✨ read and set the limits, refuse what passes them ([23d5b8b](https://github.com/brig-id/core/commit/23d5b8b44fb405402322cc777ac8e1f9e1fc0dd2))
+* **server:** ✨ backup, restore and limits commands for every edition ([be582af](https://github.com/brig-id/core/commit/be582af49bb4f5364c8dbec10287b94d8d856731))
+* **store:** ✨ limits per account and address, backup copy and checks ([b0b8a25](https://github.com/brig-id/core/commit/b0b8a252721721b1d0987705a3395f5fcadc57ae))
+
+
+### Bug Fixes
+
+* **api:** 🐛 a ceremony done for a request satisfies its max_age, however long the answer takes ([d8e7f3e](https://github.com/brig-id/core/commit/d8e7f3e86f52ba804b2d685abcd97ff45b47bf4c))
+
 ## [0.3.0](https://github.com/brig-id/core/compare/v0.2.0...v0.3.0) (2026-11-25)
 
 
