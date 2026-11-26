@@ -3402,6 +3402,11 @@ async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
         let fresh = format!("brigid_session={}", *fresh);
         let (_, j) = identity_request(&app, "GET", &uri, Some(&fresh), "10.63.6.4", None).await;
         assert_eq!(j["must_sign_in"], false, "{extra}");
+        // The person takes their time to choose: the ceremony they have just
+        // done for this request still counts, `max_age=0` included.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (_, j) = identity_request(&app, "GET", &uri, Some(&fresh), "10.63.6.6", None).await;
+        assert_eq!(j["must_sign_in"], false, "{extra}");
         approve(&app, &request, &fresh, identities[0], "10.63.6.5").await;
     }
 
