@@ -13,6 +13,7 @@
 
 pub mod admin;
 pub mod error;
+pub mod kept;
 pub mod model;
 pub mod store;
 
@@ -30,6 +31,32 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// The same schema as PostgreSQL holds it: `migrations-postgres/`.
 #[cfg(feature = "postgres")]
 pub static MIGRATOR_POSTGRES: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-postgres");
+
+/// A piece of the schema as PostgreSQL holds it: three type names change
+/// (bytes, 64-bit integers, the counter), and nothing else.
+pub fn for_postgres(sqlite: &str) -> String {
+    let counter = sqlite.replace(
+        "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT",
+        "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+    );
+    let mut out = String::with_capacity(counter.len());
+    let mut word = String::new();
+    for c in counter.chars().chain(std::iter::once('\n')) {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+        out.push_str(match word.as_str() {
+            "BLOB" => "BYTEA",
+            "INTEGER" => "BIGINT",
+            other => other,
+        });
+        word.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
+}
 
 /// Whether `database_url` names a PostgreSQL database.
 pub fn is_postgres(database_url: &str) -> bool {

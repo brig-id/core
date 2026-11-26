@@ -77,6 +77,13 @@ async fn fresh_app_state() -> AppState {
     let base_url = Url::parse("http://localhost:8080").unwrap();
 
     let mut state = AppState::new(store, webauthn, oidc_key, base_url, vsid_salt);
+    // With `BRIGID_TEST_SHARED=stored`, every flow of this file keeps its
+    // ceremonies, requests and codes in the database, as a server made of
+    // several nodes does, instead of in memory.
+    if std::env::var("BRIGID_TEST_SHARED").as_deref() == Ok("stored") {
+        state.store.prepare_kept().await.unwrap();
+        state.shared = Arc::new(brigid_api::shared::Stored::new(state.store.clone()));
+    }
     // Integration tests use `x-forwarded-for` to give each test its own
     // rate-limit bucket (oneshot requests carry no real peer address).
     state.trust_forwarded_for = true;

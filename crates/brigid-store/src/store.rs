@@ -1915,32 +1915,6 @@ mod tests {
         MasterKey::from_hex(&"ab".repeat(32)).unwrap()
     }
 
-    /// A migration as PostgreSQL holds it: three type names change, and
-    /// nothing else.
-    fn for_postgres(sqlite: &str) -> String {
-        let counter = sqlite.replace(
-            "INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT",
-            "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
-        );
-        let mut out = String::with_capacity(counter.len());
-        let mut word = String::new();
-        for c in counter.chars().chain(std::iter::once('\n')) {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                word.push(c);
-                continue;
-            }
-            out.push_str(match word.as_str() {
-                "BLOB" => "BYTEA",
-                "INTEGER" => "BIGINT",
-                other => other,
-            });
-            word.clear();
-            out.push(c);
-        }
-        out.pop();
-        out
-    }
-
     /// The schema is the one thing written twice. The second writing is
     /// held to the first: same files, same text but for three type names.
     #[test]
@@ -1960,7 +1934,7 @@ mod tests {
             let sqlite = std::fs::read_to_string(root.join("migrations").join(&name)).unwrap();
             let postgres =
                 std::fs::read_to_string(root.join("migrations-postgres").join(&name)).unwrap();
-            assert_eq!(postgres, for_postgres(&sqlite), "{name}");
+            assert_eq!(postgres, crate::for_postgres(&sqlite), "{name}");
         }
     }
 

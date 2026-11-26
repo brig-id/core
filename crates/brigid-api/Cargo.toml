@@ -37,6 +37,10 @@ webauthn-rs = { version = "0.5", features = [
   "conditional-ui",
 ] }
 
+[features]
+# The store on PostgreSQL, for an edition made of several nodes.
+postgres = ["brigid-store/postgres"]
+
 [dev-dependencies]
 # `brigid_store::testing::url`: the tests run on SQLite or on PostgreSQL.
 brigid-store = { workspace = true, features = ["testing"] }

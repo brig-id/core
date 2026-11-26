@@ -36,7 +36,7 @@ sqlx = { version = "0.9", features = [
 [features]
 # The PostgreSQL driver and schema: for forest. seedling and grove do not
 # carry them.
-postgres = ["sqlx/postgres"]
+postgres = ["sqlx/postgres", "sqlx/tls-rustls-aws-lc-rs"]
 # `brigid_store::testing`, for the tests of the crates built on the store.
 testing = []
 

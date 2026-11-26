@@ -48,6 +48,11 @@ time.workspace = true
 # geteuid, and dropping root for a command typed on the machine (owner.rs).
 libc = "0.2"
 
+[features]
+# The store on PostgreSQL, for an edition made of several nodes (forest).
+# seedling and grove leave it off and do not carry the driver.
+postgres = ["brigid-store/postgres", "brigid-api/postgres"]
+
 [dev-dependencies]
 figment = { version = "0.10", features = ["test"] }
 http-body-util = "0.1"
