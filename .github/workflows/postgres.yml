@@ -1,0 +1,107 @@
+name: PostgreSQL
+
+# The store runs on SQLite and on PostgreSQL from the same statements (spec
+# forest.md §3). CI runs every test on SQLite; this runs every test again on
+# PostgreSQL, on the oldest and the newest version its project supports, and
+# once more with what lives minutes kept in the database instead of memory,
+# as an edition made of several nodes keeps it.
+
+on:
+  push:
+    branches: [main, "dev/*"]
+  pull_request:
+    branches: [main, "dev/*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  postgres:
+    name: Every test on PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "19"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: brigid
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BRIGID_TEST_POSTGRES: postgres://postgres:test@localhost:5432/brigid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y mold
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Every test, the store on PostgreSQL
+        run: cargo nextest run --workspace --all-features
+        env:
+          CARGO_TARGET_DIR: /tmp/cargo-target
+
+      - name: Again, with what lives minutes kept in the database
+        run: cargo nextest run --workspace --all-features
+        env:
+          CARGO_TARGET_DIR: /tmp/cargo-target
+          BRIGID_TEST_SHARED: stored
+
+  sqlite-stored:
+    # The same statements keep that state on SQLite: no edition does it
+    # there, the tests do, so that both databases stay held to one text.
+    name: What lives minutes kept in the database, on SQLite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y mold
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-nextest
+
+      - name: Every flow of brigid-api, its short-lived state in SQLite
+        run: cargo nextest run --workspace --all-features
+        env:
+          CARGO_TARGET_DIR: /tmp/cargo-target
+          BRIGID_TEST_SHARED: stored
