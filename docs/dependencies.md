@@ -70,6 +70,8 @@ and maintained by AWS; it is also what `axum-server` defaults to.
 | `strip = "debuginfo"` | Symbols stay in the release binary: 2.6 MB of 18.4 | Keep them: a panic then names its function, which an operator can report |
 | `lto = "thin"` | `fat` is slower to build, smaller by a few percent | Not worth the CI time today |
 | `libsqlite3-sys` | C, SQLite itself, bundled | Keep: the database |
+| `sqlx` `any` | The store speaks to its database through the driver's database-agnostic mode, so that its statements are written once for SQLite and PostgreSQL | Keep: it is what makes the store one implementation (spec `forest.md` §3). No crate added |
+| `sqlx` `postgres` (feature `postgres`) | The PostgreSQL driver: `sqlx-postgres`, and for the SCRAM sign-in to the database `md-5`, `stringprep`, three `unicode-*` crates, `rand`, `chacha20`, `tinyvec`, `byteorder`, `whoami`. TLS to the database is rustls on aws-lc, already there: one crate more, `webpki-roots` | **Off by default.** seedling and grove are built without it and carry none of these twelve crates; only an edition on PostgreSQL turns it on |
 
 ## How to measure again
 

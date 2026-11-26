@@ -12,7 +12,7 @@ issues, pull requests. No exceptions.
 
 | Crate | Purpose |
 | --- | --- |
-| `brigid-store` | Zero-trust SQLite storage (all data encrypted before INSERT) |
+| `brigid-store` | Zero-trust storage, on SQLite or PostgreSQL (all data encrypted before INSERT) |
 | `brigid-identity` | `RootId` (the account's hidden username), VSID computation, recovery codes, identity labels |
 | `brigid-webauthn` | Passkey registration and authentication flows |
 | `brigid-oidc` | ID token issuance (EdDSA), PKCE, JWKS, `.well-known/openid-configuration` |
@@ -28,7 +28,16 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 ## Hard security constraints
 
 - **Zero-trust storage** — every sensitive field must be encrypted via `brigid-crypto`
-  before being written to SQLite. A raw SQL dump must never expose readable secrets.
+  before being written to the database. A raw SQL dump must never expose readable secrets.
+- **One store, two databases** (spec `forest.md` §3) — every statement of `brigid-store`
+  is written once and runs on SQLite and on PostgreSQL. So, in a statement: parameters
+  are `$1, $2…`; columns are `TEXT`, `INTEGER` (read as `i64`) or `BLOB`; a truth value is
+  `CASE WHEN … THEN 1 ELSE 0 END` read as `i64`, never a boolean; no function only one of
+  them has (two-argument `MIN`/`MAX`, `IFNULL`, `unixepoch`…). A new migration goes in
+  `migrations/` **and** in `migrations-postgres/`, the second being the first with `BLOB`
+  → `BYTEA` and `INTEGER` → `BIGINT`: a test compares them. Tests take their database
+  from `brigid_store::testing::url()`, never from a literal address, and run on both:
+  `BRIGID_TEST_POSTGRES=postgres://… cargo nextest run --workspace --all-features`.
 - **VSID invariants** (enforced in `brigid-identity`):
   - `sub` in OIDC tokens = VSID, never username, alias, or raw DID.
   - VSID must never be derived from an alias.
@@ -56,8 +65,10 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
 - **What lives minutes** (`brigid-api/src/shared.rs`) — passkey ceremonies in progress,
   pending requests, codes and the assertions of clients already used are kept behind the
   `Shared` trait, with an expiry and a cap, and taken once. `Memory` keeps them in the
-  process: enough for one node. Never keep such state anywhere else: an edition made of
-  several nodes gives `AppState` another `Shared` (spec `forest.md` §2–§3).
+  process: enough for one node. `Stored` keeps them in the database (`brigid-store`'s
+  `kept.rs`: an unlogged table on PostgreSQL, hashed identifiers, encrypted values), for
+  an edition made of several nodes (spec `forest.md` §2–§3). Never keep such state
+  anywhere else.
 - **Sites that describe themselves** (`brigid-api/src/described.rs`) — the server fetches
   a document at a URL anyone chooses: keep every rule of the module (https and a domain
   name, the resolver that drops special-use addresses, no redirect, no proxy, 5 KiB, 10 s,
@@ -109,7 +120,7 @@ GET /.well-known/jwks.json
 
 ## Key crates
 
-- `sqlx` (sqlite, runtime-tokio-rustls) — `brigid-store`
+- `sqlx` (`any` over sqlite; postgres behind the feature `postgres`) — `brigid-store`
 - `webauthn-rs` — `brigid-webauthn`
 - `jsonwebtoken` (EdDSA, v9+) — `brigid-oidc`
 - `axum` + `tower-http` + `tower-governor` — `brigid-api`
