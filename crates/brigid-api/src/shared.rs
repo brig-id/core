@@ -4,9 +4,9 @@
 //! already presented (spec `forest.md` §2–§3).
 //!
 //! A server made of one node keeps it in its memory ([`Memory`]). A server
-//! made of several gives [`AppState`](crate::state::AppState) another
-//! [`Shared`], which keeps it where all its nodes read it. The routes do not
-//! know which one they talk to.
+//! made of several gives [`AppState`](crate::state::AppState) [`Stored`],
+//! which keeps it in the database all its nodes read. The routes do not know
+//! which one they talk to.
 //!
 //! The contract, whatever keeps the state:
 //!
@@ -23,9 +23,11 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+use brigid_store::EncryptedStore;
 
 /// Passkey ceremonies in progress expire after 5 minutes.
 pub(crate) const CEREMONY_TTL: Duration = Duration::from_secs(300);
@@ -109,7 +111,7 @@ impl Kind {
         }
     }
 
-    /// A stable name, for whatever keeps the state outside the process.
+    /// A stable name, for what keeps the state outside the process.
     /// A value whose shape changes gets a new kind and a new name: nodes of
     /// two versions never read each other's values wrongly.
     pub fn name(self) -> &'static str {
@@ -122,6 +124,18 @@ impl Kind {
             Self::Confirm => "confirm",
             Self::Authorization => "authorization",
             Self::Code => "code",
+        }
+    }
+}
+
+impl Family {
+    /// A stable name, for what keeps the state outside the process.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Registrations => "registrations",
+            Self::Authentications => "authentications",
+            Self::Authorizations => "authorizations",
+            Self::Codes => "codes",
         }
     }
 }
@@ -248,15 +262,205 @@ impl Shared for Memory {
     }
 }
 
+/// How long a node trusts what it counted in the database. Counting at
+/// every `begin` would cost a query each; a node counts every few seconds
+/// and adds what it keeps itself in between. Several nodes can therefore
+/// pass the cap together by what they keep within that time: the cap bounds
+/// a flood, it is not an exact number.
+const COUNT_FOR: Duration = Duration::from_secs(5);
+
+struct Counted {
+    count: i64,
+    at: Instant,
+}
+
+/// The state of a server made of several nodes: in the database they share
+/// (`brigid_store::kept`, spec `forest.md` §3). The tables are created by
+/// what initialises the server ([`EncryptedStore::prepare_kept`]), never by
+/// a node.
+pub struct Stored {
+    store: Arc<EncryptedStore>,
+    capacity: i64,
+    assertions_capacity: i64,
+    kept: Mutex<HashMap<Family, Counted>>,
+    assertions: Mutex<Option<Counted>>,
+}
+
+impl Stored {
+    pub fn new(store: Arc<EncryptedStore>) -> Self {
+        Self::with_capacity(store, CAPACITY, ASSERTIONS_CAPACITY)
+    }
+
+    fn with_capacity(store: Arc<EncryptedStore>, capacity: usize, assertions: usize) -> Self {
+        Self {
+            store,
+            capacity: i64::try_from(capacity).unwrap_or(i64::MAX),
+            assertions_capacity: i64::try_from(assertions).unwrap_or(i64::MAX),
+            kept: Mutex::new(HashMap::new()),
+            assertions: Mutex::new(None),
+        }
+    }
+
+    /// Removes what expired. Every node calls it every few seconds.
+    pub async fn sweep(&self) -> Result<u64, SharedError> {
+        Ok(self.store.sweep_kept(unix_now()).await?)
+    }
+
+    /// Whether `family` is at its cap, from a count at most [`COUNT_FOR`] old.
+    async fn full(&self, family: Family, now: i64) -> Result<bool, SharedError> {
+        let known = self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&family)
+            .filter(|counted| counted.at.elapsed() < COUNT_FOR)
+            .map(|counted| counted.count);
+        let count = match known {
+            Some(count) => count,
+            None => {
+                let count = self.store.count_kept(family.name(), now).await?;
+                self.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    family,
+                    Counted {
+                        count,
+                        at: Instant::now(),
+                    },
+                );
+                count
+            }
+        };
+        Ok(count >= self.capacity)
+    }
+
+    /// Whether as many assertions as allowed are remembered, likewise.
+    async fn assertions_full(&self, now: i64) -> Result<bool, SharedError> {
+        let known = self
+            .assertions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|counted| counted.at.elapsed() < COUNT_FOR)
+            .map(|counted| counted.count);
+        let count = match known {
+            Some(count) => count,
+            None => {
+                let count = self.store.count_assertions(now).await?;
+                *self.assertions.lock().unwrap_or_else(|e| e.into_inner()) = Some(Counted {
+                    count,
+                    at: Instant::now(),
+                });
+                count
+            }
+        };
+        Ok(count >= self.assertions_capacity)
+    }
+}
+
+/// A value read from the database, or nothing when it cannot be decrypted
+/// or was not kept under that row: kept under another master key, or
+/// tampered with. Either way it is of no use, and is refused as absent.
+fn readable(
+    kind: Kind,
+    read: brigid_store::Result<Option<Vec<u8>>>,
+) -> Result<Option<Vec<u8>>, SharedError> {
+    match read {
+        Ok(value) => Ok(value),
+        Err(e @ (brigid_store::Error::InvalidBlob | brigid_store::Error::Crypto(_))) => {
+            tracing::warn!(kind = kind.name(), error = %e, "a kept value could not be read");
+            Ok(None)
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+fn unix_now() -> i64 {
+    helpers4::time::unix_now().map_or(0, |secs| secs as i64)
+}
+
+impl Shared for Stored {
+    fn put<'a>(&'a self, kind: Kind, id: &'a str, value: Vec<u8>) -> SharedFuture<'a, bool> {
+        Box::pin(async move {
+            let now = unix_now();
+            let family = kind.family();
+            if self.full(family, now).await? {
+                return Ok(false);
+            }
+            let expires = now.saturating_add(i64::try_from(kind.ttl().as_secs()).unwrap_or(0));
+            self.store
+                .keep(kind.name(), family.name(), id, &value, expires)
+                .await?;
+            if let Some(counted) = self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&family)
+            {
+                counted.count += 1;
+            }
+            Ok(true)
+        })
+    }
+
+    fn get<'a>(&'a self, kind: Kind, id: &'a str) -> SharedFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move { readable(kind, self.store.kept(kind.name(), id, unix_now()).await) })
+    }
+
+    fn take<'a>(&'a self, kind: Kind, id: &'a str) -> SharedFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            readable(
+                kind,
+                self.store.take_kept(kind.name(), id, unix_now()).await,
+            )
+        })
+    }
+
+    fn first_use<'a>(
+        &'a self,
+        client_id: &'a str,
+        jti: &'a str,
+        expires: i64,
+        now: i64,
+    ) -> SharedFuture<'a, bool> {
+        Box::pin(async move {
+            if self.assertions_full(now).await? {
+                return Ok(false);
+            }
+            let first = self
+                .store
+                .first_use_of_assertion(client_id, jti, expires, now)
+                .await?;
+            if first
+                && let Some(counted) = self
+                    .assertions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+            {
+                counted.count += 1;
+            }
+            Ok(first)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
-    #[tokio::test]
-    async fn a_value_is_read_as_often_as_asked_and_taken_once() {
-        let shared = Memory::new();
+    /// A store on an empty database (SQLite, or PostgreSQL when
+    /// `BRIGID_TEST_POSTGRES` says so), with the tables of the shared state.
+    async fn store() -> Arc<EncryptedStore> {
+        let master = brigid_crypto::MasterKey::from_hex(&"ab".repeat(32)).unwrap();
+        let store = EncryptedStore::new(&brigid_store::testing::url().await, master)
+            .await
+            .unwrap();
+        store.prepare_kept().await.unwrap();
+        Arc::new(store)
+    }
+
+    // -- The contract, checked on whatever keeps the state ------------------
+
+    async fn read_as_often_as_asked_and_taken_once(shared: &dyn Shared) {
         assert!(
             shared
                 .put(Kind::Authorization, "a", b"v".to_vec())
@@ -279,23 +483,21 @@ mod tests {
 
     /// The property several nodes rely on: whoever presents an identifier at
     /// the same instant, one caller gets the value.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn of_many_callers_at_once_one_takes_the_value() {
-        let shared: Arc<dyn Shared> = Arc::new(Memory::new());
-        for round in 0..50 {
+    async fn of_many_callers_one_takes(shared: Arc<dyn Shared>, rounds: usize, callers: usize) {
+        for round in 0..rounds {
             let id = format!("code-{round}");
             assert!(shared.put(Kind::Code, &id, b"v".to_vec()).await.unwrap());
-            let start = Arc::new(tokio::sync::Barrier::new(64));
-            let mut callers = tokio::task::JoinSet::new();
-            for _ in 0..64 {
+            let start = Arc::new(tokio::sync::Barrier::new(callers));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..callers {
                 let (shared, start, id) = (shared.clone(), start.clone(), id.clone());
-                callers.spawn(async move {
+                tasks.spawn(async move {
                     start.wait().await;
                     shared.take(Kind::Code, &id).await.unwrap().is_some()
                 });
             }
             let mut taken = 0;
-            while let Some(got) = callers.join_next().await {
+            while let Some(got) = tasks.join_next().await {
                 taken += usize::from(got.unwrap());
             }
             assert_eq!(taken, 1, "round {round}");
@@ -304,9 +506,7 @@ mod tests {
 
     /// A ceremony begun for one thing is not there for another, and stays
     /// for the one it was begun for.
-    #[tokio::test]
-    async fn a_value_is_found_under_its_own_kind_only() {
-        let shared = Memory::new();
+    async fn found_under_its_own_kind_only(shared: &dyn Shared) {
         shared.put(Kind::SignIn, "s", b"v".to_vec()).await.unwrap();
         assert_eq!(shared.take(Kind::DeleteAccount, "s").await.unwrap(), None);
         assert_eq!(shared.take(Kind::Confirm, "s").await.unwrap(), None);
@@ -317,8 +517,38 @@ mod tests {
         );
     }
 
+    async fn an_assertion_is_a_first_use_once(shared: &dyn Shared) {
+        assert!(shared.first_use("c", "j1", 100, 50).await.unwrap());
+        assert!(!shared.first_use("c", "j1", 100, 60).await.unwrap());
+        assert!(shared.first_use("other", "j1", 100, 60).await.unwrap());
+        // Past its expiry it is forgotten: a replay is refused by its date.
+        assert!(shared.first_use("c", "j1", 300, 200).await.unwrap());
+    }
+
+    // -- In memory ------------------------------------------------------------
+
     #[tokio::test]
-    async fn an_expired_value_is_as_if_never_kept() {
+    async fn memory_a_value_is_read_as_often_as_asked_and_taken_once() {
+        read_as_often_as_asked_and_taken_once(&Memory::new()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn memory_of_many_callers_at_once_one_takes_the_value() {
+        of_many_callers_one_takes(Arc::new(Memory::new()), 50, 64).await;
+    }
+
+    #[tokio::test]
+    async fn memory_a_value_is_found_under_its_own_kind_only() {
+        found_under_its_own_kind_only(&Memory::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_an_assertion_is_a_first_use_once() {
+        an_assertion_is_a_first_use_once(&Memory::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_an_expired_value_is_as_if_never_kept() {
         let shared = Memory::new();
         let past = Instant::now() - Duration::from_secs(1);
         assert!(shared.put_until(Kind::Code, "read", b"v".to_vec(), past));
@@ -328,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_family_keeps_no_more_than_its_capacity() {
+    async fn memory_a_family_keeps_no_more_than_its_capacity() {
         let shared = Memory::new();
         for n in 0..CAPACITY {
             // Two kinds of one family count together.
@@ -359,7 +589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_expired_leaves_room() {
+    async fn memory_what_expired_leaves_room() {
         let shared = Memory::new();
         let past = Instant::now() - Duration::from_secs(1);
         for n in 0..CAPACITY {
@@ -368,14 +598,135 @@ mod tests {
         assert!(shared.put(Kind::Code, "new", Vec::new()).await.unwrap());
     }
 
+    // -- In the database ------------------------------------------------------
+
     #[tokio::test]
-    async fn an_assertion_is_a_first_use_once() {
-        let shared = Memory::new();
-        assert!(shared.first_use("c", "j1", 100, 50).await.unwrap());
-        assert!(!shared.first_use("c", "j1", 100, 60).await.unwrap());
-        assert!(shared.first_use("other", "j1", 100, 60).await.unwrap());
-        // Past its expiry it is forgotten: a replay is refused by its date.
-        assert!(shared.first_use("c", "j1", 300, 200).await.unwrap());
+    async fn stored_a_value_is_read_as_often_as_asked_and_taken_once() {
+        read_as_often_as_asked_and_taken_once(&Stored::new(store().await)).await;
+    }
+
+    /// Two nodes are two `Stored` on one database: of all the callers of
+    /// both, one takes the value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stored_of_many_callers_on_two_nodes_one_takes_the_value() {
+        let store = store().await;
+        let nodes: [Arc<dyn Shared>; 2] = [
+            Arc::new(Stored::new(store.clone())),
+            Arc::new(Stored::new(store)),
+        ];
+        for round in 0..20 {
+            let id = format!("code-{round}");
+            assert!(nodes[0].put(Kind::Code, &id, b"v".to_vec()).await.unwrap());
+            let start = Arc::new(tokio::sync::Barrier::new(16));
+            let mut tasks = tokio::task::JoinSet::new();
+            for caller in 0..16 {
+                let (node, start, id) = (nodes[caller % 2].clone(), start.clone(), id.clone());
+                tasks.spawn(async move {
+                    start.wait().await;
+                    node.take(Kind::Code, &id).await.unwrap().is_some()
+                });
+            }
+            let mut taken = 0;
+            while let Some(got) = tasks.join_next().await {
+                taken += usize::from(got.unwrap());
+            }
+            assert_eq!(taken, 1, "round {round}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stored_of_many_callers_at_once_one_takes_the_value() {
+        of_many_callers_one_takes(Arc::new(Stored::new(store().await)), 20, 16).await;
+    }
+
+    #[tokio::test]
+    async fn stored_a_value_is_found_under_its_own_kind_only() {
+        found_under_its_own_kind_only(&Stored::new(store().await)).await;
+    }
+
+    #[tokio::test]
+    async fn stored_an_assertion_is_a_first_use_once() {
+        an_assertion_is_a_first_use_once(&Stored::new(store().await)).await;
+    }
+
+    /// What one node keeps, another reads and takes.
+    #[tokio::test]
+    async fn stored_what_one_node_keeps_another_takes() {
+        let store = store().await;
+        let (one, other) = (Stored::new(store.clone()), Stored::new(store));
+        assert!(one.put(Kind::SignIn, "s", b"v".to_vec()).await.unwrap());
+        assert_eq!(
+            other.get(Kind::SignIn, "s").await.unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            other.take(Kind::SignIn, "s").await.unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(one.take(Kind::SignIn, "s").await.unwrap(), None);
+        assert!(
+            one.first_use("c", "j", unix_now() + 60, unix_now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !other
+                .first_use("c", "j", unix_now() + 60, unix_now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_a_family_keeps_no_more_than_its_capacity() {
+        let shared = Stored::with_capacity(store().await, 3, 2);
+        for (n, kind) in [Kind::Signup, Kind::AddPasskey, Kind::Recovery]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(shared.put(kind, &n.to_string(), Vec::new()).await.unwrap());
+        }
+        assert!(
+            !shared
+                .put(Kind::Signup, "one more", Vec::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(shared.get(Kind::Signup, "one more").await.unwrap(), None);
+        // Another family has its own room.
+        assert!(shared.put(Kind::SignIn, "other", Vec::new()).await.unwrap());
+        // And so have the assertions.
+        let now = unix_now();
+        assert!(shared.first_use("c", "1", now + 60, now).await.unwrap());
+        assert!(shared.first_use("c", "2", now + 60, now).await.unwrap());
+        assert!(!shared.first_use("c", "3", now + 60, now).await.unwrap());
+    }
+
+    /// A node that starts counts what the others already keep.
+    #[tokio::test]
+    async fn stored_a_new_node_counts_what_is_already_kept() {
+        let store = store().await;
+        let first = Stored::with_capacity(store.clone(), 2, 2);
+        assert!(first.put(Kind::Code, "a", Vec::new()).await.unwrap());
+        assert!(first.put(Kind::Code, "b", Vec::new()).await.unwrap());
+        let second = Stored::with_capacity(store, 2, 2);
+        assert!(!second.put(Kind::Code, "c", Vec::new()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stored_sweeping_removes_what_expired_only() {
+        let store = store().await;
+        let shared = Stored::new(store.clone());
+        assert!(shared.put(Kind::Code, "live", b"v".to_vec()).await.unwrap());
+        store
+            .keep("code", "codes", "old", b"v", unix_now() - 1)
+            .await
+            .unwrap();
+        assert_eq!(shared.sweep().await.unwrap(), 1);
+        assert_eq!(
+            shared.get(Kind::Code, "live").await.unwrap(),
+            Some(b"v".to_vec())
+        );
     }
 
     #[test]
