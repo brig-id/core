@@ -632,9 +632,13 @@ fn must_sign_in(pending: &PendingAuthorization, session: Option<&AccountSession>
     if pending.prompt == Prompt::Login && session.auth_time < pending.created_unix {
         return true;
     }
-    pending
-        .max_age
-        .is_some_and(|max_age| now_unix() - session.auth_time > max_age)
+    // `max_age`: a ceremony done before the request must not be older than
+    // that when the person answers. One done for the request always counts:
+    // otherwise whoever signs in again and then takes a second to choose
+    // would be asked to sign in again, without end (`max_age=0`).
+    pending.max_age.is_some_and(|max_age| {
+        session.auth_time < pending.created_unix && now_unix() - session.auth_time > max_age
+    })
 }
 
 /// `prompt` is a space-separated list. `none` stands alone or the request is
