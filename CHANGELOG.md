@@ -9,6 +9,20 @@ Conventional Commits of the release; the entries up to 0.2.0 were written by han
 the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. This project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2](https://github.com/brig-id/core/compare/v0.3.1...v0.3.2) (2026-11-27)
+
+
+### Features
+
+* **store:** ✨ one store for two databases: every statement runs on SQLite and PostgreSQL ([7ace86f](https://github.com/brig-id/core/commit/7ace86f4405e0c13f4620889a6be15b54aad30fd))
+* **store:** ✨ the limits of core[#137](https://github.com/brig-id/core/issues/137) on both databases ([69d63f2](https://github.com/brig-id/core/commit/69d63f21dd2bbfb120bc370113e7cf39c684a283))
+* **store:** ✨ what lives minutes can be kept in the database, for several nodes ([e4ffd05](https://github.com/brig-id/core/commit/e4ffd0536a1311e40ac19640947b0f3cad9fb3a7))
+
+
+### Bug Fixes
+
+* **store:** 🐛 a sign-up is counted on PostgreSQL too ([f6843f0](https://github.com/brig-id/core/commit/f6843f03c54f3771511c18da5fd78fc8d51130bb))
+
 ## [0.3.1](https://github.com/brig-id/core/compare/v0.3.0...v0.3.1) (2026-11-26)
 
 
