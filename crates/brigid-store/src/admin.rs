@@ -350,7 +350,7 @@ impl EncryptedStore {
             return Err(Error::InvalidLimit(limit));
         }
         sqlx::query(
-            "INSERT INTO settings (name, value) VALUES (?, ?) \
+            "INSERT INTO settings (name, value) VALUES ($1, $2) \
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
         )
         .bind(limit.setting())
@@ -364,7 +364,7 @@ impl EncryptedStore {
     pub async fn sign_ups_today(&self, address: &str) -> Result<i64> {
         let day = today();
         let count: Option<i64> =
-            sqlx::query_scalar("SELECT count FROM sign_up_counts WHERE key = ? AND day = ?")
+            sqlx::query_scalar("SELECT count FROM sign_up_counts WHERE key = $1 AND day = $2")
                 .bind(sign_up_key(&self.master, day, address)?)
                 .bind(day)
                 .fetch_optional(&self.pool)

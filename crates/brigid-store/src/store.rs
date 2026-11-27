@@ -837,8 +837,8 @@ impl EncryptedStore {
         let limit = self.limit(crate::Limit::PasskeysPerAccount).await?;
         let key = user_key(&self.master, &cred.user_id)?;
         let done = sqlx::query(
-            "INSERT INTO webauthn_credentials (id, user_id, data) SELECT ?, ?, ? \
-             WHERE (SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = ?) < ?",
+            "INSERT INTO webauthn_credentials (id, user_id, data) SELECT $1, $2, $3 \
+             WHERE (SELECT COUNT(*) FROM webauthn_credentials WHERE user_id = $4) < $5",
         )
         .bind(cred.id.to_string())
         .bind(cred.user_id.to_string())
