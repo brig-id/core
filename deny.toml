@@ -1,3 +1,8 @@
+[graph]
+# Every feature of the workspace is checked: the PostgreSQL driver is one
+# that only an edition on several nodes turns on.
+all-features = true
+
 [licenses]
 allow = [
   "MIT",
@@ -22,19 +27,12 @@ confidence-threshold = 0.8
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # rsa Marvin attack: pulled in by sqlx-macros-core (compile-time query
-  # checking imports all DB backends). We do not use RSA or MySQL.
-  # No fix available upstream.
-  { id = "RUSTSEC-2023-0071", reason = "transitive via sqlx-macros-core; project uses SQLite only; no fix available" },
-  # Timing variability in crypto-bigint 0.5.x, pulled in by p256 via jsonwebtoken's `rust_crypto`
-  # feature. Tokens are EdDSA; P-256 only verifies the ES256 client assertions of sites, on
-  # public data (key, signature, signed bytes): no secret for timing to reveal.
-  { id = "RUSTSEC-2026-0387", reason = "P-256 only verifies ES256 client assertions: public inputs, nothing secret to leak by timing" },
-  # SQLite < 3.54 stale page-cache read with a crafted `-wal` file (libsqlite3-sys 0.30 via sqlx,
-  # no sqlx release bundles >= 0.39). leaf opens only its own database in its own volume.
-  { id = "RUSTSEC-2026-0459", reason = "needs a crafted -wal next to the database; only leaf writes its volume" },
-]
+# Unmaintained and unsound crates are refused wherever they are in what is
+# compiled, not only as direct dependencies. No exception: an advisory that
+# appears is fixed by an update, or argued here with its reason.
+unmaintained = "all"
+unsound = "all"
+ignore = []
 
 [bans]
 multiple-versions = "warn"

@@ -3421,7 +3421,7 @@ async fn prompt_and_max_age_decide_whether_the_person_is_asked() {
 /// the user was present (0x01) and verified (0x04).
 fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
     use base64ct::{Base64UrlUnpadded, Encoding};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use sha2::{Digest, Sha256};
 
     fn bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -3442,7 +3442,7 @@ fn handmade_registration(challenge_b64: &str, flags: u8) -> serde_json::Value {
     // registration carries no signature, so the private key (here the number
     // 7, repeated) is never used.
     let key = p256::SecretKey::from_slice(&[7u8; 32]).expect("a valid P-256 scalar");
-    let point = key.public_key().to_encoded_point(false);
+    let point = key.public_key().to_sec1_point(false);
     let (x, y) = (
         point.x().expect("an uncompressed point has an x"),
         point.y().expect("an uncompressed point has a y"),
