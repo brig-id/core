@@ -88,6 +88,19 @@ pub enum Error {
     #[error("the master key does not open it: it was made under another master key")]
     WrongMasterKey,
 
+    /// An import was asked into a server that already has accounts.
+    #[error("this server already has accounts: an import fills an empty server")]
+    NotEmpty,
+
+    /// The schema of the database is not the one this version works with:
+    /// what initialises the server was not run, or not by this version.
+    #[error("the schema of the database is at step {applied}, this version needs step {known}")]
+    SchemaNotReady { applied: i64, known: i64 },
+
+    /// A name that cannot be a PostgreSQL role.
+    #[error("{0:?} cannot name a role: letters, digits, `_` and `-`, at most 63")]
+    InvalidRole(String),
+
     /// A `Credential` was handed to an atomic-registration entry point with
     /// a `user_id` that does not match the `User` being created. Returned
     /// by [`EncryptedStore::register_user_with_credential`](crate::EncryptedStore::register_user_with_credential)
@@ -96,6 +109,25 @@ pub enum Error {
     /// another existing user).
     #[error("credential user_id does not match the user being registered")]
     CredentialUserMismatch,
+}
+
+impl Error {
+    /// What went wrong when a database could not be opened, in words that
+    /// never repeat its address: a driver's own message can, and the address
+    /// of a PostgreSQL database holds a password.
+    pub fn opening(&self) -> String {
+        match self {
+            Self::Database(sqlx::Error::Configuration(_)) => {
+                "its address cannot be read, or this build has no driver for it".to_owned()
+            }
+            Self::Database(sqlx::Error::Tls(e)) => format!("TLS: {e}"),
+            Self::Database(sqlx::Error::Io(e)) => e.to_string(),
+            Self::Database(sqlx::Error::Database(e)) => e.message().to_owned(),
+            Self::Database(sqlx::Error::PoolTimedOut) => "it does not answer".to_owned(),
+            Self::Database(_) => "the connection failed".to_owned(),
+            other => other.to_string(),
+        }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
