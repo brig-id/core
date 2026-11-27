@@ -1,6 +1,13 @@
 //! Shared application state passed to all Axum handlers via [`axum::extract::State`].
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use brigid_identity::{Attribute, Attributes, Need};
 use brigid_oidc::OidcSigningKey;
@@ -163,15 +170,28 @@ pub(crate) const CONFIRMATION_TTL: Duration = Duration::from_secs(300);
 /// A setup link, and a link that grants the administrator role, last an hour.
 pub const OPERATOR_LINK_TTL: Duration = Duration::from_secs(3600);
 
+/// The keys of the tokens: the one that signs, and the others this server
+/// publishes with it (`/.well-known/jwks.json`).
+///
+/// A server made of one node reads them when it starts. A node of a server
+/// made of several reads them again while it runs ([`AppState::set_oidc_keys`]):
+/// a rotation then needs no restart, and a key is published by every node
+/// before any of them signs with it (spec `forest.md` §6).
+#[derive(Clone)]
+struct OidcKeys {
+    /// The key that signs new tokens.
+    signing: Arc<OidcSigningKey>,
+    /// The other published keys: retired by a rotation and still within
+    /// their grace period (core#22), or newer than the one that signs and
+    /// not used yet.
+    others: Vec<Arc<OidcSigningKey>>,
+}
+
 /// Central application state shared (via `Arc`) across all request handlers.
 pub struct AppState {
     pub store: Arc<EncryptedStore>,
     pub webauthn: Arc<brigid_webauthn::WebauthnService>,
-    /// The key that signs new tokens.
-    pub oidc_key: Arc<OidcSigningKey>,
-    /// Keys retired by a rotation but still within their grace period: tokens
-    /// they signed still verify and they stay in the JWKS (core#22).
-    pub retired_oidc_keys: Vec<Arc<OidcSigningKey>>,
+    oidc_keys: RwLock<OidcKeys>,
     pub base_url: Url,
     /// An account session ends after this long without use (spec `protocol.md` §5).
     pub session_idle: Duration,
@@ -205,6 +225,52 @@ pub struct AppState {
     /// What reads the documents of clients that describe themselves, and
     /// what was read of them lately (protocol.md §6).
     pub described: Arc<crate::described::Described>,
+    /// Whether this process is one node of several on one database: it is
+    /// then ready only on a schema made for it, which it never changes
+    /// itself ([`brigid_store::nodes`]).
+    pub several_nodes: bool,
+    /// Set when the process was told to stop: it is no longer ready, and
+    /// finishes the requests it has.
+    stopping: AtomicBool,
+}
+
+/// Why a server takes no request for now (`GET /ready`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    /// The process was told to stop.
+    Stopping,
+    /// The database does not answer.
+    Database,
+    /// The schema is not one this node serves on: the server was not
+    /// initialised, not yet by this version, or by a version that left this
+    /// node behind.
+    Schema(brigid_store::nodes::Fit),
+    /// The tables of what the nodes share are not there.
+    SharedState,
+}
+
+impl NotReady {
+    /// A word for the probe's answer and the log.
+    pub fn reason(self) -> &'static str {
+        use brigid_store::nodes::Fit;
+        match self {
+            Self::Stopping => "stopping",
+            Self::Database => "the database does not answer",
+            Self::Schema(Fit::Empty) => "the database has no schema: initialise the server",
+            Self::Schema(Fit::Behind) => {
+                "the schema is older than this version: its initialisation has not run"
+            }
+            Self::Schema(Fit::LeftBehind) => {
+                "the schema was made for a newer version: this node was left behind by an update"
+            }
+            Self::Schema(Fit::NotInitialised | Fit::Serves) => {
+                "the schema was not recorded by an initialisation: initialise the server"
+            }
+            Self::SharedState => {
+                "the tables of the state shared between nodes are missing: initialise the server"
+            }
+        }
+    }
 }
 
 /// The program a server is, as it names itself: an edition and its version.
@@ -225,8 +291,10 @@ impl AppState {
         Self {
             store: Arc::new(store),
             webauthn: Arc::new(webauthn),
-            oidc_key: Arc::new(oidc_key),
-            retired_oidc_keys: Vec::new(),
+            oidc_keys: RwLock::new(OidcKeys {
+                signing: Arc::new(oidc_key),
+                others: Vec::new(),
+            }),
             base_url,
             session_idle: Duration::from_secs(3600),
             session_lifetime: Duration::from_secs(12 * 3600),
@@ -240,6 +308,45 @@ impl AppState {
             // `X-Forwarded-For` opts in (`security.trust_forwarded_for`).
             trust_forwarded_for: false,
             described: Arc::new(crate::described::Described::new(default_fetcher())),
+            several_nodes: false,
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    /// This process is one node of several on one database.
+    #[must_use]
+    pub fn with_several_nodes(mut self) -> Self {
+        self.several_nodes = true;
+        self
+    }
+
+    /// The process was told to stop: `GET /ready` now refuses, so that what
+    /// spreads requests sends it no new one.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this server takes requests, and why not when it does not.
+    pub async fn readiness(&self) -> Result<(), NotReady> {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Err(NotReady::Stopping);
+        }
+        if !self.several_nodes {
+            // A lightweight query to verify the database connection.
+            return match self.store.fetch_user(Uuid::nil()).await {
+                Ok(_) | Err(brigid_store::Error::Uuid(_)) => Ok(()),
+                Err(_) => Err(NotReady::Database),
+            };
+        }
+        let schema = self.store.schema().await.map_err(|_| NotReady::Database)?;
+        match schema.fit() {
+            brigid_store::nodes::Fit::Serves => {}
+            other => return Err(NotReady::Schema(other)),
+        }
+        match self.store.kept_prepared().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(NotReady::SharedState),
+            Err(_) => Err(NotReady::Database),
         }
     }
 
@@ -373,9 +480,31 @@ impl AppState {
 
     /// Keys retired by a rotation that must keep verifying their tokens.
     #[must_use]
-    pub fn with_retired_oidc_keys(mut self, keys: Vec<OidcSigningKey>) -> Self {
-        self.retired_oidc_keys = keys.into_iter().map(Arc::new).collect();
+    pub fn with_retired_oidc_keys(self, keys: Vec<OidcSigningKey>) -> Self {
+        self.oidc_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .others = keys.into_iter().map(Arc::new).collect();
         self
+    }
+
+    /// Replaces the keys while the server runs: `signing` signs the tokens
+    /// issued from now on, `others` are published with it.
+    pub fn set_oidc_keys(&self, signing: OidcSigningKey, others: Vec<OidcSigningKey>) {
+        let keys = OidcKeys {
+            signing: Arc::new(signing),
+            others: others.into_iter().map(Arc::new).collect(),
+        };
+        *self.oidc_keys.write().unwrap_or_else(|e| e.into_inner()) = keys;
+    }
+
+    /// The key that signs new tokens.
+    pub fn oidc_key(&self) -> Arc<OidcSigningKey> {
+        self.oidc_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing
+            .clone()
     }
 
     /// This server's host name: the domain of its accounts and the `server`
@@ -387,10 +516,11 @@ impl AppState {
             .ok_or_else(|| crate::error::ApiError::Internal("base_url has no host".into()))
     }
 
-    /// The current key followed by the retired ones still in grace.
-    pub fn oidc_verification_keys(&self) -> Vec<&OidcSigningKey> {
-        std::iter::once(self.oidc_key.as_ref())
-            .chain(self.retired_oidc_keys.iter().map(AsRef::as_ref))
+    /// Every published key: the one that signs, then the others.
+    pub fn oidc_verification_keys(&self) -> Vec<Arc<OidcSigningKey>> {
+        let keys = self.oidc_keys.read().unwrap_or_else(|e| e.into_inner());
+        std::iter::once(keys.signing.clone())
+            .chain(keys.others.iter().cloned())
             .collect()
     }
 

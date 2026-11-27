@@ -24,6 +24,7 @@ pub async fn openid_configuration(
 
 /// `GET /.well-known/jwks.json`
 pub async fn jwks(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let key_set = build_jwks(&state.oidc_verification_keys());
+    let keys = state.oidc_verification_keys();
+    let key_set = build_jwks(&keys.iter().map(AsRef::as_ref).collect::<Vec<_>>());
     Ok((StatusCode::OK, Json(key_set)))
 }
