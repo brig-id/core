@@ -482,7 +482,7 @@ pub(crate) async fn count_sign_up(
         .await?;
     let count: i64 = sqlx::query_scalar(
         "INSERT INTO sign_up_counts (key, day, count) VALUES ($1, $2, 1) \
-         ON CONFLICT (key) DO UPDATE SET count = count + 1 RETURNING count",
+         ON CONFLICT (key) DO UPDATE SET count = sign_up_counts.count + 1 RETURNING count",
     )
     .bind(sign_up_key(master, day, address)?)
     .bind(day)
