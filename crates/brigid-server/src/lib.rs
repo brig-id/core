@@ -1,4 +1,5 @@
-//! brig·id server: what every edition (seedling, grove) runs, the same code.
+//! brig·id server: what every edition (seedling, grove, forest) runs, the
+//! same code.
 //!
 //! An edition is a small executable: its name, its version, the interface it
 //! carries and where it looks for things on a machine (`Edition`), its own
@@ -6,11 +7,17 @@
 //! makes editions differ lives in their own repositories: how they are
 //! installed and packaged, never how they behave.
 //!
+//! An edition made of several nodes on one database calls [`run_node`]
+//! instead, with [`NodeCommand`]: the same server, which creates nothing
+//! when it starts and keeps nothing in its memory that another node needs
+//! (`nodes`, spec `forest.md`).
+//!
 //! # Startup sequence
 //!
 //! 1. Load and validate configuration (TOML + `BRIGID_*` environment).
 //! 2. Load the master key (environment, mounted secret, or the edition's file).
-//! 3. Open and migrate the SQLite database.
+//! 3. Open the database: a single node brings its schema up to date, a node
+//!    of several waits for the schema its initialisation made.
 //! 4. Read the VSID secret and the OIDC signing keys from it.
 //! 5. Build the Axum application (router + state + interface + metrics).
 //! 6. Start TLS (if cert/key configured) or plain HTTP server.
@@ -21,6 +28,7 @@ pub mod backup;
 pub mod config;
 pub mod lock;
 pub mod metrics;
+pub mod nodes;
 pub mod owner;
 pub mod probe;
 pub mod ui;
@@ -102,8 +110,10 @@ pub enum Command {
     },
 
     /// Make a new OIDC signing key current. The previous one keeps verifying
-    /// tokens for the grace period (tokens live one hour), then is pruned at
-    /// a later start. Restart the server afterwards to sign with the new key.
+    /// tokens for the grace period (tokens live one hour), then is removed.
+    /// A server made of one node signs with the new key once restarted; the
+    /// nodes of a server made of several read it by themselves, and the
+    /// command says when they sign with it.
     RotateOidcKey,
 
     /// Manage the relying parties: the sites that may ask this server to
@@ -143,8 +153,9 @@ pub enum Command {
         action: Option<LimitsCommand>,
     },
 
-    /// Write a copy of the database to FILE, consistent while the server
-    /// runs. It is encrypted under the same master key: keep the key with
+    /// For a server whose database is a SQLite file (a database server has
+    /// its own tools). Write a copy of the database to FILE, consistent
+    /// while the server runs. It is encrypted under the same master key: keep the key with
     /// it, apart. FILE is created with mode 0600 and never written over.
     /// Prints the path written on standard output.
     Backup {
@@ -152,7 +163,8 @@ pub enum Command {
         file: PathBuf,
     },
 
-    /// Put a backup in place of the database. Stop the server first: this
+    /// For a server whose database is a SQLite file. Put a backup in place
+    /// of the database. Stop the server first: this
     /// refuses while the server, or anything else, uses the database. The
     /// backup must open with the master key, belong to this server's
     /// domain and have a schema this version knows. The database it
@@ -171,6 +183,59 @@ pub enum Command {
         #[arg(long, env = "BRIGID_SERVER__PORT", default_value_t = 8080)]
         port: u16,
     },
+}
+
+/// The commands of an edition made of several nodes: the shared ones, and
+/// the two that prepare the database the nodes share.
+#[derive(Subcommand)]
+pub enum NodeCommand {
+    /// Prepare the database, before the nodes start and before each update:
+    /// create or update the schema, the tables of what the nodes share, the
+    /// secret of the identifiers and the first signing key. Nodes create
+    /// none of it and wait for it. Run it once at a time, as a database role
+    /// that owns the schema; a second run changes nothing. On a server with
+    /// no administrator it prints, on standard output, the setup link that
+    /// creates the first one.
+    Init {
+        /// The database role the nodes connect as: it is given the right to
+        /// read and write rows, and not to change the schema.
+        #[arg(long, value_name = "ROLE")]
+        grant: Option<String>,
+        /// Keep what lives minutes in an ordinary table instead of an
+        /// unlogged one: for a PostgreSQL service that offers none. Read
+        /// only when the table is created.
+        #[arg(long)]
+        logged_pending: bool,
+    },
+
+    /// Copy a backup of a seedling or a grove (the FILE its `backup`
+    /// command wrote) into this server's database: accounts, passkeys,
+    /// identities, sites, settings, the secret of the identifiers and the
+    /// signing keys. For a server that has no account yet, after `init`,
+    /// under the same master key and the same domain as the server the
+    /// backup comes from: nothing changes for the people and the sites.
+    Import {
+        /// A file written by `seedling backup` or `grove backup`.
+        file: PathBuf,
+        /// Import a backup whose accounts were created on another domain
+        /// than this server's. Their passkeys will not work here.
+        #[arg(long)]
+        any_domain: bool,
+    },
+
+    #[command(flatten)]
+    Shared(Command),
+}
+
+/// How many processes serve the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Nodes {
+    /// One: it brings the schema up to date and creates what is missing
+    /// when it starts, and keeps what lives minutes in its memory.
+    One,
+    /// Several: none of them changes the schema or creates a secret
+    /// (`init` does), and what lives minutes is in the database.
+    Several,
 }
 
 /// `limits …`
@@ -340,33 +405,47 @@ fn describe_attributes(attributes: &BTreeMap<Attribute, Need>) -> String {
         .join(",")
 }
 
-/// Builds the sqlx connection URL for a database path.
-fn db_url(path: &str) -> String {
-    if path == ":memory:" {
-        "sqlite::memory:".to_string()
-    } else {
-        // Use the path-only form `sqlite:{path}` rather than `sqlite://{path}`.
-        // The double-slash form is a URL where everything after `://` is
-        // host+path; for an absolute path like `/data/brigid.db` that yields
-        // `sqlite:///data/brigid.db` (three slashes) which is correct but
-        // easy to miscount as `sqlite:////…` in code review and is fragile
-        // when the path contains characters that would otherwise need URL
-        // encoding. The single-slash form is unambiguously a filename and
-        // sqlx parses it the same way for both absolute and relative paths.
-        format!("sqlite:{path}?mode=rwc")
+/// The database named by the configuration at `config`, or the end of the
+/// command with what is wrong with it.
+fn load_database(config: Option<&Path>) -> config::Database {
+    config::load_database(config)
+        .expect("configuration error")
+        .database()
+        .unwrap_or_else(|e| fail(&e))
+}
+
+/// Opens the store for a command or for the server. A single node brings
+/// the schema up to date. A node of several never does: it opens the
+/// database as it is, and a command refuses to work on a schema that is not
+/// the one its version serves on.
+async fn open_store(
+    nodes: Nodes,
+    database: &config::Database,
+    master: MasterKey,
+) -> EncryptedStore {
+    match nodes {
+        Nodes::One => EncryptedStore::new(&database.address, master)
+            .await
+            .expect("failed to open or migrate database"),
+        Nodes::Several => {
+            let store = nodes::connect(database, master).await;
+            if let Err(why) = nodes::initialised(&store).await {
+                fail(&format!("{why}."));
+            }
+            store
+        }
     }
 }
 
 /// Handles `rotate-key --old <path> --new <path>`.
 async fn rotate_key(
     edition: &Edition,
-    db: &config::DatabaseConfig,
+    nodes: Nodes,
+    db: &config::Database,
     old_master: MasterKey,
     new_master: MasterKey,
 ) {
-    let mut store = EncryptedStore::new(&db_url(&db.path), old_master)
-        .await
-        .expect("failed to open or migrate database");
+    let mut store = open_store(nodes, db, old_master).await;
 
     store
         .rotate_master_key(new_master)
@@ -384,6 +463,11 @@ async fn rotate_key(
         "Update BRIGID_MASTER_KEY to the new key before starting {} again.",
         edition.name
     );
+    if nodes == Nodes::Several {
+        eprintln!(
+            "Every node must have been stopped: one that ran meanwhile wrote under the old key."
+        );
+    }
 }
 
 /// For a command run as root: reads the master key while it still can
@@ -522,10 +606,8 @@ async fn load_oidc_keys(store: &EncryptedStore) -> (OidcSigningKey, Vec<OidcSign
 }
 
 /// Handles `rotate-oidc-key`.
-async fn rotate_oidc_key(edition: &Edition, db: &config::DatabaseConfig) {
-    let store = EncryptedStore::new(&db_url(&db.path), load_master_key(edition))
-        .await
-        .expect("failed to open or migrate database");
+async fn rotate_oidc_key(edition: &Edition, nodes: Nodes, db: &config::Database) {
+    let store = open_store(nodes, db, load_master_key(edition)).await;
     let seed = OidcSigningKey::generate().to_raw_bytes();
     let key = OidcSigningKey::from_seed(&seed);
     store
@@ -533,6 +615,17 @@ async fn rotate_oidc_key(edition: &Edition, db: &config::DatabaseConfig) {
         .await
         .expect("failed to store the new OIDC signing key");
     eprintln!("✓ New OIDC signing key {} is current.", key.kid());
+    if nodes == Nodes::Several {
+        eprintln!(
+            "  No restart: every node publishes it within a minute and signs with it {} minutes",
+            nodes::KEY_PUBLISHED_FOR.whole_minutes()
+        );
+        eprintln!(
+            "  after its creation. Tokens signed by the previous key keep verifying for {} hours.",
+            OIDC_GRACE.whole_hours()
+        );
+        return;
+    }
     eprintln!(
         "  Restart {} to sign with it. Tokens signed by the previous key keep",
         edition.name
@@ -636,7 +729,7 @@ fn public_url(cfg: &config::Config) -> Url {
 ///   hour, and each start replaces it.
 /// - Accounts and no administrator (a server upgraded from a version without
 ///   administration, or whose administrators left): `<server> admin link`.
-async fn announce_administration(edition: &Edition, state: &AppState) {
+async fn announce_administration(edition: &Edition, nodes: Nodes, state: &AppState) {
     let name = edition.name;
     let store = &state.store;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -652,6 +745,14 @@ async fn announce_administration(edition: &Edition, state: &AppState) {
         .await
         .expect("failed to read the accounts");
     if administrators > 0 {
+        return;
+    }
+    if nodes == Nodes::Several {
+        // Each new setup link cancels the one before: of several nodes
+        // starting together, none makes one. `init` printed it.
+        tracing::warn!(
+            "no administrator yet: `{name} init` printed the setup link, `{name} admin link` makes a new one"
+        );
         return;
     }
     match brigid_api::setup_link(store)
@@ -681,11 +782,14 @@ async fn announce_administration(edition: &Edition, state: &AppState) {
 }
 
 /// Handles `signup [policy]`.
-async fn signup_command(edition: &Edition, db: &config::DatabaseConfig, policy: Option<&str>) {
+async fn signup_command(
+    edition: &Edition,
+    nodes: Nodes,
+    db: &config::Database,
+    policy: Option<&str>,
+) {
     use brigid_store::SignupPolicy;
-    let store = EncryptedStore::new(&db_url(&db.path), load_master_key(edition))
-        .await
-        .expect("failed to open or migrate database");
+    let store = open_store(nodes, db, load_master_key(edition)).await;
     if let Some(value) = policy {
         let policy = SignupPolicy::parse(value)
             .unwrap_or_else(|| fail(&format!("{value} is not open, invitation or closed.")));
@@ -714,13 +818,12 @@ async fn signup_command(edition: &Edition, db: &config::DatabaseConfig, policy: 
 /// output: `name<TAB>value<TAB>default<TAB>max`.
 async fn limits_command(
     edition: &Edition,
-    db: &config::DatabaseConfig,
+    nodes: Nodes,
+    db: &config::Database,
     action: Option<LimitsCommand>,
 ) {
     use brigid_store::Limit;
-    let store = EncryptedStore::new(&db_url(&db.path), load_master_key(edition))
-        .await
-        .expect("failed to open or migrate database");
+    let store = open_store(nodes, db, load_master_key(edition)).await;
     if let Some(LimitsCommand::Set { name, value }) = action {
         let limit = Limit::parse(&name).unwrap_or_else(|| {
             let known: Vec<&str> = Limit::ALL.into_iter().map(Limit::name).collect();
@@ -765,8 +868,7 @@ async fn limits_command(
 
 /// Handles `backup <file>`: `out` is the file, created before this process
 /// became the database's owner.
-async fn backup_command(db: &config::DatabaseConfig, out: std::fs::File, path: &Path) {
-    let database = Path::new(&db.path);
+async fn backup_command(database: &Path, out: std::fs::File, path: &Path) {
     if let Err(e) = backup::backup(database, out, path).await {
         fail(&e);
     }
@@ -780,8 +882,12 @@ async fn backup_command(db: &config::DatabaseConfig, out: std::fs::File, path: &
 
 /// Handles `restore <file>`: `source` is the backup, opened before this
 /// process became the database's owner.
-async fn restore_command(edition: &Edition, cfg: &config::Config, source: std::fs::File) {
-    let database = Path::new(&cfg.database.path);
+async fn restore_command(
+    edition: &Edition,
+    cfg: &config::Config,
+    database: &Path,
+    source: std::fs::File,
+) {
     let base = public_url(cfg);
     let domain = base.host_str().unwrap_or(&cfg.server.domain).to_owned();
     let restored = match backup::restore(database, source, &load_master_key(edition), &domain).await
@@ -815,11 +921,11 @@ async fn restore_command(edition: &Edition, cfg: &config::Config, source: std::f
 /// Holds the lock of the database shared for as long as the value lives
 /// (`lock`). A lock that cannot be made is said, and nothing is refused for
 /// it: the server runs as it did before locks existed.
-fn hold_database(database: &str) -> Option<std::fs::File> {
-    if database == ":memory:" {
-        return None;
-    }
-    match lock::shared(Path::new(database)) {
+fn hold_database(database: &config::Database) -> Option<std::fs::File> {
+    // Only a file is locked: PostgreSQL has its own locks, and no command
+    // replaces it under a running server.
+    let file = database.file.as_deref()?;
+    match lock::shared(file) {
         Ok(file) => Some(file),
         Err(e) => {
             tracing::warn!(error = %e, "the database lock cannot be held: a restore cannot see this process");
@@ -838,10 +944,13 @@ fn fail(message: &str) -> ! {
 /// Handles `client …`. Results go to standard output, one `key=value`
 /// or one site per line, so that a script can read them; everything meant
 /// for a person goes to standard error.
-async fn client_command(edition: &Edition, db: &config::DatabaseConfig, action: ClientCommand) {
-    let store = EncryptedStore::new(&db_url(&db.path), load_master_key(edition))
-        .await
-        .expect("failed to open or migrate database");
+async fn client_command(
+    edition: &Edition,
+    nodes: Nodes,
+    db: &config::Database,
+    action: ClientCommand,
+) {
+    let store = open_store(nodes, db, load_master_key(edition)).await;
     match action {
         ClientCommand::Add {
             name,
@@ -1011,13 +1120,43 @@ async fn list_client(store: &EncryptedStore, client_id: &str, list: Option<Clien
 /// Runs `command`, or the server itself when there is none. `config` is the
 /// `--config` the edition's command line was given.
 pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Command>) {
+    run_as(
+        edition,
+        Nodes::One,
+        config,
+        command.map(NodeCommand::Shared),
+    )
+    .await;
+}
+
+/// [`run`], for an edition made of several nodes on one database: the
+/// server it starts is one of them.
+pub async fn run_node(edition: &Edition, config: Option<PathBuf>, command: Option<NodeCommand>) {
+    run_as(edition, Nodes::Several, config, command).await;
+}
+
+async fn run_as(
+    edition: &Edition,
+    nodes: Nodes,
+    config: Option<PathBuf>,
+    command: Option<NodeCommand>,
+) {
     // One rustls crypto provider for the whole process, aws-lc-rs: the
-    // server's TLS (axum-server) and the client that reads documents of sites
-    // (reqwest). Installed explicitly, so that a dependency enabling another
-    // provider later can never leave rustls choosing at the first handshake.
+    // server's TLS (axum-server), the client that reads documents of sites
+    // (reqwest) and the connection to a PostgreSQL database. Installed
+    // explicitly, so that a dependency enabling another provider later can
+    // never leave rustls choosing at the first handshake.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("no CryptoProvider should be installed yet — this runs once at startup");
+
+    // The two commands of an edition made of several nodes, apart from the
+    // shared ones.
+    let (command, prepare) = match command {
+        Some(NodeCommand::Shared(command)) => (Some(command), None),
+        Some(other) => (None, Some(other)),
+        None => (None, None),
+    };
 
     struct Cli {
         config: Option<PathBuf>,
@@ -1038,7 +1177,7 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     }
 
     // The server never runs as root.
-    if cli.command.is_none() && owner::effective_uid() == 0 {
+    if cli.command.is_none() && prepare.is_none() && owner::effective_uid() == 0 {
         eprintln!(
             "{} does not run as root. Start it as an unprivileged user{}",
             edition.name, edition.root_hint
@@ -1076,18 +1215,50 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     // rotate-key only ever needs the database path — extracting the full
     // `Config` here would demand `server.domain` (required, no default) for
     // no reason, since rotate-key never touches server/TLS/CORS settings.
+    match prepare {
+        Some(NodeCommand::Init {
+            grant,
+            logged_pending,
+        }) => {
+            let cfg = config::load(cli.config.as_deref()).expect("configuration error");
+            nodes::init(edition, &cfg, grant.as_deref(), logged_pending).await;
+            return;
+        }
+        Some(NodeCommand::Import { file, any_domain }) => {
+            let cfg = config::load(cli.config.as_deref()).expect("configuration error");
+            nodes::import(edition, &cfg, &file, any_domain).await;
+            return;
+        }
+        Some(NodeCommand::Shared(_)) | None => {}
+    }
+
     if let Some(Command::RotateKey { old, new }) = cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
+        let db = load_database(cli.config.as_deref());
         // Read as whoever runs this (root may be the only one who can), then
         // the database is touched as its owner.
         let old_master = MasterKey::from_file(&old)
             .expect("failed to read the old master key file (64 hex chars expected)");
         let new_master = MasterKey::from_file(&new)
             .expect("failed to read the new master key file (64 hex chars expected)");
-        as_owner_of_database(edition, Path::new(&db.path), false);
-        let _lock = hold_database(&db.path);
-        rotate_key(edition, &db, old_master, new_master).await;
+        if let Some(file) = &db.file {
+            as_owner_of_database(edition, file, false);
+        }
+        let _lock = hold_database(&db);
+        rotate_key(edition, nodes, &db, old_master, new_master).await;
         return;
+    }
+    // A backup is the file of a SQLite database, and a restore puts one in
+    // place: neither exists for a database that is not a file.
+    if matches!(
+        cli.command,
+        Some(Command::Backup { .. } | Command::Restore { .. })
+    ) && load_database(cli.config.as_deref()).file.is_none()
+    {
+        fail(
+            "backup and restore work on the file of a SQLite database. This server's database \
+             is not a file: back it up and restore it with the database's own tools \
+             (for PostgreSQL: pg_dump, or continuous archiving)",
+        );
     }
     // `backup` and `restore` name a file of the operator's: opened as
     // whoever runs this, who may be the only one allowed to.
@@ -1113,38 +1284,43 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     // it themselves.
     let mut _lock = None;
     if let Some(command) = &cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
+        let db = load_database(cli.config.as_deref());
         let needs_key = !matches!(command, Command::Backup { .. });
-        as_owner_of_database(edition, Path::new(&db.path), needs_key);
+        if let Some(file) = &db.file {
+            as_owner_of_database(edition, file, needs_key);
+        }
         if !matches!(command, Command::Backup { .. } | Command::Restore { .. }) {
-            _lock = hold_database(&db.path);
+            _lock = hold_database(&db);
         }
     }
     match (&cli.command, operator_file, restore_config.as_ref()) {
         (Some(Command::Backup { file }), Some(out), _) => {
-            let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-            backup_command(&db, out, file).await;
+            let db = load_database(cli.config.as_deref());
+            let database = db.file.as_deref().expect("checked above: a file");
+            backup_command(database, out, file).await;
             return;
         }
         (Some(Command::Restore { .. }), Some(source), Some(cfg)) => {
-            restore_command(edition, cfg, source).await;
+            let db = load_database(cli.config.as_deref());
+            let database = db.file.as_deref().expect("checked above: a file");
+            restore_command(edition, cfg, database, source).await;
             return;
         }
         _ => {}
     }
     if let Some(Command::Limits { action }) = cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-        limits_command(edition, &db, action).await;
+        let db = load_database(cli.config.as_deref());
+        limits_command(edition, nodes, &db, action).await;
         return;
     }
     if let Some(Command::RotateOidcKey) = cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-        rotate_oidc_key(edition, &db).await;
+        let db = load_database(cli.config.as_deref());
+        rotate_oidc_key(edition, nodes, &db).await;
         return;
     }
     if let Some(Command::Signup { policy }) = &cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-        signup_command(edition, &db, policy.as_deref()).await;
+        let db = load_database(cli.config.as_deref());
+        signup_command(edition, nodes, &db, policy.as_deref()).await;
         return;
     }
     if let Some(Command::Admin {
@@ -1152,9 +1328,8 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     }) = cli.command
     {
         let cfg = config::load(cli.config.as_deref()).expect("configuration error");
-        let store = EncryptedStore::new(&db_url(&cfg.database.path), load_master_key(edition))
-            .await
-            .expect("failed to open or migrate database");
+        let db = cfg.database.database().unwrap_or_else(|e| fail(&e));
+        let store = open_store(nodes, &db, load_master_key(edition)).await;
         let base = public_url(&cfg).as_str().trim_end_matches('/').to_owned();
         // No account yet: a new setup link, which creates the first one.
         // The running server takes it at once; no restart.
@@ -1179,12 +1354,20 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
         return;
     }
     if let Some(Command::Client { action }) = cli.command {
-        let db = config::load_database(cli.config.as_deref()).expect("configuration error");
-        client_command(edition, &db, action).await;
+        let db = load_database(cli.config.as_deref());
+        client_command(edition, nodes, &db, action).await;
         return;
     }
 
     let cfg = config::load(cli.config.as_deref()).expect("configuration error");
+    if nodes == Nodes::Several && cfg.server.acme {
+        eprintln!(
+            "FATAL: server.acme is for a server made of one node: the certificate of {} is held \
+             by what stands in front of its nodes",
+            edition.name
+        );
+        std::process::exit(1);
+    }
 
     // -- MASTER_KEY ----------------------------------------------------------
     // Must come from the environment or a Docker-secrets file — never from
@@ -1192,24 +1375,45 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     let master = load_master_key(edition);
 
     // -- Database ------------------------------------------------------------
+    let database = cfg.database.database().unwrap_or_else(|e| {
+        eprintln!("FATAL: {e}");
+        std::process::exit(1);
+    });
+    if nodes == Nodes::Several && cfg.database.url.is_none() && cfg.database.url_file.is_none() {
+        eprintln!(
+            "FATAL: {} serves a database its nodes share: set database.url_file (or database.url) \
+             to the address of a PostgreSQL database",
+            edition.name
+        );
+        std::process::exit(1);
+    }
     // Held while the server runs: `restore` refuses while it is.
-    let _database_lock = hold_database(&cfg.database.path);
-    let store = EncryptedStore::new(&db_url(&cfg.database.path), master)
-        .await
-        .expect("failed to open or migrate database");
-
-    // -- VSID secret ---------------------------------------------------------
-    // Stored, so that rotating the master key does not change every VSID.
-    let vsid_salt = *store
-        .vsid_secret()
-        .await
-        .expect("failed to read or store the VSID secret");
-
-    // -- OIDC signing keys ---------------------------------------------------
-    let (oidc_key, retired_oidc_keys) = load_oidc_keys(&store).await;
+    let _database_lock = hold_database(&database);
+    let (store, vsid_salt, oidc_key, retired_oidc_keys) = match nodes {
+        Nodes::One => {
+            let store = EncryptedStore::new(&database.address, master)
+                .await
+                .expect("failed to open or migrate database");
+            // Stored, so that rotating the master key does not change every
+            // VSID.
+            let vsid_salt = *store
+                .vsid_secret()
+                .await
+                .expect("failed to read or store the VSID secret");
+            let (oidc_key, retired) = load_oidc_keys(&store).await;
+            (store, vsid_salt, oidc_key, retired)
+        }
+        Nodes::Several => {
+            // A node creates neither schema, secret nor key: it waits for
+            // the ones `init` made.
+            let store = nodes::connect(&database, master).await;
+            let (vsid_salt, oidc_key, others) = nodes::wait_for_init(edition, &store).await;
+            (store, vsid_salt, oidc_key, others)
+        }
+    };
     tracing::info!(
         kid = oidc_key.kid(),
-        retired = retired_oidc_keys.len(),
+        published_with_it = retired_oidc_keys.len(),
         "OIDC signing keys loaded"
     );
 
@@ -1229,16 +1433,27 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
             Duration::from_secs(cfg.security.session_lifetime_seconds),
         );
     state.trust_forwarded_for = cfg.security.trust_forwarded_for;
-    let state = Arc::new(
-        state
-            .with_admin_log_retention(Duration::from_secs(
-                cfg.security
-                    .admin_log_retention_days
-                    .saturating_mul(24 * 3600),
-            ))
-            .with_confirmation_ttl(Duration::from_secs(cfg.security.admin_confirmation_seconds)),
-    );
-    announce_administration(edition, &state).await;
+    let mut state = state
+        .with_admin_log_retention(Duration::from_secs(
+            cfg.security
+                .admin_log_retention_days
+                .saturating_mul(24 * 3600),
+        ))
+        .with_confirmation_ttl(Duration::from_secs(cfg.security.admin_confirmation_seconds));
+    // What lives minutes: in this process's memory, or, for a node of
+    // several, in the database they share.
+    let stored = (nodes == Nodes::Several)
+        .then(|| Arc::new(brigid_api::shared::Stored::new(state.store.clone())));
+    if let Some(stored) = &stored {
+        state = state.with_several_nodes().with_shared(stored.clone());
+    }
+    let state = Arc::new(state);
+    if let Some(stored) = stored {
+        nodes::keep_sweeping(stored);
+        nodes::keep_reading_keys(state.clone());
+    }
+    announce_administration(edition, nodes, &state).await;
+    let stopping = state.clone();
     // The certificate obtained with ACME is kept in the database.
     let acme_store = state.store.clone();
     let api_router = build_router(state);
@@ -1324,9 +1539,23 @@ pub async fn run(edition: &Edition, config: Option<PathBuf>, command: Option<Com
     // Spawn graceful-shutdown task.
     {
         let shutdown_handle = handle.clone();
+        let delay = Duration::from_secs(cfg.server.shutdown_delay_seconds.unwrap_or(match nodes {
+            Nodes::One => 0,
+            Nodes::Several => 5,
+        }));
         tokio::spawn(async move {
             shutdown_signal().await;
-            tracing::info!("shutdown signal received — draining connections (10 s grace)");
+            // Not ready first, so that what spreads requests sends no new
+            // one; then the requests already here are finished.
+            stopping.stop();
+            if !delay.is_zero() {
+                tracing::info!(
+                    seconds = delay.as_secs(),
+                    "shutdown signal received — no longer ready, still answering"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            tracing::info!("draining connections (10 s grace)");
             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
         });
     }

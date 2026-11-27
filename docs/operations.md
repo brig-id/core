@@ -1,10 +1,15 @@
-# Backups and limits
+# Backups, limits, and several nodes
 
-What every server edition (seedling, grove) offers on its command line for these, and what
-an administrator sets from the interface. `<server>` is the edition's executable:
-`seedling`, `grove`. The commands read the database path like a normal run (`--config`,
-`BRIGID_DATABASE__PATH`). Typed as root, they become the owner of the database's directory
-first, so that no file of the database belongs to root.
+What every server edition (seedling, grove, forest) offers on its command line for these,
+and what an administrator sets from the interface. `<server>` is the edition's executable:
+`seedling`, `grove`, `forest`. The commands read the database like a normal run (`--config`,
+`BRIGID_DATABASE__PATH`, or `BRIGID_DATABASE__URL_FILE` for PostgreSQL). Typed as root on a
+SQLite database, they become the owner of the database's directory first, so that no file
+of the database belongs to root.
+
+`backup` and `restore` are for a database that is a SQLite file (seedling, grove). On
+PostgreSQL they refuse and say so: the database has its own tools. What an edition made of
+several nodes adds is in [Several nodes](#several-nodes-on-one-database).
 
 ## Backup
 
@@ -118,3 +123,81 @@ A creation refused by a limit answers, with the error the interface already read
 `409` for `identities_per_account` (`POST /account/identities`) and `passkeys_per_account`
 (`POST /auth/passkeys/add/begin`, checked again at `…/finish`); `429` for
 `sign_ups_per_ip_per_day` (`POST /auth/register/begin`, counted at `…/finish`).
+
+## Several nodes on one database
+
+An edition made of several nodes (forest; `brigid_server::run_node`, spec `forest.md`)
+serves one PostgreSQL database from processes that stand in for one another. Its settings,
+besides those of every edition:
+
+| Setting | Meaning |
+| --- | --- |
+| `database.url_file` (`BRIGID_DATABASE__URL_FILE`) | A file holding the address of the database, `postgres://role:password@host/database`. `database.url` gives it directly |
+| `database.allow_unverified` | Accept an address whose `sslmode` does not verify the database's certificate. Without it only `verify-full` (the default when the address names none) and `verify-ca` are accepted; `sslrootcert=<file>` names an authority of your own |
+| `database.max_connections` | The most connections one process opens (default 10) |
+| `server.shutdown_delay_seconds` | How long a node told to stop keeps answering, not ready, before it closes (default 5) |
+
+### `init`
+
+```sh
+<server> init [--grant <role>] [--logged-pending]
+```
+
+Run once before the nodes start, and before each update, as a database role that owns the
+schema. It takes a lock (a second `init` waits), creates or updates the schema and the two
+tables of what the nodes share, creates the secret of the identifiers and the first signing
+key if they are missing, and records which nodes may serve on the schema. On a server with
+no administrator it prints the setup link on standard output. A second run changes nothing.
+
+- `--grant <role>`: the role the nodes connect as may read and write rows, and nothing
+  else. Nodes never change the schema.
+- `--logged-pending`: `pending` is an ordinary table instead of an unlogged one, for a
+  PostgreSQL service without unlogged tables.
+
+**A node creates nothing.** Started before `init`, it waits a minute for it, saying what is
+missing, then ends. While it runs, `GET /ready` answers 503 with the reason when the schema
+is not one its version serves on, when the database does not answer, and from the moment
+the process is told to stop.
+
+### Updates
+
+`init` of the new version first, then the nodes one by one. A schema step must leave the
+nodes of the release before working; when one cannot, `SERVES_NODES_FROM`
+(`brigid-store/src/nodes.rs`) is raised with it, older nodes stop being ready as soon as
+`init` has run, and the release's notes say that the update interrupts.
+
+### Signing keys
+
+`<server> rotate-oidc-key` needs no restart: every node reads the keys again every minute,
+publishes the new one at once, and signs with it five minutes after its creation. Keys past
+their grace period are removed by the nodes.
+
+### The master key
+
+`rotate-key` re-encrypts every row in one transaction: stop every node first. A node that
+ran meanwhile wrote under the old key.
+
+### `import`
+
+```sh
+<server> import /somewhere/backup.db [--any-domain]
+```
+
+Copies a backup of a seedling or a grove (the file its `backup` wrote) into this server's
+database: accounts, passkeys, identities, sites, settings, sessions, the secret of the
+identifiers and the signing keys. After `init`, on a server that has no account, under the
+**same master key** and the **same domain** as the server the backup comes from.
+
+- Rows are copied as they are, in one transaction: nothing is decrypted, and an import that
+  fails changes nothing. What `init` had created (a secret, a key) is replaced by the
+  backup's: no account existed, so nothing had been given out under them.
+- Identifiers that sites hold, tokens and passkeys stay valid. Sign-ins in progress on the
+  old server start again.
+- A backup made by an earlier version is brought to this version's schema on a private
+  copy in the temporary directory; the file itself is never written.
+- A backup whose accounts were created on another domain is refused (passkeys are bound to
+  the domain) unless `--any-domain`.
+- The certificate a single node obtained for itself (ACME) is not copied.
+
+Then stop the old server: two servers must not answer for one domain. To change the master
+key, rotate it after the import.

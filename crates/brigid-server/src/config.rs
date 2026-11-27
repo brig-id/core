@@ -98,6 +98,13 @@ pub struct ServerConfig {
     /// this port; scrape it from the internal network only.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+
+    /// How many seconds a server told to stop keeps answering before it
+    /// closes its listener, `GET /ready` saying 503 meanwhile: the time for
+    /// what spreads requests to notice and send it no new one. Unset: none
+    /// for a server made of one node, 5 for a node of several.
+    #[serde(default)]
+    pub shutdown_delay_seconds: Option<u64>,
 }
 
 /// Database settings.
@@ -107,12 +114,138 @@ pub struct DatabaseConfig {
     /// Use `":memory:"` for in-memory databases (tests only).
     #[serde(default = "default_db_path")]
     pub path: String,
+
+    /// The address of a PostgreSQL database
+    /// (`postgres://user:password@host/database`), for an edition made of
+    /// several nodes; `path` is then not read. It holds a password: prefer
+    /// `url_file`.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// A file holding the address of the database, as a secret manager
+    /// mounts it. Exclusive with `url`.
+    #[serde(default)]
+    pub url_file: Option<PathBuf>,
+
+    /// Accept a PostgreSQL connection whose server certificate is not
+    /// verified, or without TLS at all, when the address asks for it
+    /// (`sslmode=disable`, `require`…). Without this the server refuses
+    /// such an address: the connection carries every row. For a database
+    /// reached on a network nothing else can read.
+    #[serde(default)]
+    pub allow_unverified: bool,
+
+    /// The most connections one process opens to a PostgreSQL database
+    /// (default: 10). The database must allow that many for every node,
+    /// and a few more for the commands.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             path: default_db_path(),
+            url: None,
+            url_file: None,
+            allow_unverified: false,
+            max_connections: None,
+        }
+    }
+}
+
+/// Where the database is, as the store opens it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Database {
+    /// The address given to the store.
+    pub address: String,
+    /// The file of a SQLite database: what `backup`, `restore`, the lock
+    /// and a command typed as root work on. `None` for PostgreSQL, and for
+    /// a database in memory.
+    pub file: Option<PathBuf>,
+    /// The most connections to open, when the configuration says.
+    pub connections: Option<u32>,
+}
+
+impl DatabaseConfig {
+    /// Where the database is. A PostgreSQL address is checked: unless
+    /// `allow_unverified` is set it must verify the server's certificate
+    /// (`sslmode=verify-full`, which it gets when it names no mode).
+    pub fn database(&self) -> Result<Database, String> {
+        let url = match (&self.url, &self.url_file) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "database.url and database.url_file are both set: the address comes from \
+                     one or the other"
+                        .into(),
+                );
+            }
+            (Some(url), None) => Some(url.trim().to_owned()),
+            (None, Some(file)) => Some(
+                std::fs::read_to_string(file)
+                    .map_err(|e| format!("database.url_file {}: {e}", file.display()))?
+                    .trim()
+                    .to_owned(),
+            ),
+            (None, None) => None,
+        };
+        let Some(url) = url else {
+            let memory = self.path == ":memory:";
+            return Ok(Database {
+                address: if memory {
+                    "sqlite::memory:".to_owned()
+                } else {
+                    // The path-only form `sqlite:{path}`, not `sqlite://{path}`:
+                    // unambiguously a file name, for absolute and relative
+                    // paths alike.
+                    format!("sqlite:{}?mode=rwc", self.path)
+                },
+                file: (!memory).then(|| PathBuf::from(&self.path)),
+                connections: None,
+            });
+        };
+        if !brigid_store::is_postgres(&url) {
+            // A SQLite address, for the tests of an edition made of several
+            // nodes: no file is known, so nothing that works on a file runs.
+            return Ok(Database {
+                address: url,
+                file: None,
+                connections: self.max_connections,
+            });
+        }
+        Ok(Database {
+            address: verified_postgres(&url, self.allow_unverified)?,
+            file: None,
+            connections: self.max_connections,
+        })
+    }
+}
+
+/// `url` with `sslmode=verify-full` when it names no mode; refused when it
+/// names a mode that does not verify the server's certificate, unless
+/// `allow_unverified`. The address is never repeated in the error: it holds
+/// a password.
+fn verified_postgres(url: &str, allow_unverified: bool) -> Result<String, String> {
+    let mut parsed = url::Url::parse(url)
+        .map_err(|e| format!("the address of the database is not a URL ({e})"))?;
+    let mode = parsed
+        .query_pairs()
+        .find(|(name, _)| name == "sslmode")
+        .map(|(_, value)| value.into_owned());
+    match mode.as_deref() {
+        Some("verify-full" | "verify-ca") => Ok(url.to_owned()),
+        Some(_) if allow_unverified => Ok(url.to_owned()),
+        Some(other) => Err(format!(
+            "the address of the database says sslmode={other}: the connection would not verify \
+             the database's certificate. Use sslmode=verify-full (with sslrootcert=<file> for an \
+             authority of your own), or set database.allow_unverified = true for a database \
+             reached on a network nothing else can read"
+        )),
+        None => {
+            parsed
+                .query_pairs_mut()
+                .append_pair("sslmode", "verify-full");
+            Ok(parsed.into())
         }
     }
 }
@@ -429,6 +562,90 @@ mod tests {
             assert_eq!(cfg.security.admin_log_retention_days, 180);
             Ok(())
         });
+    }
+
+    #[test]
+    fn without_an_address_the_database_is_the_sqlite_file() {
+        let cfg = load_value(serde_json::json!({
+            "server": { "domain": "localhost" },
+            "database": { "path": "/data/brigid.db" }
+        }));
+        let database = cfg.database.database().unwrap();
+        assert_eq!(database.address, "sqlite:/data/brigid.db?mode=rwc");
+        assert_eq!(
+            database.file.as_deref(),
+            Some(std::path::Path::new("/data/brigid.db"))
+        );
+        let memory = DatabaseConfig {
+            path: ":memory:".into(),
+            ..DatabaseConfig::default()
+        };
+        let database = memory.database().unwrap();
+        assert_eq!(database.address, "sqlite::memory:");
+        assert!(database.file.is_none());
+    }
+
+    #[test]
+    fn a_postgresql_address_verifies_the_certificate_unless_the_operator_wrote_otherwise() {
+        let with = |url: &str, allow_unverified| DatabaseConfig {
+            url: Some(url.into()),
+            allow_unverified,
+            max_connections: Some(4),
+            ..DatabaseConfig::default()
+        };
+        // No mode named: the strictest.
+        let database = with("postgres://brigid:secret@db.internal/brigid", false)
+            .database()
+            .unwrap();
+        assert_eq!(
+            database.address,
+            "postgres://brigid:secret@db.internal/brigid?sslmode=verify-full"
+        );
+        assert!(database.file.is_none());
+        assert_eq!(database.connections, Some(4));
+        // A mode that verifies is kept as written.
+        let url =
+            "postgres://brigid:secret@db.internal/brigid?sslmode=verify-ca&sslrootcert=/ca.pem";
+        assert_eq!(with(url, false).database().unwrap().address, url);
+        // A mode that does not is refused, without the password in the message.
+        for mode in ["disable", "allow", "prefer", "require"] {
+            let url = format!("postgres://brigid:secret@db.internal/brigid?sslmode={mode}");
+            let refused = with(&url, false).database().unwrap_err();
+            assert!(refused.contains(&format!("sslmode={mode}")), "{refused}");
+            assert!(!refused.contains("secret"), "{refused}");
+            assert_eq!(with(&url, true).database().unwrap().address, url);
+        }
+    }
+
+    #[test]
+    fn the_address_of_the_database_can_come_from_a_mounted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("database-url");
+        std::fs::write(&file, "postgres://brigid:secret@db.internal/brigid\n").unwrap();
+        let cfg = DatabaseConfig {
+            url_file: Some(file.clone()),
+            ..DatabaseConfig::default()
+        };
+        assert_eq!(
+            cfg.database().unwrap().address,
+            "postgres://brigid:secret@db.internal/brigid?sslmode=verify-full"
+        );
+        let both = DatabaseConfig {
+            url: Some("postgres://a@b/c".into()),
+            url_file: Some(file),
+            ..DatabaseConfig::default()
+        };
+        assert!(both.database().unwrap_err().contains("both set"));
+        let missing = DatabaseConfig {
+            url_file: Some(dir.path().join("nothing")),
+            ..DatabaseConfig::default()
+        };
+        assert!(
+            missing
+                .database()
+                .unwrap_err()
+                .contains("database.url_file")
+        );
     }
 
     #[test]
