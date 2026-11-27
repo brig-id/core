@@ -31,7 +31,7 @@ tracing = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Verifies the signed assertions of those clients (private_key_jwt).
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
-webauthn-rs = { version = "0.5", features = [
+webauthn-rs = { version = "0.6", features = [
   "danger-allow-state-serialisation",
   # start/finish_discoverable_authentication: username-less passkey login.
   "conditional-ui",
@@ -44,14 +44,14 @@ postgres = ["brigid-store/postgres"]
 [dev-dependencies]
 # `brigid_store::testing::url`: the tests run on SQLite or on PostgreSQL.
 brigid-store = { workspace = true, features = ["testing"] }
-webauthn-rs-proto = "0.5"
+webauthn-rs-proto = "0.6"
 brigid-crypto.workspace = true
 ed25519-dalek = "3"
 sha2 = "0.11"
 # A P-256 public key for a registration built by hand in the tests. Already
 # in the tree (through jsonwebtoken): no new crate.
 p256 = "0.13"
-webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
