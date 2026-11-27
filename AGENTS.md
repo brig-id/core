@@ -157,7 +157,6 @@ Format: `type(scope): <emoji> description`
 | `workspace` | Root `Cargo.toml`, workspace-level changes |
 | `ci` | `.github/workflows/` |
 | `deps` | Dependency bumps |
-| `release` | A release pull request (release-please) |
 
 **Do not use a scope outside this list.** If a new crate is added, update this table,
 `.vscode/settings.json`, and `.github/workflows/conventional-commits.yml`.
@@ -172,22 +171,24 @@ ci(ci): 👷 add conventional commit check
 
 ## Releases
 
-Nobody tags by hand. `.github/workflows/release.yml` (release-please, through the
-shared workflow of brig-id/.github) keeps a release pull request up to date: the next
-version of every crate of the workspace (they share it, from the commit types since the
-last release) and its `CHANGELOG.md` entry. **Merging that pull request is the
-release**: the tag `vX.Y.Z` and the GitHub Release follow, and Renovate proposes the new
-tag to the servers, which pin the core by `tag`. So:
+The core has no release of its own: no version to bump, no tag, no `CHANGELOG.md`. The
+servers follow it at a commit of `main` (their `Cargo.lock`), and a server's release
+notes list what changed here since the release before, from the commit subjects. So:
 
-- the commit type decides the version: while it is 0.x, `feat` and `fix` are a patch,
-  a `!` or a `BREAKING CHANGE:` footer a minor; `build`, `ci`, `chore`, `docs`, `test`
-  and `refactor` alone make no release;
-- the commit subject is the changelog line: write it for someone reading the release;
-- a new release of brig-id/crypto comes from Renovate as `fix(deps)`, on a Monday, and
-  so opens a release pull request of the core; an update from outside the project
-  comes as `build(deps)` and waits for the next release;
-- do not edit `CHANGELOG.md`, `.release-please-manifest.json` or the crates' versions
-  by hand.
+- one pull request per change. A change that needs another repository too (crypto, a
+  server, the interface) is a pull request there as well, **on a branch of the same
+  name**: the `integration` job (brig-id/.github, `integration.yml`) builds the servers
+  with this change and those branches and runs their suites, before anything is merged.
+  They are merged from crypto down to the servers;
+- the commit type says whether a person running a server would notice: `feat`, `fix`,
+  `perf` and `revert` are listed in the server's release notes and are a reason for a
+  release; `build`, `ci`, `chore`, `docs`, `test` and `refactor` are not. A `!` or a
+  `BREAKING CHANGE:` footer is announced first;
+- the commit subject is the line people read in those notes: write it for them;
+- the core follows crypto the same way: `branch = "main"` in `Cargo.toml`, the commit in
+  `Cargo.lock`, moved with `cargo update -p brigid-crypto` by the pull request that
+  needs it;
+- `brigid release` (brig-id/cli) shows what the servers do not follow yet.
 
 ## Commands
 
