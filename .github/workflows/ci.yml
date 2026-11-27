@@ -5,7 +5,6 @@ on:
     branches: [main, "dev/*"]
   pull_request:
     branches: [main, "dev/*"]
-  # Started by the release workflow on the release pull request.
   workflow_dispatch:
 
 permissions:
@@ -13,7 +12,16 @@ permissions:
 
 jobs:
   ci:
-    uses: brig-id/.github/.github/workflows/ci-rust.yml@5e019131d735e4ed0bd3598b5a61137bdae7eff3
+    uses: brig-id/.github/.github/workflows/ci-rust.yml@main
+
+  # The servers built with this change, and their suites: their Rust tests, the
+  # interface's and the demonstration site's in a browser (brig-id/.github,
+  # integration.yml). A branch of the same name with an open pull request in
+  # another repository is taken instead of its main.
+  integration:
+    uses: brig-id/.github/.github/workflows/integration.yml@main
+    with:
+      heads: true
 
   # The certificate obtained with ACME (core#75), end to end against Pebble,
   # the test authority of Let's Encrypt, and its DNS server answering
