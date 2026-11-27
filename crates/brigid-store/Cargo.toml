@@ -41,3 +41,5 @@ postgres = ["sqlx/postgres", "sqlx/tls-rustls-aws-lc-rs"]
 testing = []
 
 [dev-dependencies]
+# The import tests read a database from a file.
+tempfile = "3"

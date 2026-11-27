@@ -74,10 +74,20 @@ impl EncryptedStore {
     /// Creates the two tables if they are not there. Run once, by what
     /// initialises a server made of several nodes; nodes never do it.
     pub async fn prepare_kept(&self) -> Result<()> {
-        let postgres = self.pool.acquire().await?.backend_name() == "PostgreSQL";
+        self.prepare_kept_as(true).await
+    }
+
+    /// [`Self::prepare_kept`], with `pending` an ordinary table when
+    /// `unlogged` is false: for a PostgreSQL service that offers no unlogged
+    /// table. It costs the database more, and a crash can then give back a
+    /// value taken a moment before it (spec `forest.md` §3). Tables already
+    /// there stay as they were made.
+    pub async fn prepare_kept_as(&self, unlogged: bool) -> Result<()> {
+        let postgres = self.postgres().await?;
         for table in TABLES {
             let statement = if postgres {
-                crate::for_postgres(table).replace("{TABLE}", "UNLOGGED TABLE")
+                let kind = if unlogged { "UNLOGGED TABLE" } else { "TABLE" };
+                crate::for_postgres(table).replace("{TABLE}", kind)
             } else {
                 table.replace("{TABLE}", "TABLE")
             };
@@ -87,6 +97,26 @@ impl EncryptedStore {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether the two tables are there: a node is not ready without them.
+    pub async fn kept_prepared(&self) -> Result<bool> {
+        for table in ["pending", "used_assertions"] {
+            // A table that is not there fails the statement on both
+            // databases; anything else that fails does too, and a node that
+            // cannot read them is not ready either.
+            let read = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE 1 = 0"
+            )))
+            .fetch_one(&self.pool)
+            .await;
+            match read {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(_)) => return Ok(false),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(true)
     }
 
     /// Keeps `value` under `kind` and `id` until `expires_at` (Unix

@@ -608,44 +608,62 @@ impl EncryptedStore {
     /// return an `EncryptedStore`. A SQLite file is created when missing; a
     /// PostgreSQL database must exist, and needs the feature `postgres`.
     pub async fn new(database_url: &str, master: MasterKey) -> Result<Self> {
+        let store = Self::connect(database_url, master, None).await?;
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    /// Open the database at `database_url` as it is: nothing is created and
+    /// the schema is not touched. For a node of a server made of several,
+    /// which never changes the schema ([`crate::nodes`]); `connections` is
+    /// the most it opens to the database (the driver's default when `None`).
+    pub async fn connect(
+        database_url: &str,
+        master: MasterKey,
+        connections: Option<u32>,
+    ) -> Result<Self> {
         sqlx::any::install_default_drivers();
-        let postgres = crate::is_postgres(database_url);
-        let pool = if postgres {
-            AnyPoolOptions::new().connect(database_url).await?
+        let mut options = AnyPoolOptions::new();
+        if let Some(connections) = connections {
+            options = options.max_connections(connections.max(1));
+        }
+        let pool = if crate::is_postgres(database_url) {
+            // A request waits this long for the database, not the driver's
+            // thirty seconds: while a database fails over, a node answers
+            // that it is not ready instead of keeping every request open.
+            options
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(database_url)
+                .await?
         } else if database_url.contains(":memory:") {
             // For in-memory SQLite each connection gets its own empty database.
             // Restrict the pool to a single connection so all operations share the
             // same in-memory database (used in tests; does not affect file-backed DBs).
-            AnyPoolOptions::new()
-                .max_connections(1)
-                .connect(database_url)
-                .await?
+            options.max_connections(1).connect(database_url).await?
         } else if database_url.contains('?') {
-            AnyPoolOptions::new().connect(database_url).await?
+            options.connect(database_url).await?
         } else {
             // The file is created when it is missing.
-            AnyPoolOptions::new()
-                .connect(&format!("{database_url}?mode=rwc"))
-                .await?
+            options.connect(&format!("{database_url}?mode=rwc")).await?
         };
-        Self::migrate(&pool, postgres).await?;
         Ok(Self { pool, master })
     }
 
-    #[cfg(feature = "postgres")]
-    async fn migrate(pool: &AnyPool, postgres: bool) -> Result<()> {
-        if postgres {
-            crate::MIGRATOR_POSTGRES.run(pool).await?;
-        } else {
-            crate::MIGRATOR.run(pool).await?;
-        }
-        Ok(())
+    /// Whether the database is PostgreSQL.
+    pub(crate) async fn postgres(&self) -> Result<bool> {
+        Ok(self.pool.acquire().await?.backend_name() == "PostgreSQL")
     }
 
-    #[cfg(not(feature = "postgres"))]
-    async fn migrate(pool: &AnyPool, _postgres: bool) -> Result<()> {
-        // Without the driver, a PostgreSQL address failed to connect above.
-        crate::MIGRATOR.run(pool).await?;
+    /// Brings the schema up to date. [`Self::new`] does it; what initialises
+    /// a server made of several nodes does it once for all of them.
+    pub async fn migrate(&self) -> Result<()> {
+        #[cfg(feature = "postgres")]
+        if self.postgres().await? {
+            crate::MIGRATOR_POSTGRES.run(&self.pool).await?;
+            return Ok(());
+        }
+        // Without the driver, a PostgreSQL address failed to connect.
+        crate::MIGRATOR.run(&self.pool).await?;
         Ok(())
     }
 
@@ -774,6 +792,26 @@ impl EncryptedStore {
             .try_into()
             .map_err(|_| Error::InvalidBlob)?;
         Ok(Zeroizing::new(secret))
+    }
+
+    /// The VSID secret if the database holds one, and nothing drawn when it
+    /// does not: a node of a server made of several never creates it (two
+    /// nodes starting together would each draw their own).
+    pub async fn stored_vsid_secret(&self) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        let key = server_secret_key(&self.master)?;
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT value FROM server_secrets WHERE name = 'vsid'")
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(raw) = stored else {
+            return Ok(None);
+        };
+        let secret = Zeroizing::new(dec(&key, &raw)?);
+        let secret: [u8; 32] = secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidBlob)?;
+        Ok(Some(Zeroizing::new(secret)))
     }
 
     /// A secret the server keeps for its own certificate (ACME): `None` until
