@@ -19,5 +19,11 @@
 # leaf only opens its own database in its own volume, written by no one else: a party able
 # to plant the `-wal` file can already read and replace the database. Revisit when sqlx
 # moves to libsqlite3-sys >= 0.39.
+#
+# RUSTSEC-2026-0543: `chrono` is unmaintained. It is in Cargo.lock as an optional
+# dependency of `serde_with` (brought by webauthn-rs 0.6), behind a feature nothing
+# enables: it is not compiled (`cargo tree --target all -i chrono` prints nothing, and
+# cargo-deny, which reads the graph and not the lock file, does not see it). Remove this
+# line when serde_with drops it, or if the command above ever prints something.
 [advisories]
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459", "RUSTSEC-2026-0543"]
