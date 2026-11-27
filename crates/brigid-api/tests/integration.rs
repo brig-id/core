@@ -2080,8 +2080,10 @@ async fn cookie_session_check_sign_out_and_same_origin() {
     let idle = j["idle_expires_at"].as_i64().unwrap();
     let end = j["expires_at"].as_i64().unwrap();
     assert!(idle > 0 && idle <= end, "{j}");
+    // A few seconds of slack: the two times are taken at different moments,
+    // and may fall on either side of a second.
     assert!(
-        end - idle >= 11 * 3600,
+        end - idle >= 11 * 3600 - 5,
         "1 h idle within a 12 h lifetime: {j}"
     );
 
