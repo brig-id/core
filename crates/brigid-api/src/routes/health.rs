@@ -11,16 +11,16 @@ pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
-/// `GET /ready` — 200 when the DB is reachable, 503 otherwise.
+/// `GET /ready` — 200 when this server takes requests, 503 otherwise, with
+/// the reason: the database does not answer, the process is stopping, or,
+/// for a node of a server made of several, the schema is not one it serves
+/// on ([`AppState::readiness`]).
 pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // A lightweight query to verify the database connection.
-    match state.store.fetch_user(uuid::Uuid::nil()).await {
-        Ok(_) | Err(brigid_store::Error::Uuid(_)) => {
-            (StatusCode::OK, Json(json!({ "status": "ready" })))
-        }
-        Err(_) => (
+    match state.readiness().await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ready" }))),
+        Err(why) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "unavailable" })),
+            Json(json!({ "status": "unavailable", "reason": why.reason() })),
         ),
     }
 }

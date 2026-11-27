@@ -253,7 +253,7 @@ async fn exchange(
             // values they saw.
             attributes: &code.attributes,
         },
-        &state.oidc_key,
+        &state.oidc_key(),
         helpers4::time::unix_now().map_or(0, |secs| secs as i64),
     )
     .map_err(TokenError::internal)?;

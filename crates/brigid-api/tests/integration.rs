@@ -2752,11 +2752,11 @@ fn verified_claims(state: &AppState, jwt: &str) -> serde_json::Value {
     let head: serde_json::Value =
         serde_json::from_slice(&Base64UrlUnpadded::decode_vec(header).unwrap()).unwrap();
     assert_eq!(head["alg"], "EdDSA");
-    assert_eq!(head["kid"], state.oidc_key.kid());
+    assert_eq!(head["kid"], state.oidc_key().kid());
     let signature =
         Signature::from_slice(&Base64UrlUnpadded::decode_vec(signature).unwrap()).unwrap();
     state
-        .oidc_key
+        .oidc_key()
         .verifying_key()
         .verify(format!("{header}.{payload}").as_bytes(), &signature)
         .expect("the ID token is signed by the server's key");
@@ -6377,4 +6377,222 @@ async fn sign_ups_from_one_address_are_limited_per_day() {
         .await
         .unwrap();
     assert_eq!(state.store.count_accounts().await.unwrap(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Several nodes on one database (spec `forest.md`)
+// ---------------------------------------------------------------------------
+
+/// One node of a server made of several: its own connections, its own
+/// memory, the database of the others. It reads the VSID secret and the
+/// signing key the initialisation made, and creates neither.
+async fn node(url: &str) -> Arc<AppState> {
+    let store = EncryptedStore::connect(url, master(), None).await.unwrap();
+    let vsid = *store.stored_vsid_secret().await.unwrap().unwrap();
+    let key = store.oidc_signing_keys().await.unwrap().remove(0);
+    let base_url = Url::parse(ORIGIN).unwrap();
+    let webauthn = WebauthnService::new("localhost", &base_url).unwrap();
+    let mut state = AppState::new(
+        store,
+        webauthn,
+        OidcSigningKey::from_raw_bytes(key.kid, &key.seed),
+        base_url,
+        vsid,
+    )
+    .with_several_nodes();
+    state.shared = Arc::new(brigid_api::shared::Stored::new(state.store.clone()));
+    state.trust_forwarded_for = true;
+    Arc::new(state)
+}
+
+/// What stands in front of the nodes: each request goes to the next one.
+fn spread_over(nodes: &[Arc<AppState>]) -> axum::Router {
+    let routers: Arc<Vec<axum::Router>> =
+        Arc::new(nodes.iter().cloned().map(build_router).collect());
+    let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    axum::Router::new().fallback(move |request: Request<Body>| {
+        let routers = routers.clone();
+        let n = turn.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % routers.len();
+        async move { routers[n].clone().oneshot(request).await }
+    })
+}
+
+/// A database two nodes can open: PostgreSQL when the tests run on it, a
+/// SQLite file otherwise (in memory, each connection has its own).
+async fn shared_database(dir: &std::path::Path) -> String {
+    if std::env::var("BRIGID_TEST_POSTGRES").is_ok() {
+        brigid_store::testing::url().await
+    } else {
+        format!("sqlite:{}", dir.join("nodes.db").display())
+    }
+}
+
+/// What the initialisation of such a server does, once, before any node.
+async fn initialise(url: &str) -> EncryptedStore {
+    let store = EncryptedStore::connect(url, master(), None).await.unwrap();
+    let lock = store.begin_initialisation().await.unwrap();
+    store.migrate().await.unwrap();
+    store.prepare_kept().await.unwrap();
+    store.vsid_secret().await.unwrap();
+    let seed = OidcSigningKey::generate().to_raw_bytes();
+    store
+        .add_oidc_signing_key(OidcSigningKey::from_seed(&seed).kid(), &seed)
+        .await
+        .unwrap();
+    store.record_schema().await.unwrap();
+    lock.done().await.unwrap();
+    store
+}
+
+/// No node holds what another needs: every request of a sign-up, of a
+/// sign-in to a site and of the exchange of its code is answered by the
+/// node after the one that answered the request before.
+#[tokio::test]
+async fn any_node_answers_any_request_of_a_sign_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = shared_database(dir.path()).await;
+    let operator = initialise(&url).await;
+    operator
+        .set_signup_policy(brigid_store::SignupPolicy::Open)
+        .await
+        .unwrap();
+    let (shop, secret) = operator
+        .create_client("Shop", &[REDIRECT.to_string()], true)
+        .await
+        .unwrap();
+    let secret = secret.unwrap();
+
+    let nodes = [node(&url).await, node(&url).await, node(&url).await];
+    for node in &nodes {
+        assert_eq!(node.readiness().await, Ok(()));
+    }
+    let app = spread_over(&nodes);
+
+    // A sign-up, the recovery code, three identities: fourteen requests,
+    // none of them twice in a row on the same node.
+    let (cookie, _, identities) = signed_in_account(&app, "nodes@localhost", "10.90.1").await;
+
+    // A site asks; the person answers; the site exchanges the code.
+    let id = begin_authorization(&app, &shop.client_id, "", "10.90.2.1").await;
+    let code = approve(&app, &id, &cookie, identities[0], "10.90.2.2").await;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let (status, _, j) =
+        token_request(&app, &form, Some((&shop.client_id, &secret)), "10.90.3.1").await;
+    assert_eq!(status, StatusCode::OK, "{j}");
+    // Every node signs with the same key and derives the same identifier.
+    let claims = verified_claims(&nodes[0], j["id_token"].as_str().unwrap());
+    let expected =
+        brigid_identity::identity_vsid(identities[0], &shop.client_id, &nodes[2].vsid_salt);
+    assert_eq!(claims["sub"], expected.as_str());
+
+    // The code was taken: no other node gives a token for it.
+    for n in 0..nodes.len() {
+        let (status, _, j) = token_request(
+            &app,
+            &form,
+            Some((&shop.client_id, &secret)),
+            &format!("10.90.4.{n}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{j}");
+        assert_eq!(j["error"], "invalid_grant");
+    }
+
+    // A node told to stop takes no new request, and says so.
+    nodes[1].stop();
+    assert_eq!(
+        nodes[1].readiness().await,
+        Err(brigid_api::state::NotReady::Stopping)
+    );
+    let resp = build_router(nodes[1].clone())
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_body_json(resp.into_body()).await["reason"],
+        "stopping"
+    );
+}
+
+/// A node on a database nobody initialised is not ready, says why, and
+/// creates nothing; once the server is initialised it serves.
+#[tokio::test]
+async fn a_node_is_ready_only_on_a_schema_made_for_it() {
+    use brigid_api::state::NotReady;
+    use brigid_store::nodes::Fit;
+    let dir = tempfile::tempdir().unwrap();
+    let url = shared_database(dir.path()).await;
+
+    let store = EncryptedStore::connect(&url, master(), None).await.unwrap();
+    let base_url = Url::parse(ORIGIN).unwrap();
+    let state = AppState::new(
+        store,
+        WebauthnService::new("localhost", &base_url).unwrap(),
+        OidcSigningKey::generate(),
+        base_url,
+        [0; 32],
+    )
+    .with_several_nodes();
+    assert_eq!(state.readiness().await, Err(NotReady::Schema(Fit::Empty)));
+    assert_eq!(state.store.schema().await.unwrap().applied, 0);
+
+    // The schema alone is not an initialisation.
+    state.store.migrate().await.unwrap();
+    assert_eq!(
+        state.readiness().await,
+        Err(NotReady::Schema(Fit::NotInitialised))
+    );
+    state.store.record_schema().await.unwrap();
+    assert_eq!(state.readiness().await, Err(NotReady::SharedState));
+    state.store.prepare_kept().await.unwrap();
+    assert_eq!(state.readiness().await, Ok(()));
+}
+
+/// A rotation reaches a running server: the key that signs changes, and
+/// the one before stays published.
+#[tokio::test]
+async fn the_keys_of_a_running_server_can_be_replaced() {
+    let state = make_state().await;
+    let before = state.oidc_key().kid().to_owned();
+    let seed = OidcSigningKey::generate().to_raw_bytes();
+    let next = OidcSigningKey::from_seed(&seed);
+    let next_kid = next.kid().to_owned();
+    let previous = state.oidc_key();
+    state.set_oidc_keys(
+        next,
+        vec![OidcSigningKey::from_raw_bytes(
+            previous.kid().to_owned(),
+            &previous.to_raw_bytes(),
+        )],
+    );
+    assert_eq!(state.oidc_key().kid(), next_kid);
+
+    let resp = build_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .uri("/.well-known/jwks.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let published = response_body_json(resp.into_body()).await;
+    let kids: Vec<&str> = published["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [next_kid.as_str(), before.as_str()]);
 }

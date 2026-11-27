@@ -56,3 +56,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = "0.3"
+# Two nodes on one SQLite database need it in a file.
+tempfile = "3"
