@@ -17,7 +17,7 @@ issues, pull requests. No exceptions.
 | `brigid-webauthn` | Passkey registration and authentication flows |
 | `brigid-oidc` | ID token issuance (EdDSA), PKCE, JWKS, `.well-known/openid-configuration` |
 | `brigid-api` | Axum HTTP server — all routes |
-| `brigid-server` | What every server edition runs: configuration, operator commands, startup, the embedded interface, metrics |
+| `brigid-server` | What every server edition runs: configuration, operator commands, startup (one node, or one of several), the embedded interface, metrics |
 | `brigid-ui-embed` | Build-time helper: embeds the built interface in an edition's executable |
 
 ## Roadmap & planning
@@ -69,6 +69,16 @@ TODOs, backlog ideas, and phase/release status for this repo are tracked as card
   `kept.rs`: an unlogged table on PostgreSQL, hashed identifiers, encrypted values), for
   an edition made of several nodes (spec `forest.md` §2–§3). Never keep such state
   anywhere else.
+- **Several nodes** (`brigid-server/src/nodes.rs`, `brigid-store/src/nodes.rs`,
+  `docs/operations.md`) — an edition made of several nodes calls `run_node`. A node
+  **creates nothing**: no schema step, no secret, no key, no setup link (`init` does, under
+  a lock). It keeps nothing in memory that another node needs, reads the signing keys again
+  every minute and signs with a key only once it was published five minutes
+  (`nodes::signing_key`). Whatever a single node does at its start must be asked here: can
+  two nodes do it together? A new schema step must leave the nodes of the release before
+  working, or raise `SERVES_NODES_FROM` (a test asks at each step). `import` copies rows
+  as they are: a new table needs nothing, a column type outside `TEXT`/`INTEGER`/`BLOB`
+  is refused.
 - **Sites that describe themselves** (`brigid-api/src/described.rs`) — the server fetches
   a document at a URL anyone chooses: keep every rule of the module (https and a domain
   name, the resolver that drops special-use addresses, no redirect, no proxy, 5 KiB, 10 s,

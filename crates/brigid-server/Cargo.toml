@@ -54,6 +54,9 @@ libc = "0.2"
 postgres = ["brigid-store/postgres", "brigid-api/postgres"]
 
 [dev-dependencies]
+# The tests of the node mode build stored keys, and run on both databases.
+zeroize.workspace = true
+brigid-store = { workspace = true, features = ["testing"] }
 # The backup tests build accounts and identities.
 uuid.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }

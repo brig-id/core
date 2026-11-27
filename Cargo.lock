@@ -575,6 +575,7 @@ dependencies = [
  "url",
  "uuid",
  "x509-parser 0.16.0",
+ "zeroize",
 ]
 
 [[package]]
