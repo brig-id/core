@@ -23,7 +23,8 @@ advisories and to build for every target. Stripping symbols would save 2.6 MB (1
 | --- | --- | --- | --- |
 | RustCrypto (`ed25519-dalek`, `p256`, `sha2`, `sha3`, `aes-gcm`, `hkdf`…) | Rust | `brigid-crypto`, `jsonwebtoken` (`rust_crypto`) | Our own cryptography: storage encryption, key derivation, ID tokens, client assertions |
 | aws-lc (`aws-lc-rs`, `aws-lc-sys`) | C and assembly | `rustls` (`axum-server`, `reqwest`, `instant-acme`) | TLS: the server's own certificate when it serves HTTPS itself (with the ACME account and the certificate's key, `rcgen`), and reading the documents of sites |
-| OpenSSL (`openssl`, `openssl-sys`; vendored in the static binary) | C | `webauthn-rs-core` 0.5 | **Every passkey sign-in** (verifying the assertion's signature, `COSEKey::verify_signature`), SHA-256 inside webauthn-rs, and attestation chains (never asked for) |
+| RustCrypto again, through `crypto-glue` (`p256`, `p384`, `p521`, `rsa`, `sha2`, `x509-cert`…) | Rust | `webauthn-rs-core` 0.6 | **Every passkey sign-in** (verifying the assertion's signature), SHA-256 inside webauthn-rs, and attestation chains (never asked for) |
+| OpenSSL | C | `webauthn-rs-core` 0.5 | **Gone** with webauthn-rs 0.6 (2026-11-27): it did the line above |
 | ring | C and assembly | `sqlx` (`runtime-tokio-rustls`) | **Nothing**: sqlx only needs TLS for network databases; SQLite has none. Removed here |
 
 ### Correction
@@ -32,31 +33,29 @@ advisories and to build for every target. Stripping symbols would save 2.6 MB (1
 flows". That was wrong: in webauthn-rs 0.5, `webauthn-rs-core/src/crypto.rs` verifies every
 authentication signature with OpenSSL. Both now say so.
 
-### Removing OpenSSL
+### OpenSSL is removed
 
-**webauthn-rs 0.6** (0.6.2, October 2026) replaces OpenSSL with `crypto-glue`, a facade over
-RustCrypto (`p256`, `p384`, `rsa`, `sha2`, `x509-cert`…). With it, the passkey checks run on
-the same RustCrypto as our own code, and OpenSSL leaves the binary.
+webauthn-rs 0.5 verified every passkey assertion with OpenSSL. **webauthn-rs 0.6** does it
+with `crypto-glue`, a facade over RustCrypto: the passkey checks now run on the same
+RustCrypto as our own code, and OpenSSL left the binary on 2026-11-27 (core#120).
 
-**Blocked, upstream, for now:** `crypto-glue` 0.2.2 asks `rsa` 0.10 with a `sha2` feature
-that only its release candidates had; `jsonwebtoken` 12 asks `rsa` 0.10.0 final. Cargo can
-hold one 0.10 only, so the two cannot resolve together. `crypto-glue` fixed it on its main
-branch (kanidm/crypto-glue#49, `rsa = "0.10.0"`), not released yet (#52). When it is:
-
-1. `webauthn-rs`, `webauthn-rs-proto`, `webauthn-authenticator-rs` (tests) to 0.6;
-2. adapt `brigid-webauthn` to the 0.6 API, run the integration tests (the soft passkey
-   covers registration and authentication end to end);
-3. drop the `openssl` vendored dependency of the static builds (seedling, grove) and the
-   `openssl-sys` exception of `deny.toml`.
-
-The alternative, verifying assertions ourselves with RustCrypto, is a few hundred lines of
-sensitive code (COSE keys, the signed data, the counter): not worth it while a maintained
-library is about to do it.
+- It waited for `crypto-glue` 0.2.3 (2026-11-26): 0.2.2 asked `rsa` 0.10 with a feature
+  only its release candidates had, which could not resolve next to `jsonwebtoken` 12.
+- What changed in our code: a discoverable sign-in is verified against the one passkey the
+  response names (`finish_discoverable_authentication_v2`), which must be one of the
+  account's, instead of handing every passkey of the account to the library. The tests
+  drive a software passkey through registration, sign-in and discoverable sign-in.
+- The price: 38 more crates in the server (453 to 491), all Rust, most of them RustCrypto
+  algorithms webauthn-rs can meet in a passkey (P-384, P-521, RSA) and that brig·id never
+  asks for. One library in C less to vet, to follow for advisories and to build for every
+  target; the static builds no longer compile OpenSSL from source.
+- Left to do in the servers: drop their `openssl` (vendored) dependency of the static
+  builds, and move their tests' software passkey to 0.6.
 
 ### Two TLS libraries would be one
 
 aws-lc stays: rustls needs a provider, and the pure-Rust one (`rustls-rustcrypto`) is not
-production-ready. After the webauthn upgrade the binary carries two stacks with clear roles:
+production-ready. The binary carries two stacks with clear roles:
 **RustCrypto for everything brig·id decides, aws-lc for TLS only**. aws-lc is FIPS-validated
 and maintained by AWS; it is also what `axum-server` defaults to.
 
@@ -78,6 +77,6 @@ and maintained by AWS; it is also what `axum-server` defaults to.
 ```sh
 cargo tree -e normal -p brigid-server --prefix none | sort -u | wc -l
 cargo tree -e normal -i ring              # nothing, after this change
-cargo tree -e normal -i openssl-sys       # webauthn-rs-core, until 0.6
+cargo tree -e normal -i openssl-sys       # nothing, since webauthn-rs 0.6
 cargo tree -e normal -p brigid-server --prefix none | sort -u | grep -- '-sys '
 ```

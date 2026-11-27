@@ -131,10 +131,18 @@ impl WebauthnService {
         if credentials.is_empty() {
             return Err(Error::NoCredentials);
         }
-        let keys: Vec<DiscoverableKey> = credentials.iter().map(DiscoverableKey::from).collect();
+        // The response names its passkey: it is verified against that one,
+        // which must be one of this account's.
+        let (_, named) = self
+            .webauthn
+            .identify_discoverable_authentication(response)?;
+        let passkey = credentials
+            .iter()
+            .find(|passkey| AsRef::<[u8]>::as_ref(passkey.cred_id()) == named)
+            .ok_or(WebauthnError::CredentialNotFound)?;
         let auth_result = self
             .webauthn
-            .finish_discoverable_authentication(response, state, &keys)?;
+            .finish_discoverable_authentication_v2(response, state, passkey)?;
 
         let mut credential_updated = false;
         for passkey in credentials.iter_mut() {
@@ -301,7 +309,7 @@ mod tests {
     fn register_passkey(
         svc: &WebauthnService,
         rp_origin: &Url,
-        auth_client: &mut WebauthnAuthenticator<SoftPasskey>,
+        auth_client: &mut SoftPasskey,
         username: &str,
     ) -> Passkey {
         let user_id = Uuid::new_v4();
@@ -317,7 +325,7 @@ mod tests {
         let rp_origin = Url::parse("http://localhost:8080").unwrap();
         let svc = test_service();
         let user_id = Uuid::new_v4();
-        let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut auth_client = SoftPasskey::new(true);
 
         let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
         let reg_resp = auth_client
@@ -346,7 +354,7 @@ mod tests {
         let rp_origin = Url::parse("http://localhost:8080").unwrap();
         let svc = test_service();
         let user_id = Uuid::new_v4();
-        let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut auth_client = SoftPasskey::new(true);
 
         let (ccr, reg_state) = svc.begin_registration(user_id, "alice", None).unwrap();
         let reg_resp = auth_client
@@ -360,7 +368,7 @@ mod tests {
         let allow = |mut rcr: RequestChallengeResponse, pk: &Passkey| {
             rcr.public_key.allow_credentials = vec![webauthn_rs_proto::AllowCredentials {
                 type_: "public-key".to_string(),
-                id: pk.cred_id().as_ref().to_vec().into(),
+                id: AsRef::<[u8]>::as_ref(pk.cred_id()).to_vec(),
                 transports: None,
             }];
             rcr.mediation = None;
@@ -369,7 +377,7 @@ mod tests {
         // It does not return the user handle either (not covered by the
         // signature), so set it the way a resident-key authenticator would.
         let with_handle = |mut resp: PublicKeyCredential, uid: Uuid| {
-            resp.response.user_handle = Some(uid.as_bytes().to_vec().into());
+            resp.response.user_handle = Some(uid.as_bytes().to_vec());
             resp
         };
         let (rcr, state) = svc.begin_discoverable_authentication().unwrap();
@@ -388,7 +396,7 @@ mod tests {
         assert!(!result.credential_id.is_empty());
 
         // Someone else's passkeys do not verify the assertion.
-        let mut other = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut other = SoftPasskey::new(true);
         let (ccr, reg_state) = svc.begin_registration(Uuid::new_v4(), "bob", None).unwrap();
         let bob_key = svc
             .finish_registration(
@@ -425,8 +433,8 @@ mod tests {
     fn finish_registration_fails_with_wrong_state() {
         let rp_origin = Url::parse("http://localhost:8080").unwrap();
         let svc = test_service();
-        let mut auth_a = WebauthnAuthenticator::new(SoftPasskey::new(true));
-        let auth_b = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut auth_a = SoftPasskey::new(true);
+        let auth_b = SoftPasskey::new(true);
 
         let uid = Uuid::new_v4();
         let (ccr_a, _state_a) = svc.begin_registration(uid, "alice", None).unwrap();
@@ -445,7 +453,7 @@ mod tests {
     fn finish_authentication_fails_with_wrong_state() {
         let rp_origin = Url::parse("http://localhost:8080").unwrap();
         let svc = test_service();
-        let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut auth_client = SoftPasskey::new(true);
 
         // Register once.
         let passkey = register_passkey(&svc, &rp_origin, &mut auth_client, "charlie");
@@ -491,7 +499,7 @@ mod tests {
         store.store_user(&user).await.unwrap();
 
         // Register a passkey.
-        let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut auth_client = SoftPasskey::new(true);
         let passkey = register_passkey(&svc, &rp_origin, &mut auth_client, "bob");
 
         // Store and reload the passkey.

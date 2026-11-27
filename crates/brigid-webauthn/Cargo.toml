@@ -16,14 +16,14 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 url.workspace = true
-webauthn-rs = { version = "0.5", features = [
+webauthn-rs = { version = "0.6", features = [
   "danger-allow-state-serialisation",
   # start/finish_discoverable_authentication: username-less passkey login.
   "conditional-ui",
 ] }
 
 # ResidentKeyRequirement, to ask for discoverable credentials at registration.
-webauthn-rs-proto = "0.5"
+webauthn-rs-proto = "0.6"
 
 [dev-dependencies]
 # `brigid_store::testing::url`: the tests run on SQLite or on PostgreSQL.
@@ -35,4 +35,4 @@ sqlx = { version = "0.9", features = [
   "macros",
 ] }
 time.workspace = true
-webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }

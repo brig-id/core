@@ -15,6 +15,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
+// The ceremonies of a software passkey (`do_registration`, `do_authentication`).
+use webauthn_authenticator_rs::WebauthnAuthenticator as _;
 
 use brigid_api::{AppState, build_router};
 
@@ -383,14 +385,13 @@ async fn sign_in_asks_a_discoverable_passkey() {
 
 #[tokio::test]
 async fn register_and_login_roundtrip() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
 
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // -- Register begin --
     let body = serde_json::json!({});
@@ -528,14 +529,13 @@ async fn logout_requires_a_session() {
 
 #[tokio::test]
 async fn logout_ends_the_session() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
 
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // -- Register --
     let body = serde_json::json!({});
@@ -844,9 +844,7 @@ async fn an_account_route_answers_no_other_origin() {
 /// resident key: the test names the credential for it, and gives the answer
 /// the user handle a real authenticator returns, the account id.
 fn answer_discoverable(
-    dev: &mut webauthn_authenticator_rs::WebauthnAuthenticator<
-        webauthn_authenticator_rs::softpasskey::SoftPasskey,
-    >,
+    dev: &mut webauthn_authenticator_rs::softpasskey::SoftPasskey,
     rp_origin: &url::Url,
     mut rcr: webauthn_rs::prelude::RequestChallengeResponse,
     credential_id: &str,
@@ -861,7 +859,7 @@ fn answer_discoverable(
             .unwrap();
     rcr.mediation = None;
     let mut cred = dev.do_authentication(rp_origin.clone(), rcr).unwrap();
-    cred.response.user_handle = Some(account_id.as_bytes().to_vec().into());
+    cred.response.user_handle = Some(account_id.as_bytes().to_vec());
     cred
 }
 
@@ -874,9 +872,7 @@ async fn register_and_login_for_passkey_tests(
     app: axum::Router,
     username: &str,
     rp_origin: &url::Url,
-    auth_client: &mut webauthn_authenticator_rs::WebauthnAuthenticator<
-        webauthn_authenticator_rs::softpasskey::SoftPasskey,
-    >,
+    auth_client: &mut webauthn_authenticator_rs::softpasskey::SoftPasskey,
     xff_base: &str,
 ) -> (String, Uuid, Uuid) {
     // Register begin (IP .1)
@@ -1021,7 +1017,6 @@ async fn add_credential_for_tests(
     xff_base: &str,
     xff_start: u8,
 ) {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let resp = app
@@ -1047,7 +1042,7 @@ async fn add_credential_for_tests(
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
 
-    let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut second_authenticator = SoftPasskey::new(true);
     let reg_cred = second_authenticator
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
@@ -1076,13 +1071,12 @@ async fn add_credential_for_tests(
 
 #[tokio::test]
 async fn delete_passkey_roundtrip() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // xff_base "10.20.1" → setup IPs 10.20.1.1–10.20.1.5 (one each), add a
     // 2nd credential on .6/.7 (deleting the sole passkey is now refused —
@@ -1143,13 +1137,12 @@ async fn delete_passkey_roundtrip() {
 
 #[tokio::test]
 async fn delete_passkey_last_one_returns_409() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // xff_base "10.20.5" → setup IPs 10.20.5.1–5, DELETE attempt on .6.
     // brig·id is passkey-only: deleting someone's last credential would
@@ -1189,14 +1182,13 @@ async fn delete_passkey_last_one_returns_409() {
 
 #[tokio::test]
 async fn another_accounts_passkey_is_not_found() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_alice = SoftPasskey::new(true);
+    let mut auth_bob = SoftPasskey::new(true);
 
     // Each user's setup uses its own /24 so no bucket accumulates.
     // xff_base "10.20.2" → 10.20.2.1–5 for alice's setup
@@ -1246,13 +1238,12 @@ async fn another_accounts_passkey_is_not_found() {
 
 #[tokio::test]
 async fn delete_passkey_unknown_id_returns_404() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // xff_base "10.20.4" → setup IPs 10.20.4.1–5, DELETE on 10.20.4.6
     let (id_token, user_id, _) = register_and_login_for_passkey_tests(
@@ -1322,13 +1313,12 @@ async fn delete_passkey_requires_a_session() {
 
 #[tokio::test]
 async fn list_passkeys_returns_registered_passkeys() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // xff_base "10.30.1" → setup IPs 10.30.1.1–5, list request on 10.30.1.6
     let (id_token, user_id, passkey_id) = register_and_login_for_passkey_tests(
@@ -1367,14 +1357,13 @@ async fn list_passkeys_returns_registered_passkeys() {
 
 #[tokio::test]
 async fn a_user_id_parameter_never_names_the_account() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_alice = SoftPasskey::new(true);
+    let mut auth_bob = SoftPasskey::new(true);
 
     let (alice_token, _, alice_passkey) = register_and_login_for_passkey_tests(
         app.clone(),
@@ -1451,13 +1440,12 @@ async fn list_passkeys_requires_a_session() {
 
 #[tokio::test]
 async fn add_credential_roundtrip() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_client = SoftPasskey::new(true);
 
     // xff_base "10.40.1" → setup IPs 10.40.1.1–5, add begin/finish on .6/.7,
     // list-passkeys check on .8.
@@ -1494,7 +1482,7 @@ async fn add_credential_roundtrip() {
         serde_json::from_value(j["challenge"].clone()).unwrap();
 
     // A distinct authenticator stands in for a second physical key.
-    let mut second_authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut second_authenticator = SoftPasskey::new(true);
     let reg_cred = second_authenticator
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
@@ -1546,14 +1534,13 @@ async fn add_credential_roundtrip() {
 
 #[tokio::test]
 async fn add_credential_is_for_the_sessions_account() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut auth_alice = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let mut auth_bob = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut auth_alice = SoftPasskey::new(true);
+    let mut auth_bob = SoftPasskey::new(true);
 
     let (alice_token, alice_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
@@ -1712,13 +1699,12 @@ async fn identities_require_a_session() {
 
 #[tokio::test]
 async fn identity_crud_roundtrip_and_isolation() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
 
-    let mut alice_dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut alice_dev = SoftPasskey::new(true);
     let (alice_token, alice_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "id_alice@localhost",
@@ -1727,7 +1713,7 @@ async fn identity_crud_roundtrip_and_isolation() {
         "10.41.1",
     )
     .await;
-    let mut bob_dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut bob_dev = SoftPasskey::new(true);
     let (bob_token, bob_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "id_bob@localhost",
@@ -1888,12 +1874,11 @@ async fn identity_crud_roundtrip_and_isolation() {
 
 #[tokio::test]
 async fn passkey_can_be_renamed() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (token, user_id, passkey_id) = register_and_login_for_passkey_tests(
         app.clone(),
         "pk_label@localhost",
@@ -1942,13 +1927,12 @@ async fn passkey_can_be_renamed() {
 /// user's passkeys.
 #[tokio::test]
 async fn discoverable_login_roundtrip() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     use webauthn_rs::prelude::{PublicKeyCredential, RequestChallengeResponse};
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (first, user_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "disco@localhost",
@@ -1999,7 +1983,7 @@ async fn discoverable_login_roundtrip() {
     rcr.public_key.allow_credentials = serde_json::from_value(allow.clone()).unwrap();
     rcr.mediation = None;
     let mut cred: PublicKeyCredential = dev.do_authentication(rp_origin.clone(), rcr).unwrap();
-    cred.response.user_handle = Some(user_id.as_bytes().to_vec().into());
+    cred.response.user_handle = Some(user_id.as_bytes().to_vec());
 
     let (status, cookie, _) = request_with_cookie(
         &app,
@@ -2033,7 +2017,7 @@ async fn discoverable_login_roundtrip() {
     rcr.public_key.allow_credentials = serde_json::from_value(allow).unwrap();
     rcr.mediation = None;
     let mut cred: PublicKeyCredential = dev.do_authentication(rp_origin, rcr).unwrap();
-    cred.response.user_handle = Some(Uuid::new_v4().as_bytes().to_vec().into());
+    cred.response.user_handle = Some(Uuid::new_v4().as_bytes().to_vec());
     let (status, _) = identity_request(
         &app,
         "POST",
@@ -2051,13 +2035,12 @@ async fn discoverable_login_roundtrip() {
 /// cross-origin request that changes something is refused.
 #[tokio::test]
 async fn cookie_session_check_sign_out_and_same_origin() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (cookie, _, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "sess@localhost",
@@ -2172,12 +2155,11 @@ async fn cookie_session_check_sign_out_and_same_origin() {
 /// caller sends, and the identity token endpoint is gone.
 #[tokio::test]
 async fn no_token_for_a_caller_supplied_client_id() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (cookie, _, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "idtok@localhost",
@@ -2209,12 +2191,11 @@ async fn no_token_for_a_caller_supplied_client_id() {
 /// refused without a lookup or with a plain 401.
 #[tokio::test]
 async fn recovery_code_enrols_a_new_passkey_once() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut first_device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut first_device = SoftPasskey::new(true);
     let (token, user_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "recover@localhost",
@@ -2272,7 +2253,7 @@ async fn recovery_code_enrols_a_new_passkey_once() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // The first device is lost: a new one enrols with the code.
-    let mut new_device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut new_device = SoftPasskey::new(true);
     let (status, j) = identity_request(
         &app,
         "POST",
@@ -2410,12 +2391,11 @@ async fn every_passkey_of_an_account_has_the_same_name() {
 /// A session begun to add a passkey can't be completed as a new account.
 #[tokio::test]
 async fn registration_sessions_finish_only_as_what_they_began() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut device = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut device = SoftPasskey::new(true);
     let (token, user_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "purpose@localhost",
@@ -2436,7 +2416,7 @@ async fn registration_sessions_finish_only_as_what_they_began() {
     assert_eq!(status, StatusCode::OK);
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(j["challenge"].clone()).unwrap();
-    let mut second = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut second = SoftPasskey::new(true);
     let cred = second
         .do_registration(rp_origin.clone(), for_soft_passkey(ccr))
         .unwrap();
@@ -2465,12 +2445,11 @@ async fn registration_sessions_finish_only_as_what_they_began() {
 /// and the same ceremony signs the new account in (a session cookie).
 #[tokio::test]
 async fn signup_without_username_signs_in() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
     let app = build_router(make_state().await);
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
 
     let (status, j) = identity_request(
         &app,
@@ -2536,12 +2515,11 @@ async fn signup_without_username_signs_in() {
 /// the server creates no identity for it.
 #[tokio::test]
 async fn an_account_without_a_recovery_code_can_do_nothing_else() {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     let state = make_state().await;
     let app = build_router(Arc::clone(&state));
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (cookie, _, passkey) = register_and_login_for_passkey_tests(
         app.clone(),
         "onboarding@localhost",
@@ -2808,10 +2786,9 @@ async fn signed_in_account(
     username: &str,
     xff_base: &str,
 ) -> (String, Uuid, Vec<Uuid>) {
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     let rp_origin = url::Url::parse("http://localhost:8080").unwrap();
-    let mut dev = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut dev = SoftPasskey::new(true);
     let (cookie, account_id, _) =
         register_and_login_for_passkey_tests(app.clone(), username, &rp_origin, &mut dev, xff_base)
             .await;
@@ -4311,7 +4288,6 @@ async fn the_label_of_an_identity_appears_in_no_token() {
 #[tokio::test]
 async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing() {
     use brigid_identity::{Attribute, Need};
-    use webauthn_authenticator_rs::WebauthnAuthenticator;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
     use webauthn_rs::prelude::RequestChallengeResponse;
 
@@ -4322,7 +4298,7 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
 
     // Two accounts. The first has lived: identities, attributes, an
     // application it signed in to and shared an address with.
-    let mut ada_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut ada_key = SoftPasskey::new(true);
     let (ada, ada_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "leaving@localhost",
@@ -4332,7 +4308,7 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
     )
     .await;
     let identities = finish_onboarding(&app, &ada, "10.82.1").await;
-    let mut bob_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut bob_key = SoftPasskey::new(true);
     let (bob, bob_id, _) = register_and_login_for_passkey_tests(
         app.clone(),
         "staying@localhost",
@@ -4491,14 +4467,10 @@ async fn deleting_an_account_takes_its_own_passkey_ceremony_and_leaves_nothing()
 // Administration: /admin, the links, who may sign up
 // ---------------------------------------------------------------------------
 
-type Key = webauthn_authenticator_rs::WebauthnAuthenticator<
-    webauthn_authenticator_rs::softpasskey::SoftPasskey,
->;
+type Key = webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
 fn new_key() -> Key {
-    webauthn_authenticator_rs::WebauthnAuthenticator::new(
-        webauthn_authenticator_rs::softpasskey::SoftPasskey::new(true),
-    )
+    webauthn_authenticator_rs::softpasskey::SoftPasskey::new(true)
 }
 
 /// The account's passkeys, as a deletion ceremony (begun, never finished)
@@ -4545,7 +4517,7 @@ async fn sign_in_answer(
         .do_authentication(url::Url::parse(ORIGIN).unwrap(), challenge)
         .unwrap();
     let account = Uuid::parse_str(account).unwrap();
-    credential.response.user_handle = Some(account.as_bytes().to_vec().into());
+    credential.response.user_handle = Some(account.as_bytes().to_vec());
     (j["session_id"].clone(), credential)
 }
 
