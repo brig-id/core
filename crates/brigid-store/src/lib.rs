@@ -18,6 +18,10 @@ pub mod kept;
 pub mod model;
 pub mod store;
 
+/// The key an [`EncryptedStore`] is opened with, so that what opens one needs no
+/// dependency of its own on brigid-crypto: a second reference to that repository would
+/// build a second copy of this type, which the store would refuse.
+pub use brigid_crypto::MasterKey;
 pub use error::{Error, Result};
 pub use model::{
     AccountStanding, AccountSummary, AcmeSecret, AdminAction, AdminLogEntry, ApplicationType,
