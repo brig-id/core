@@ -11,8 +11,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-# The version of every crate here (`version.workspace = true`), written by release-please
-# with the crates' lines of Cargo.lock (release-please-config.json).
+# The version of every crate here (`version.workspace = true`). Not a release number any
+# more: the core has no release of its own, a server follows it at a commit of main and
+# its release notes list what changed here. It stays as it was at the last tag.
 version = "0.3.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
@@ -20,7 +21,9 @@ publish = false
 rust-version = "1.94"
 
 [workspace.dependencies]
-brigid-crypto = { git = "https://github.com/brig-id/crypto", tag = "v0.2.0" }
+# crypto at a commit of its main, which Cargo.lock holds: `cargo update -p brigid-crypto`
+# follows a newer one.
+brigid-crypto = { git = "https://github.com/brig-id/crypto", branch = "main" }
 brigid-store = { path = "crates/brigid-store" }
 brigid-identity = { path = "crates/brigid-identity" }
 brigid-webauthn = { path = "crates/brigid-webauthn" }
